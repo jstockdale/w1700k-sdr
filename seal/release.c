@@ -738,9 +738,14 @@ int main(int argc, char **argv)
 		} else if (!strcmp(argv[i], "--first")) {
 			first = true;
 		} else if (!strcmp(argv[i], "--floor") && i + 1 < argc) {
+			/* A number written plainly, as it is kept: no sign, no space, nothing
+			 * that strtoull would read as another number than the one meant. */
+			i++;
+			if (!*argv[i] || strspn(argv[i], "0123456789") != strlen(argv[i]))
+				goto usage;
 			errno = 0;
-			floor = strtoull(argv[++i], &end, 10);
-			if (errno || *end || end == argv[i])
+			floor = strtoull(argv[i], &end, 10);
+			if (errno || *end)
 				goto usage;
 		} else if (argv[i][0] != '-' && !operand) {
 			operand = argv[i];
