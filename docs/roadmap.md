@@ -78,6 +78,22 @@ installation, the first loader and the kernel image.
   from the release's, so the check waits for one root that fits every unit
   (the item above); and nothing yet fetches the newest release and the
   rotations for a host to hand to its unit.
+- **Keyed units, before one ships.** Found by review and not built:
+  - *What is current.* Nothing tells a unit or its host that a list or a
+    release it has not been given exists, so whoever delivers decides where a
+    unit's keys stop. A dated statement of the newest list and release,
+    sealed by a `timestamp` key and checked by the host, which has a clock.
+  - *The first list, checked by machine.* The bench shows fingerprints and a
+    person compares them. For a unit that ships, the tool should hold the
+    list to a signed record of the keys issued, as an exact set.
+  - *A way to ship.* One step that installs a sealed release and no login
+    key, keys the unit, and sets its release number, so that none of it
+    depends on remembering a flag.
+  - *Development and production.* Nothing in a unit or an envelope says which
+    it is: only the list a unit was given does.
+  - *A unit that lost its list* is pointed at `--unsigned`, which checks
+    nothing, though the release it is offered carries the whole chain of
+    lists from the first.
 - **The kernel image over ssh.** It is a volume beside the root and could be
   staged and confirmed the same way; today it takes the console.
 - **The first loader over ssh.** It is the one part a unit in the field can
