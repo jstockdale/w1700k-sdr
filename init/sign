@@ -1,33 +1,62 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""Make an update archive a release: seal its manifest with a release key.
+"""Seal releases, and the lists of keys that say who may.
 
-    init/sign keygen KEYFILE                      # a new signing key, and its line for a unit
-    init/sign public KEYFILE                      # that line again
-    init/sign archive --key KEYFILE --release N [ARCHIVE] [-o OUT]
-    init/sign check --keys FILE ARCHIVE           # is it a release, and which of these keys' is it
+A keyed unit holds a list of keys, each with a scope (seal/README.md):
 
-    init/sign request --release N [ARCHIVE] [-o REQUEST]       # for a key that signs elsewhere:
-    init/sign attach --request REQUEST --signature SIG --keys FILE [ARCHIVE] [-o OUT]
+    release     seals a release: an update archive whose manifest it signs
+    timestamp   seals nothing a unit takes: what a host is told is current
+    keys        seals the next list of an epoch, which leaves every root and keys line as it is
+    root        seals that, and the first list of the next epoch, which may change any line
 
-A unit built with release keys in it (`W1700K_RELEASE_KEYS=FILE make`, see platform/README.md)
-takes over ssh only what one of them sealed, and nothing older than the release it has settled
-on. `keygen` writes the private half of a key to KEYFILE, readable by you alone, and prints the
-public half as one line of such a file. Keep two: one to sign with, one that stays offline until
-the first is lost.
+A list is of an epoch and a generation, written E.G: 1.1 is the first, 1.2 the next of that
+epoch, 2.1 the first of the next.
+
+    init/sign keygen KEYFILE                      # a new signing key; prints its public half
+    init/sign public KEYFILE                      # that again
+    init/sign list --generation E.G -o FILE KEY:SCOPE:NAME...   # write a list in its one form
+    init/sign show FILE...                        # a list, a sealed list or a release: what it holds
+
+A release, with the key on this host:
+
+    init/sign archive --key KEYFILE --release N [--carry DIR] [ARCHIVE] [-o OUT]
+    init/sign check --keys LIST ARCHIVE           # is it a release a unit holding LIST takes
+
+A rotation (a new list, sealed), with the key on this host. Without --held it is a first list,
+which a root key it names itself seals:
+
+    init/sign rotate --key KEYFILE --list NEW [--held OLD] [-o OUT]
+
+A key that never leaves its keeper signs in two steps, for a release and for a rotation alike:
+
+    init/sign request --domain D --release N [--carry DIR] [ARCHIVE] [-o REQUEST]
+    init/sign attach --request REQUEST --signature SIG --keys LIST [--carry DIR] [ARCHIVE] [-o OUT]
+
+    init/sign rotate-request --domain D --list NEW [--held OLD] [-o REQUEST]
+    init/sign rotate-proof --request REQUEST --name KEYNAME (--signature SIG | --key KEYFILE)
+    init/sign rotate-attach --request REQUEST --signature SIG [--held OLD] [-o OUT]
 
 `archive` writes ARCHIVE (default: this build's w1700k-update.tar) again as release N, with the
 number in its manifest and the manifest sealed, to OUT (default: w1700k-release-N.tar beside
 it). The manifest lists the SHA-256 of every image in the archive, so the one signature covers
-them all. N only ever goes up: a unit that has settled on release 7 refuses release 6.
+them all, and names the commit the request was made from. N only ever goes up: a unit that has
+settled on release 7 refuses release 6. `--carry DIR` puts the rotations in DIR (every *.wms2)
+into the release, so that a unit which missed one catches up before it judges the release; they
+have to follow one from another, from a first list on. The manifest names each by digest, so
+`request` is given the same `--carry` as `attach`.
 
-A key that never leaves its keeper signs in two steps. `request` writes what there is to sign
-for release N: a small JSON file with the release number, the exact bytes (`sign`, in hex: the
-topic, the envelope's header and the manifest, which is readable in them from `manifest_at`)
-and their SHA-256. The keeper signs those bytes (Ed25519, RFC 8032) and returns 64 bytes.
-`attach` takes them as 128 hex digits or a file of them, checks them against FILE's public
-keys, and writes the release; a signature that is not over this request, by one of those keys,
-writes nothing. The archive has to be the one the request was made of.
+A request is a small JSON file: `domain` (development or production: which keys are asked,
+for a keeper that holds both), `topic`, `device`, `counter` (the release number, or the list's
+generation), the exact bytes to sign in hex (`auth_hex`: the topic, the envelope's header and
+the manifest or the list, readable in them) and their SHA-256 (`auth_sha256`). The keeper signs
+those bytes (Ed25519, RFC 8032) and returns 64 bytes. `attach` and `rotate-attach` take them as
+128 hex digits or a file of them, and write nothing unless the signature is over that request,
+by a key that may seal it: a release key of LIST for a release; for a rotation a root or keys
+key of OLD, and a root key for the first list of an epoch.
+
+A rotation's request also names the keys that are new in the list (`needs_proofs`). Whoever
+seals the list may ask each of them to show it is held, by signing the same bytes:
+`rotate-proof` puts such a signature into the request (`new_key_proofs`), once it verifies.
 
 The envelope is Whitehat Hardware's WMS2 (`seal/`, init/initkit/seal.py). Signing takes the
 Python package `cryptography` or PyNaCl; checking takes neither.
@@ -37,12 +66,17 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
+import tarfile
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from initkit import bundle, config, seal                # noqa: E402
 from initkit.console import StepFailed                  # noqa: E402
+
+ROOT = Path(__file__).resolve().parent.parent
+DOMAINS = ('development', 'production')
 
 
 def read_seed(path):
@@ -56,18 +90,43 @@ def read_seed(path):
     return seed
 
 
-def read_request(path):
-    """(release number, time, the bytes to sign) of a signing request."""
+def read_list(path):
+    """The list in the file at `path`: as text, or sealed."""
+    try:
+        data = Path(path).read_bytes()
+    except OSError as error:
+        raise StepFailed(f'{path}: {error}') from None
+    try:
+        return seal.parse_list(seal.body_of(data) if data[:4] == seal.MAGIC else data)
+    except seal.Refused as error:
+        raise StepFailed(f'{path} is not a list of keys: {error}') from None
+
+
+def read_request(path, topic):
+    """(counter, time, the bytes to sign, the request) of a signing request for `topic`."""
     try:
         request = json.loads(Path(path).read_text())
-        release, when, message = request['release'], request['time_ms'], bytes.fromhex(request['sign'])
-        if type(release) is not int or type(when) is not int:
-            raise ValueError('its release and time are not numbers')
-        if hashlib.sha256(message).hexdigest() != request['sign_sha256']:
+        counter, when, message = request['counter'], request['time_ms'], bytes.fromhex(request['auth_hex'])
+        if type(counter) is not int or type(when) is not int or not 0 <= when < 1 << 64:
+            raise ValueError('its counter and time are not numbers a header holds')
+        if not isinstance(request.get('new_key_proofs', {}), dict):
+            raise ValueError('its proofs are not a set of names and signatures')
+        if hashlib.sha256(message).hexdigest() != request['auth_sha256']:
             raise ValueError('its bytes are not the ones its SHA-256 names')
+        if request['topic'] != topic or request['device'] != seal.PRODUCT:
+            raise ValueError(f"it asks for {request['topic']} of {request['device']}, not {topic} of {seal.PRODUCT}")
     except (OSError, KeyError, TypeError, ValueError) as error:
-        raise StepFailed(f'{path} is not a signing request: {error}') from None
-    return release, when, message
+        raise StepFailed(f'{path} is not a signing request for this: {error}') from None
+    return counter, when, message, request
+
+
+def write_request(path, topic, counter, when, message, **more):
+    digest = hashlib.sha256(message).hexdigest()
+    unwritten(path, 'a request that may be out for signing').write_text(json.dumps({
+        'request': 'an Ed25519 signature (RFC 8032) over the bytes in `auth_hex`',
+        'topic': topic, 'device': seal.PRODUCT, 'counter': counter, 'time_ms': when, **more,
+        'bytes': len(message), 'auth_hex': message.hex(), 'auth_sha256': digest}, indent=1) + '\n')
+    return digest
 
 
 def read_signature(given):
@@ -88,8 +147,72 @@ def unwritten(path, what):
     return path
 
 
-def key_line(public, note):
-    return f'{public.hex()}  {note} ({seal.fingerprint(public)})'
+def source_commit():
+    """What this tree is: its commit, and whether anything in it differs from that."""
+    try:
+        commit = subprocess.run(['git', '-C', str(ROOT), 'rev-parse', 'HEAD'], capture_output=True, text=True,
+                                check=True).stdout.strip()
+        changed = subprocess.run(['git', '-C', str(ROOT), 'status', '--porcelain'], capture_output=True,
+                                 text=True, check=True).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return 'unknown'
+    return commit + ('-dirty' if changed else '')
+
+
+def carried(directory):
+    """The rotations in `directory`, oldest first, held to following one from another."""
+    if directory is None:
+        return []
+    try:
+        found = [path.read_bytes() for path in sorted(Path(directory).glob('*.wms2'))]
+        found.sort(key=lambda envelope: seal.parse_list(seal.body_of(envelope)).stamp)
+    except (OSError, seal.Refused) as error:
+        raise StepFailed(f'{directory} holds something that is not a sealed list of keys: {error}') from None
+    if not found:
+        raise StepFailed(f'{directory} holds no rotation (*.wms2)')
+    bundle.chain(found)
+    return found
+
+
+def describe(keys):
+    lines = [f'list {keys.label} (epoch {keys.epoch}, generation {keys.generation}), {len(keys.keys)} keys']
+    for key in keys.keys:
+        lines += [f'  {key.scope:<7}  {key.name}', f'           {key.public.hex()}',
+                  f'           {seal.fingerprint(key.public)} (as a unit prints it) / '
+                  f'{seal.registry_fingerprint(key.public)} (registry)']
+    return '\n'.join(lines)
+
+
+def show(path):
+    data = path.read_bytes()
+    if data[:4] == seal.MAGIC or not tarfile.is_tarfile(path):
+        keys = read_list(path)
+        sealed = ''
+        if data[:4] == seal.MAGIC:
+            try:
+                _, by = seal.rotated(None, data)
+                sealed = f', sealed as a first list by {by.name}'
+            except seal.Refused:
+                sealed = ', sealed (by a key of the list before it, which says whether a unit takes it)'
+        print(f'{path}: a list of keys{sealed}\n{describe(keys)}')
+        return
+    manifest, files, sealed = bundle.read_release(path)
+    turns = bundle.rotations(path)
+    print(f'{path}: ' + (f'release {manifest.get("release")}' if sealed else 'an update archive, not sealed')
+          + f', {len(files)} images, from {manifest.get("source", "an unnamed source")}')
+    if turns:
+        keys = bundle.chain(turns)
+        print(f'it carries {len(turns)} rotations, which leave a unit holding:\n{describe(keys)}')
+        if sealed:
+            _, _, key = seal.unseal(sealed, keys.release_keys())
+            print(f'and it is sealed by {seal.fingerprint(key)}, a release key of that list')
+
+
+def release_keys(path):
+    keys = read_list(path)
+    if not keys.release_keys():
+        raise StepFailed(f'{path} holds no release key (list {keys.label}): no release is taken')
+    return keys.release_keys()
 
 
 def main():
@@ -98,24 +221,51 @@ def main():
     for name in ('keygen', 'public'):
         verb = verbs.add_parser(name)
         verb.add_argument('keyfile', type=Path, metavar='KEYFILE')
-    archive = verbs.add_parser('archive')
-    archive.add_argument('--key', type=Path, required=True, metavar='KEYFILE')
-    archive.add_argument('--release', type=int, required=True, metavar='N')
-    archive.add_argument('archive', type=Path, nargs='?', default=config.UPDATE, metavar='ARCHIVE')
-    archive.add_argument('-o', '--output', type=Path, metavar='OUT')
-    check = verbs.add_parser('check')
-    check.add_argument('--keys', type=Path, required=True, metavar='FILE')
-    check.add_argument('archive', type=Path, metavar='ARCHIVE')
-    request = verbs.add_parser('request')
-    request.add_argument('--release', type=int, required=True, metavar='N')
-    request.add_argument('archive', type=Path, nargs='?', default=config.UPDATE, metavar='ARCHIVE')
-    request.add_argument('-o', '--output', type=Path, metavar='REQUEST')
-    attach = verbs.add_parser('attach')
-    attach.add_argument('--request', type=Path, required=True, metavar='REQUEST')
-    attach.add_argument('--signature', required=True, metavar='SIG')
-    attach.add_argument('--keys', type=Path, required=True, metavar='FILE')
-    attach.add_argument('archive', type=Path, nargs='?', default=config.UPDATE, metavar='ARCHIVE')
-    attach.add_argument('-o', '--output', type=Path, metavar='OUT')
+    verb = verbs.add_parser('list')
+    verb.add_argument('--generation', required=True, metavar='E.G', help='the epoch and the generation')
+    verb.add_argument('-o', '--output', type=Path, required=True, metavar='FILE')
+    verb.add_argument('keys', nargs='+', metavar='KEY:SCOPE:NAME')
+    verb = verbs.add_parser('show')
+    verb.add_argument('files', type=Path, nargs='+', metavar='FILE')
+    for name in ('archive', 'request', 'attach'):
+        verb = verbs.add_parser(name)
+        if name == 'archive':
+            verb.add_argument('--key', type=Path, required=True, metavar='KEYFILE')
+        if name == 'request':
+            verb.add_argument('--domain', choices=DOMAINS, required=True)
+        if name != 'attach':
+            verb.add_argument('--release', type=int, required=True, metavar='N')
+            verb.add_argument('--source', metavar='COMMIT', help='what the images were built from '
+                              '(default: this tree\'s commit)')
+        else:
+            verb.add_argument('--request', type=Path, required=True, metavar='REQUEST')
+            verb.add_argument('--signature', required=True, metavar='SIG')
+            verb.add_argument('--keys', type=Path, required=True, metavar='LIST')
+        verb.add_argument('--carry', type=Path, metavar='DIR')
+        verb.add_argument('archive', type=Path, nargs='?', default=config.UPDATE, metavar='ARCHIVE')
+        verb.add_argument('-o', '--output', type=Path, metavar='OUT')
+    verb = verbs.add_parser('check')
+    verb.add_argument('--keys', type=Path, required=True, metavar='LIST')
+    verb.add_argument('archive', type=Path, metavar='ARCHIVE')
+    verb = verbs.add_parser('rotate-proof')
+    verb.add_argument('--request', type=Path, required=True, metavar='REQUEST')
+    verb.add_argument('--name', required=True, metavar='KEYNAME')
+    how = verb.add_mutually_exclusive_group(required=True)
+    how.add_argument('--signature', metavar='SIG')
+    how.add_argument('--key', type=Path, metavar='KEYFILE')
+    for name in ('rotate', 'rotate-request', 'rotate-attach'):
+        verb = verbs.add_parser(name)
+        if name == 'rotate':
+            verb.add_argument('--key', type=Path, required=True, metavar='KEYFILE')
+        if name == 'rotate-attach':
+            verb.add_argument('--request', type=Path, required=True, metavar='REQUEST')
+            verb.add_argument('--signature', required=True, metavar='SIG')
+        else:
+            verb.add_argument('--list', type=Path, required=True, metavar='NEW', dest='new')
+        if name == 'rotate-request':
+            verb.add_argument('--domain', choices=DOMAINS, required=True)
+        verb.add_argument('--held', type=Path, metavar='OLD')
+        verb.add_argument('-o', '--output', type=Path, metavar='OUT')
     args = parser.parse_args()
     try:
         if args.verb == 'keygen':
@@ -128,57 +278,156 @@ def main():
                 raise StepFailed(f'{args.keyfile} exists; a key is never overwritten') from None
             with os.fdopen(handle, 'w') as stream:
                 stream.write(seed.hex() + '\n')
-            print(f'sign: the signing key is in {args.keyfile}; keep it private. Its line for a '
-                  'release-keys file:', file=sys.stderr)
-            print(key_line(public, args.keyfile.stem))
+            print(f'sign: the signing key is in {args.keyfile}; keep it private. Its public half, and '
+                  f'its fingerprint {seal.fingerprint(public)}:', file=sys.stderr)
+            print(public.hex())
         elif args.verb == 'public':
-            public, _ = seal.signer(read_seed(args.keyfile))
-            print(key_line(public, args.keyfile.stem))
+            print(seal.signer(read_seed(args.keyfile))[0].hex())
+        elif args.verb == 'list':
+            keys = []
+            for given in args.keys:
+                fields = given.split(':')
+                if len(fields) != 3:
+                    raise StepFailed(f'{given!r} is not KEY:SCOPE:NAME')
+                try:
+                    keys.append((bytes.fromhex(fields[0]), fields[1], fields[2]))
+                except ValueError:
+                    raise StepFailed(f'{fields[0]!r} is not a public key of 64 hex digits') from None
+            stamp = args.generation.split('.')
+            if len(stamp) != 2 or not all(part.isdigit() for part in stamp):
+                raise StepFailed(f'{args.generation!r} is not an epoch and a generation, E.G')
+            text = seal.format_list(tuple(map(int, stamp)), keys)
+            unwritten(args.output, 'a list').write_bytes(text)
+            print(f'sign: {args.output}\n{describe(seal.parse_list(text))}')
+        elif args.verb == 'show':
+            for path in args.files:
+                show(path)
         elif args.verb == 'archive':
             public, sign = seal.signer(read_seed(args.key))
             output = args.output or args.archive.with_name(f'w1700k-release-{args.release}.tar')
             if output.resolve() != args.archive.resolve():
                 unwritten(output, 'a release')
-            bundle.sign(args.archive, output, args.release, sign)
+            turns = carried(args.carry)
+            if turns and public not in bundle.chain(turns).release_keys():
+                raise StepFailed(f'{args.key} is no release key of the list the rotations in {args.carry} '
+                                 'leave a unit holding')
+            bundle.sign(args.archive, output, args.release, sign, source=args.source or source_commit(),
+                        carried=turns)
             print(f'sign: {output} is release {args.release}, sealed by {seal.fingerprint(public)}')
         elif args.verb == 'request':
-            when = int(time.time() * 1000)
-            manifest, message = bundle.to_sign(args.archive, args.release, when)
-            output = unwritten(args.output or args.archive.with_name(f'w1700k-release-{args.release}.request.json'),
-                               'a request that may be out for signing')
-            digest = hashlib.sha256(message).hexdigest()
-            output.write_text(json.dumps({
-                'request': 'a signature for a W1700K SDR release: Ed25519 (RFC 8032) over the bytes in `sign`',
-                'product': seal.PRODUCT, 'topic': seal.TOPIC, 'release': args.release, 'time_ms': when,
-                'manifest_sha256': hashlib.sha256(manifest).hexdigest(),
-                'manifest_at': len(message) - len(manifest), 'bytes': len(message),
-                'sign': message.hex(), 'sign_sha256': digest}, indent=1) + '\n')
+            when, source = int(time.time() * 1000), args.source or source_commit()
+            manifest, message = bundle.to_sign(args.archive, args.release, when, source, carried(args.carry))
+            output = args.output or args.archive.with_name(f'w1700k-release-{args.release}.request.json')
+            digest = write_request(output, seal.TOPIC, args.release, when, message, domain=args.domain,
+                                   release=args.release,
+                                   manifest_sha256=hashlib.sha256(manifest).hexdigest(),
+                                   manifest_at=len(message) - len(manifest), source_commit=source)
             print(f'sign: {output} asks for release {args.release} of {args.archive}: {len(message)} bytes to '
                   f'sign, SHA-256 {digest}')
         elif args.verb == 'attach':
-            release, when, message = read_request(args.request)
+            release, when, message, request = read_request(args.request, seal.TOPIC)
             signature = read_signature(args.signature)
-            keys = seal.read_keys(args.keys.read_text())
+            keys, turns = release_keys(args.keys), carried(args.carry)
             key = next((key for key in keys if seal.verifies(key, message, signature)), None)
             if key is None:
-                raise StepFailed(f'that signature is not over the bytes of {args.request} by a key in {args.keys} ('
-                                 + (', '.join(map(seal.fingerprint, keys)) or 'it holds none') + ')')
+                raise StepFailed(f'that signature is not over the bytes of {args.request} by a release key of '
+                                 f'{args.keys} (' + ', '.join(map(seal.fingerprint, keys)) + ')')
+            if turns and key not in bundle.chain(turns).release_keys():
+                raise StepFailed(f'the key that signed is no release key of the list the rotations in '
+                                 f'{args.carry} leave a unit holding')
             output = unwritten(args.output or args.archive.with_name(f'w1700k-release-{release}.tar'), 'a release')
 
             def returned(asked):
                 if asked != message:
-                    raise StepFailed(f'{args.archive} is not the archive {args.request} was made of')
+                    raise StepFailed(f'{args.archive} is not the archive {args.request} was made of, or '
+                                     'not with the rotations it was made with (--carry)')
                 return signature
-            bundle.sign(args.archive, output, release, returned, when, keys)
+            bundle.sign(args.archive, output, release, returned, when, keys, request.get('source_commit'), turns)
             print(f'sign: {output} is release {release}, sealed by {seal.fingerprint(key)}')
-        else:
-            keys = seal.read_keys(args.keys.read_text())
+        elif args.verb == 'check':
+            keys = read_list(args.keys)
             manifest, _, sealed = bundle.read_release(args.archive)
             if sealed is None:
                 raise StepFailed(f'{args.archive} is not sealed: an update archive, not a release')
-            release, _, key = seal.unseal(sealed, keys)
-            print(f'sign: {args.archive} is release {release}, sealed by {seal.fingerprint(key)}; '
-                  f'its {len(manifest["files"])} images are the ones its manifest lists')
+            turns = bundle.rotations(args.archive)
+            after = bundle.chain([turn for turn in turns
+                                  if seal.parse_list(seal.body_of(turn)).stamp > keys.stamp], keys)
+            release, _, key = seal.unseal(sealed, after.release_keys())
+            print(f'sign: {args.archive} is release {release}, sealed by {seal.fingerprint(key)}; its '
+                  f'{len(manifest["files"])} images are the ones its manifest lists'
+                  + (f'; a unit holding list {keys.label} holds list {after.label} '
+                     'after the rotations it carries' if after.stamp != keys.stamp else ''))
+        elif args.verb == 'rotate-proof':
+            _, _, message, request = read_request(args.request, seal.ROTATE_TOPIC)
+            keys = seal.parse_list(message[2 + len(seal.ROTATE_TOPIC) + seal.HEADER:])
+            named = next((key for key in keys.keys if key.name == args.name), None)
+            if named is None:
+                raise StepFailed(f'the list {args.request} asks for names no key {args.name}')
+            if args.key:
+                public, sign = seal.signer(read_seed(args.key))
+                if public != named.public:
+                    raise StepFailed(f'{args.key} is not the key the list names {args.name}')
+                signature = sign(message)
+            else:
+                signature = read_signature(args.signature)
+            if not seal.verifies(named.public, message, signature):
+                raise StepFailed(f'that is not {args.name}\'s signature over the bytes of {args.request}')
+            request['new_key_proofs'] = {**request.get('new_key_proofs', {}), args.name: signature.hex()}
+            args.request.write_text(json.dumps(request, indent=1) + '\n')
+            missing = [name for name in request.get('needs_proofs', []) if name not in request['new_key_proofs']]
+            print(f'sign: {args.request} holds the proof that {args.name} ({seal.fingerprint(named.public)}) is '
+                  'held' + (f'; still without one: {", ".join(missing)}' if missing else '; every new key has one'))
+        else:
+            held = read_list(args.held) if args.held else None
+            if args.verb == 'rotate-attach':
+                counter, when, message, request = read_request(args.request, seal.ROTATE_TOPIC)
+                signature = read_signature(args.signature)
+                text = message[2 + len(seal.ROTATE_TOPIC) + seal.HEADER:]
+                try:
+                    new = seal.parse_list(text)
+                except seal.Refused as error:
+                    raise StepFailed(f'{args.request} does not ask for a list of keys: {error}') from None
+                if counter != new.generation:
+                    raise StepFailed(f'{args.request} says generation {counter} and asks for a list of '
+                                     f'generation {new.generation}')
+            else:
+                new, when = read_list(args.new), int(time.time() * 1000)
+                text = new.text
+            if held is not None and new.stamp <= held.stamp and new.text != held.text:
+                raise StepFailed(f'the new list is {new.label} and the one held is {held.label}: a unit takes '
+                                 'only a later one')
+            header, asked = seal.unsigned_list(text, when)
+            stem = f'w1700k-keys-{new.label}'
+            beside = (args.request if args.verb == 'rotate-attach' else args.new).parent
+            if args.verb == 'rotate-request':
+                starts = held is None or new.epoch != held.epoch
+                fresh = [key.name for key in new.keys
+                         if (key.scope not in ('root', 'keys') if held is None
+                             else key.public not in {known.public for known in held.keys})]
+                output = args.output or beside / f'{stem}.request.json'
+                digest = write_request(output, seal.ROTATE_TOPIC, new.generation, when, asked, domain=args.domain,
+                                       epoch=new.epoch,
+                                       generation=new.generation, list_sha256=hashlib.sha256(text).hexdigest(),
+                                       list_at=len(asked) - len(text), needs='root' if starts else 'root or keys',
+                                       held_list=held.text.decode() if held else None, needs_proofs=fresh,
+                                       new_key_proofs={})
+                print(f'sign: {output} asks for list {new.label}: {len(asked)} bytes to sign, SHA-256 '
+                      f'{digest}; a ' + ('root key' if starts else 'root or keys key') + ' of '
+                      + ('the list itself' if held is None else f'list {held.label}') + ' seals it'
+                      + (f'. New in it, to show they are held (rotate-proof): {", ".join(fresh)}' if fresh else ''))
+                return 0
+            if args.verb == 'rotate':
+                signature = seal.signer(read_seed(args.key))[1](asked)
+            elif asked != message:
+                raise StepFailed(f'{args.request} does not ask for a list as this tool seals one')
+            envelope = seal.signed(header, text, signature)
+            _, by = seal.rotated(held, envelope)        # what a unit would make of it, or Refused
+            if by is None:
+                raise StepFailed(f'that is the list held ({held.label}): there is nothing to seal')
+            output = unwritten(args.output or beside / f'{stem}.wms2', 'a sealed list')
+            output.write_bytes(envelope)
+            print(f'sign: {output} is list {new.label}, sealed by {by.name} ({by.scope}, '
+                  f'{seal.fingerprint(by.public)})\n{describe(new)}')
     except (StepFailed, seal.Refused) as error:
         sys.exit(f'sign: {error}')
     except OSError as error:

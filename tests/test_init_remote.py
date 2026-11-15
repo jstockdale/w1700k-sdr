@@ -4,6 +4,8 @@ ssh and in which order, and what it makes of a unit that takes the new root, doe
 or comes back on the old one."""
 import argparse
 import hashlib
+import io
+import tarfile
 from pathlib import Path
 import sys
 import tempfile
@@ -587,50 +589,78 @@ class RemoteJoint(unittest.TestCase):
             self.run_update(unit)
 
 
-class ReleaseUnit(JointUnit):
-    """A unit built with release keys: system-update's rules for staging, as the script has
-    them (tests/test_release.py runs the script itself)."""
+def keys_list(stamp, *rows):
+    """A list of test keys: `rows` are (key number, scope, name); `stamp` is its (epoch,
+    generation), or the generation alone, in epoch 1."""
+    stamp = stamp if isinstance(stamp, tuple) else (1, stamp)
+    return seal.parse_list(seal.format_list(stamp, [(seal.signer(bytes((number,)) * 32)[0], scope, name)
+                                                    for number, scope, name in rows]))
 
-    def __init__(self, keys, floor=0, **options):
+
+USUAL = ((5, 'root', 'the-root'), (6, 'keys', 'the-keys'), (1, 'release', 'primary'))
+
+
+class ReleaseUnit(JointUnit):
+    """A keyed unit: system-update's rules for its list of keys and for staging, as the script
+    has them (tests/test_release.py runs the script itself)."""
+
+    def __init__(self, held, floor=0, kind=None, **options):
         super().__init__(**options)
-        self.keys, self.floor = keys, floor
+        self.held, self.floor, self.settled = held, floor, ''
+        self.kind = kind or ('keyed' if held else 'unkeyed')
         self.verified = self.noted = None
         self.flags = {}
 
     def call(self, command, data=None, timeout=120):
-        if command == f'cat {remote.RELEASE_KEYS}' and not self.down:
-            self.calls.append(command)
-            return 0, ''.join(key.hex() + '\n' for key in self.keys)
         if not command.startswith('sh -s -- ') or self.down:
             return super().call(command, data, timeout)
         verb, *arguments = command.split()[3:]
+        lost = 'system-update: this unit was given a list of keys and holds none that reads\n'
         if verb == 'status':
             code, text = super().call(command, data, timeout)
-            return code, text + f'release_keys={len(self.keys)}\nrelease={self.floor}\n'
+            return code, text + (f'keys={self.kind}\nkey_list={"good" if self.held else "none"}\n'
+                                 f'key_generation={self.held.label if self.held else ""}\n'
+                                 f'release_keys={len(self.held.release_keys()) if self.held else 0}\n'
+                                 f'release={self.floor}\nrelease_manifest={self.settled}\n')
+        if verb == 'keys':
+            self.calls.append(command)
+            return (0, self.held.text.decode()) if self.held else (1, 'system-update: this unit holds no list\n')
+        if verb == 'rotate':
+            self.calls.append(command)
+            if self.kind != 'keyed':
+                return 1, lost
+            try:
+                self.held, _ = seal.rotated(self.held, self.files[arguments[0]])
+            except seal.Refused as error:
+                return 1, f'w1700k-release: {error}\nsystem-update: not a list this unit takes\n'
+            return 0, f'system-update: the list of keys is now generation={self.held.label}\n'
         if verb == 'release':
             self.calls.append(command)
+            if self.kind != 'keyed':
+                return 1, lost
             try:
-                number, body, _ = seal.unseal(self.files[arguments[0]], self.keys)
+                number, body, _ = seal.unseal(self.files[arguments[0]], self.held.release_keys())
             except seal.Refused:
                 return 1, 'system-update: not a release this unit takes\n'
             if number < self.floor:
                 return 1, f'w1700k-release: release {number} is older than release {self.floor}\n'
             self.verified = (number, body.decode())
             return 0, f'system-update: release {number} verified\n'
-        if verb in ('stage', 'stage-loader'):
+        if verb in ('stage', 'stage-loader') and self.kind != 'unkeyed':
             path, digest, *flags = arguments
             self.flags[verb] = flags
             listed = self.verified and f'"{digest}"' in self.verified[1]
-            if not (flags == ['--unsigned'] or listed
-                    or (flags == ['--from-release'] and verb == 'stage' and self.verified)):
+            if not (flags == ['--unsigned'] or (self.kind == 'keyed' and (
+                    listed or (flags == ['--from-release'] and verb == 'stage' and self.verified)))):
                 self.calls.append(command)
-                return 1, 'system-update: this unit takes releases: verify one first\n'
+                return 1, lost if self.kind == 'lost' else 'system-update: this unit takes releases: verify one first\n'
             if flags != ['--unsigned'] and self.verified:
-                self.noted = self.verified[0]
+                self.noted, self.noted_manifest = self.verified
             return super().call(' '.join(command.split()[:6]), data, timeout)
         code, text = super().call(command, data, timeout)
         if verb == 'confirm' and code == 0 and self.noted:
-            self.floor = max(self.floor, self.noted)
+            if self.noted > self.floor:
+                self.floor, self.settled = self.noted, hashlib.sha256(self.noted_manifest.encode()).hexdigest()
         if verb in ('confirm', 'cancel'):
             self.noted = None
         return code, text
@@ -641,29 +671,35 @@ class ReleaseUnit(JointUnit):
 
 
 class Releases(RemoteJoint):
-    """A unit that pins release keys takes over ssh what one of them sealed, and nothing else
-    without the owner's word."""
+    """A keyed unit takes over ssh what a release key of its list sealed, and nothing else
+    without the owner's word; and its list moves on with the rotations a release carries."""
 
     def setUp(self):
         super().setUp()
         try:
             self.primary, self.sign = seal.signer(bytes((1,)) * 32)
             self.stranger, self.sign_stranger = seal.signer(bytes((3,)) * 32)
+            self.signers = {number: seal.signer(bytes((number,)) * 32)[1] for number in (1, 3, 5, 6, 8)}
         except seal.Refused as error:
             self.skipTest(str(error))
+        self.held = keys_list(1, *USUAL)
         self.plain = self.work / 'w1700k-update.tar'
         bundle.write(self.plain, self.loader_image.read_bytes(), b'hsqs the release root',
                      config.partitions.GEOMETRY)
 
-    def release(self, number, sign=None):
+    def release(self, number, sign=None, carried=()):
         path = self.work / f'w1700k-release-{number}.tar'
-        bundle.sign(self.plain, path, number, sign or self.sign)
+        path.unlink(missing_ok=True)
+        bundle.sign(self.plain, path, number, sign or self.sign, carried=carried)
         return path
 
+    def turn(self, keys, by):
+        return seal.seal_list(keys.text, self.signers[by])
+
     def test_a_release_is_checked_here_then_by_the_unit_and_then_sent(self):
-        unit = ReleaseUnit([self.primary])
+        unit = ReleaseUnit(self.held)
         self.assertEqual(self.run_update(unit, self.release(4)), 0)
-        self.assertEqual(self.verbs(unit), ['status', 'cat', 'cat', 'release', 'cat', 'stage-loader', 'cat',
+        self.assertEqual(self.verbs(unit), ['status', 'keys', 'cat', 'release', 'cat', 'stage-loader', 'cat',
                                             'stage', 'reboot', '/usr/sbin/verify-storage', 'status', 'confirm'])
         self.assertEqual(unit.flags, {'stage-loader': [], 'stage': ['--from-release']},
                          'the loader is in the manifest; the root is this unit\'s, built from it')
@@ -673,32 +709,34 @@ class Releases(RemoteJoint):
     def test_an_unsigned_archive_or_build_is_not_sent_without_the_owners_word(self):
         for archive in (self.plain, None):
             with self.subTest(archive=archive):
-                unit = ReleaseUnit([self.primary])
-                with self.assertRaisesRegex(StepFailed, 'takes only releases sealed by a key it pins.*'
-                                                        '--unsigned'):
+                unit = ReleaseUnit(self.held)
+                with self.assertRaisesRegex(StepFailed, 'takes only releases sealed by a release key of its '
+                                                        'list.*--unsigned'):
                     self.run_update(unit, archive)
-                self.assertEqual(self.verbs(unit), ['status', 'cat'], 'its keys were read; nothing was sent')
+                self.assertEqual(self.verbs(unit), ['status', 'keys'], 'its keys were read; nothing was sent')
                 self.assertEqual(self.run_update(unit, archive, unsigned=True), 0)
                 self.assertEqual(unit.flags, {'stage-loader': ['--unsigned'], 'stage': ['--unsigned']})
                 self.assertEqual(unit.floor, 0, 'a build of the owner\'s moves no floor')
                 self.assertIn('as a build of your own', self.said())
 
-    def test_a_release_sealed_by_a_stranger_is_refused_before_anything_is_sent(self):
-        unit = ReleaseUnit([self.primary])
-        with self.assertRaisesRegex(StepFailed, "not a release this unit takes.*none of the release keys'"):
-            self.run_update(unit, self.release(4, self.sign_stranger))
-        self.assertEqual(self.verbs(unit), ['status', 'cat'])
-        self.assertEqual(unit.files, {})
+    def test_a_release_sealed_by_a_stranger_or_an_authority_is_refused_before_anything_is_sent(self):
+        for by in (3, 5, 6):
+            with self.subTest(by=by):
+                unit = ReleaseUnit(self.held)
+                with self.assertRaisesRegex(StepFailed, "not a release this unit takes.*none of the release keys'"):
+                    self.run_update(unit, self.release(4, self.signers[by]))
+                self.assertEqual(self.verbs(unit), ['status', 'keys'])
+                self.assertEqual(unit.files, {})
 
     def test_a_release_older_than_the_units_is_refused_before_anything_is_sent(self):
-        unit = ReleaseUnit([self.primary], floor=9)
+        unit = ReleaseUnit(self.held, floor=9)
         with self.assertRaisesRegex(StepFailed, 'release 4; this unit has settled on release 9'):
             self.run_update(unit, self.release(4))
         self.assertEqual(unit.files, {})
         self.assertEqual(self.run_update(unit, self.release(9)), 0, 'the same release again is no step back')
 
     def test_an_archive_the_unit_would_refuse_is_refused_even_when_it_has_all_of_it(self):
-        unit = ReleaseUnit([self.primary], floor=9)
+        unit = ReleaseUnit(self.held, floor=9)
         unit.running, unit.second = self.root, self.loader
         for archive, why in ((self.release(4), 'settled on release 9'),
                              (self.release(12, self.sign_stranger), 'none of the release keys'),
@@ -709,8 +747,7 @@ class Releases(RemoteJoint):
         self.assertIn('already current', self.said())
 
     def test_the_units_own_refusal_stops_the_update_too(self):
-        unit = ReleaseUnit([self.primary])
-        unit.keys = [self.primary]
+        unit = ReleaseUnit(self.held)
         archive = self.release(4)
         # The host believes a key the unit does not act on: the unit's word is the last.
         with mock.patch.object(seal, 'unseal', side_effect=[(4, b'', self.primary), seal.Refused('no')]):
@@ -718,18 +755,139 @@ class Releases(RemoteJoint):
                 self.run_update(unit, archive)
         self.assertEqual((unit.staged, unit.lstaged), ('', ''))
 
-    def test_a_unit_with_no_keys_takes_a_release_as_any_archive_and_is_told_nothing_checks_it(self):
-        unit = JointUnit()
-        self.assertEqual(self.run_update(unit, self.release(4, self.sign_stranger)), 0)
-        self.assertIn('pins no release key: nothing checks the seal', self.said())
-        self.assertNotIn('release', self.verbs(unit))
+    def test_an_unkeyed_unit_takes_a_release_as_any_archive_and_is_told_nothing_checks_it(self):
+        chain = [self.turn(self.held, 5)]
+        for unit in (JointUnit(), ReleaseUnit(None)):
+            with self.subTest(type(unit).__name__):
+                self.assertEqual(self.run_update(unit, self.release(4, self.sign_stranger, chain)), 0)
+                self.assertIn('holds no list of keys: nothing checks the seal', self.said())
+                self.assertFalse({'release', 'rotate', 'keys'} & set(self.verbs(unit)),
+                                 'and it is given no list: that is done at the bench')
+
+    def test_a_keyed_unit_that_lost_its_list_takes_nothing_sealed_and_says_so_loudly(self):
+        unit = ReleaseUnit(None, kind='lost')
+        with self.assertRaisesRegex(StepFailed, 'WAS GIVEN A LIST OF KEYS AND HOLDS NONE THAT READS.*'
+                                                'at the bench.*--unsigned'):
+            self.run_update(unit, self.release(4, carried=[self.turn(self.held, 5)]))
+        self.assertEqual(self.verbs(unit), ['status'], 'nothing was sent, and no list either')
+        self.assertEqual(self.run_update(unit, self.plain, unsigned=True), 0)
+        self.assertIn('HOLDS NONE THAT READS', self.said())
+        self.assertEqual(unit.flags, {'stage-loader': ['--unsigned'], 'stage': ['--unsigned']})
+
+    def test_the_rotations_a_release_carries_reach_the_unit_first_and_the_release_is_judged_by_them(self):
+        """The release key was replaced: the unit learns that from the release itself."""
+        second = keys_list(2, USUAL[0], USUAL[1], (3, 'release', 'second'))
+        third = keys_list((2, 1), USUAL[0], (8, 'keys', 'new-keys'), (3, 'release', 'second'))
+        chain = [self.turn(self.held, 5), self.turn(second, 6), self.turn(third, 5)]
+        unit = ReleaseUnit(self.held)
+        self.assertEqual(self.run_update(unit, self.release(4, self.sign_stranger, chain)), 0)
+        self.assertEqual(unit.held.text, third.text)
+        self.assertEqual(self.verbs(unit)[:10], ['status', 'keys', 'cat', 'rotate', 'cat', 'rotate', 'status',
+                                                 'keys', 'cat', 'release'],
+                         'the first list is the one it holds and is not sent again')
+        self.assertIn('keys: list 1.2, sealed by the-keys (keys', self.said())
+        self.assertIn('keys: list 2.1, sealed by the-root (root', self.said())
+        # The old release key seals nothing for it now, whatever the archive carries.
+        with self.assertRaisesRegex(StepFailed, "none of the release keys'"):
+            self.run_update(unit, self.release(5, carried=chain))
+        # A unit that already holds the last list is sent none.
+        self.assertEqual(self.run_update(unit, self.release(5, self.sign_stranger, chain)), 0)
+        self.assertNotIn('rotate', self.verbs(unit)[-12:])
+
+    def test_rotations_reach_a_unit_that_already_has_everything_else(self):
+        second = keys_list(2, USUAL[0], USUAL[1], (3, 'release', 'second'))
+        unit = ReleaseUnit(self.held)
+        unit.running, unit.second = self.root, self.loader
+        self.assertEqual(self.run_update(unit, self.release(4, self.sign_stranger,
+                                                            [self.turn(self.held, 5), self.turn(second, 6)])), 0)
+        self.assertIn('already current', self.said())
+        self.assertEqual(unit.held.text, second.text)
+
+    def test_a_rotation_the_unit_would_refuse_is_said_and_never_sent_and_stops_nothing_else(self):
+        second = keys_list(2, USUAL[0], USUAL[1], (3, 'release', 'second'))
+        for name, chain, why in (
+                ('sealed by a release key', [self.turn(keys_list(2, *USUAL[:2], (3, 'release', 'second')), 1)],
+                 'not sealed by a root or keys key'),
+                ('a keys key changing the root', [self.turn(keys_list(2, (8, 'root', 'new-root'), *USUAL[1:]), 6)],
+                 'stays in epoch 1'),
+                ('another list of the generation held', [self.turn(keys_list(1, *USUAL[:2]), 5)],
+                 'ANOTHER list 1.1'),
+                ('an epoch a keys key starts', [self.turn(keys_list((2, 1), *USUAL), 6)],
+                 'only a root key of the list held starts one')):
+            with self.subTest(name):
+                unit = ReleaseUnit(self.held)
+                self.assertEqual(self.run_update(unit, self.release(4, carried=chain)), 0,
+                                 'the release is one its own list takes')
+                self.assertRegex(self.said(), 'KEYS: a rotation with this update is NOT one this unit takes.*' + why)
+                self.assertNotIn('rotate', self.verbs(unit))
+                self.assertEqual(unit.held.text, self.held.text)
+        # One it does not take does not stand before one it does.
+        unit = ReleaseUnit(self.held)
+        chain = [self.turn(keys_list(1, *USUAL[:2]), 5), self.turn(second, 6)]
+        self.assertEqual(self.run_update(unit, self.release(4, self.sign_stranger, chain)), 0)
+        self.assertEqual(unit.held.text, second.text)
+
+    def test_a_release_names_the_rotations_it_carries_and_is_not_itself_without_them(self):
+        second = keys_list(2, USUAL[0], USUAL[1], (3, 'release', 'second'))
+        chain = [self.turn(self.held, 5), self.turn(second, 6)]
+        release = self.release(4, self.sign_stranger, chain)
+        manifest = bundle.read_release(release)[0]
+        self.assertEqual(manifest['rotations'], {'1.1': hashlib.sha256(chain[0]).hexdigest(),
+                                                 '1.2': hashlib.sha256(chain[1]).hexdigest()})
+
+        def remade(name, keep, also=()):
+            with tarfile.open(release) as source, tarfile.open(self.work / name, 'w') as target:
+                for member in source.getmembers():
+                    if keep(member.name):
+                        target.addfile(member, source.extractfile(member))
+                for member_name, data in also:
+                    info = tarfile.TarInfo(member_name)
+                    info.size = len(data)
+                    target.addfile(info, io.BytesIO(data))
+            return self.work / name
+        third = self.turn(keys_list(3, USUAL[0], USUAL[1], (1, 'release', 'primary')), 6)
+        for name, archive in (('one taken away', remade('less.tar', lambda member: member != 'keys/1.2.wms2')),
+                              ('all taken away', remade('none.tar', lambda member: not member.startswith('keys/'))),
+                              ('one added', remade('more.tar', lambda member: True, [('keys/1.3.wms2', third)])),
+                              ('one changed', remade('other.tar', lambda member: member != 'keys/1.2.wms2',
+                                                     [('keys/1.2.wms2', self.turn(second, 5))]))):
+            with self.subTest(name):
+                unit = ReleaseUnit(self.held)
+                with self.assertRaisesRegex(StepFailed, 'one was added, taken away or changed'):
+                    self.run_update(unit, archive)
+                self.assertEqual((unit.calls, unit.held.text), ([], self.held.text), 'the unit is not even asked')
+
+    def test_another_release_under_the_number_settled_on_is_refused_though_the_unit_has_its_images(self):
+        unit = ReleaseUnit(self.held)
+        self.assertEqual(self.run_update(unit, self.release(4)), 0)
+        self.assertEqual(unit.settled, hashlib.sha256(bundle.read_release(self.release(4))[2][40:-64]).hexdigest())
+        self.assertEqual(self.run_update(unit, self.release(4)), 0, 'the same release again is itself')
+        other = self.work / 'other-4.tar'
+        bundle.sign(self.plain, other, 4, self.sign, source='cd' * 20)
+        with self.assertRaisesRegex(StepFailed, 'ANOTHER release 4 than the one this unit settled on'):
+            self.run_update(unit, other)
+        self.assertEqual(self.verbs(unit)[-2:], ['status', 'keys'], 'nothing was sent')
+
+    def test_a_release_number_the_unit_cannot_read_stops_a_release(self):
+        unit = ReleaseUnit(self.held, floor='unreadable')
+        with self.assertRaisesRegex(StepFailed, 'does not read.*at the bench'):
+            self.run_update(unit, self.release(4))
+        self.assertEqual(unit.files, {})
+
+    def test_the_units_word_on_a_rotation_is_the_last(self):
+        second = keys_list(2, USUAL[0], USUAL[1], (3, 'release', 'second'))
+        unit = ReleaseUnit(self.held)
+        with mock.patch.object(seal, 'rotated', side_effect=[(second, second.keys[1]), seal.Refused('no')]):
+            with self.assertRaisesRegex(StepFailed, 'the unit does not take the rotation to list 1.2'):
+                self.run_update(unit, self.release(4, self.sign_stranger, [self.turn(second, 6)]))
+        self.assertEqual(unit.held.text, self.held.text)
 
     def test_the_root_alone_and_the_loader_alone_need_the_word_as_well(self):
         def sleep(seconds):
             self.now += seconds
         for run, verb in ((remote.run, 'stage'), (remote.run_loader, 'stage-loader')):
             with self.subTest(verb), mock.patch.object(config, 'ROOTFS', self.root_image):
-                unit = ReleaseUnit([self.primary])
+                unit = ReleaseUnit(self.held)
                 with self.assertRaisesRegex(StepFailed, 'takes only releases'):
                     run(self.settings, link=unit, clock=lambda: self.now, sleep=sleep)
                 self.assertEqual(run(self.settings, link=unit, clock=lambda: self.now, sleep=sleep,

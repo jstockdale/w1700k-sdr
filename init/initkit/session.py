@@ -82,18 +82,20 @@ def preflight(settings, network=True):
 
 
 @contextlib.contextmanager
-def open_session(settings, tool, write=False, passive=False):
-    """Run log, console and (unless passive) the stock and transfer TFTP servers.
+def open_session(settings, tool, write=False, passive=False, network=True):
+    """Run log, console and (unless passive, or without `network`) the stock and transfer
+    TFTP servers.
 
     `write` lets the console transmit NAND and environment writes; without it,
     the console refuses them.
     """
-    preflight(settings, network=not passive)
+    network = network and not passive
+    preflight(settings, network=network)
     log = RunLog(settings.data_dir, tool)
     served = log.dir / 'served'
     served.mkdir()
     servers = []
-    if not passive:
+    if network:
         servers = [
             tftp.ServerThread(served, settings.host_ip, settings.transfer_port,
                               allow_write=True, timeout=5.0, retries=5,

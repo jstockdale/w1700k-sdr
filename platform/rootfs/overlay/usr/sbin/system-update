@@ -7,7 +7,11 @@
 #
 #   system-update status                what runs, what is staged, what the loader made of it
 #   system-update release ENVELOPE      verify a release's sealed manifest (manifest.wms2 of a
-#                                       signed archive) against the keys this unit pins
+#                                       signed archive) against the release keys this unit holds
+#   system-update keys                  the list of keys this unit holds, as it is kept
+#   system-update rotate ENVELOPE       take a new list of keys, sealed by a key of the list held
+#   system-update first ENVELOPE        at the bench: give a marked unit that holds no list its first
+#   system-update unkey                 at the bench: forget the list
 #   system-update stage IMAGE SHA256 [--from-release | --unsigned]
 #                                       leave IMAGE (a SquashFS root, e.g. in /work) for the
 #                                       loader, with the running root beside it to go back to
@@ -29,27 +33,67 @@
 # it and on nothing else. Whatever is decided here is decided on a request that
 # was read; when durable storage cannot be read, nothing is decided.
 #
-# A unit built with release keys (/etc/w1700k/release-keys) stages only what a release
-# sealed by one of them lists: `release` first, then the images, whose digests must be in
-# its manifest. The release's number is kept once the update is confirmed, and nothing
-# older is taken after that; a unit has no clock, so the number is all it can hold a
-# release to. Two things pass without being in a manifest, and each says so:
+# A keyed unit holds a list of keys (seal/release.c says what a list is) in durable storage,
+# where no update reaches it, and stages only what a release sealed by a release key of that
+# list lists: `release` first, then the images, whose digests must be in its manifest. The
+# release's number is kept once the update is confirmed, and nothing older is taken after
+# that; a unit has no clock, so the number is all it can hold a release to. Two things pass
+# without being in a manifest, and each says so:
 #   --unsigned       the owner's own build. Whoever can run this as root owns the unit.
 #   --from-release   a root. Until one root fits every unit, the host builds each unit's
 #                    root (its ssh host key is in it) from the release's root, which it has
 #                    checked against the manifest; this unit cannot check that, and takes
 #                    the root because a release was verified, not because the root was.
-# A unit with no release keys takes any update, as before.
+#
+# The list changes in one way: `rotate`, with a list of a higher generation sealed by a root
+# or keys key of the list held. No update carries a list, so a key that seals releases cannot
+# change who is trusted. A unit gets its first list at the bench, on its serial console
+# (`first`), and before it a mark that it is keyed: `w1700k_keyed=1` in the stock boot loader's
+# environment, which only the stock loader's prompt writes and which is outside durable storage
+# and outside everything an update replaces. Nothing here sets or clears the mark; init/bench
+# does, at that prompt. So there are three kinds of unit:
+#   unkeyed   no mark and no list: it takes any update, as a unit someone built themselves does
+#   keyed     a list that reads: releases and rotations sealed for it, and nothing else
+#   lost      the mark, or a list, but no list that reads: nothing but --unsigned, until it is
+#             given a list at the bench again. A stock environment that does not read counts
+#             as a mark: what cannot be told is not taken for unkeyed.
+# Whoever is root on a unit can do all of this by hand; the mark and the console are there so
+# that nothing this script is asked over the network does it.
 set -eu
 . /etc/w1700k/storage.conf
 STAGED=/durable/update
 MARK='staged-update 1'		# in the description of a loader that applies updates
 SECOND_MARK='second-loader 1'	# and of one that starts a second loader from `loader-b`
 SECOND_KIND='W1700K SDR second ARM loader'	# the description of such a second loader
-RELEASE=/usr/sbin/w1700k-release	# the verifier, and the release it verified this boot (in RAM)
+RELEASE=/usr/sbin/w1700k-release	# the verifier
+STATE=/run/w1700k-release	# the release it verified this boot (in RAM)
 FLOOR=/durable/release		# the number of the newest release this unit settled on
+KEYS=/durable/keys		# the list of keys this unit trusts
+HELD=/run/w1700k-keys.$$	# this run's copy of it (in RAM)
+LOCK=/run/w1700k-update.lock	# one run at a time changes anything
+MARKED=uenv			# the partition of the stock environment, where the mark of a keyed unit is
+CONSOLE=/dev/console		# where the bench is
 
 fail() { echo "system-update: $*" >&2; exit 1; }
+
+# Whatever this run leaves in RAM goes with it, and so does its hold on the unit.
+trap 'rm -f "$HELD" "$HELD.new" "$HELD.new.part"; [ -z "${LOCKED:-}" ] || rm -rf "$LOCK"' EXIT
+trap 'exit 130' INT TERM HUP
+
+alone()		# nothing else changes this unit's update state or its keys while this run does
+{
+	if ! mkdir "$LOCK" 2>/dev/null; then
+		# A run that was killed left its hold behind; one that still runs keeps it.
+		other=$(cat "$LOCK/pid" 2>/dev/null || :)
+		case $other in ''|*[!0-9]*) other= ;; esac
+		[ -z "$other" ] || ! kill -0 "$other" 2>/dev/null ||
+			fail "another system-update is at work on this unit (process $other); try again when it is done"
+		rm -rf "$LOCK"
+		mkdir "$LOCK" 2>/dev/null || fail "another system-update is at work on this unit; try again when it is done"
+	fi
+	LOCKED=1
+	echo "$$" > "$LOCK/pid"
+}
 
 volume()	# the UBI volume named $1 on ubi0, as /dev/ubi0_N
 {
@@ -83,8 +127,9 @@ second_loader()	# the digest of the image in `loader-b`; nothing when it holds n
 	head -c "$size" "$node" | digest
 }
 
-# What the loader keeps while an update is neither confirmed nor undone.
-loader_note() { fw_printenv -n "$1" 2>/dev/null || :; }
+# What the loader keeps while an update is neither confirmed nor undone: digests, and
+# nothing else is passed on as one.
+loader_note() { fw_printenv -n "$1" 2>/dev/null | head -n 1 | tr -cd '0-9a-f' || :; }
 
 # The staged request as it is kept, a line a field (update_new, update_old, loader_new);
 # nothing when none is staged.
@@ -128,36 +173,119 @@ unwritten()
 			"unit and the first loader removes it, or confirm it"
 }
 
-pinned() { "$RELEASE" pinned > /dev/null 2>&1; }
-
-release_floor()	# the newest release settled on; 0 before the first
+mark()	# yes, no, or unreadable: is this unit marked as keyed?
 {
-	floor=$(/usr/sbin/durable-run sh -c '[ ! -f "$1" ] || echo "floor: $(cat "$1")"' sh "$FLOOR" |
-		sed -n 's/^floor: //p')
-	case $floor in ''|*[!0-9]*) echo 0 ;; *) echo "$floor" ;; esac
+	code=0
+	"$RELEASE" mark --environment "$(partition "$MARKED")" > /dev/null 2>&1 || code=$?
+	case $code in 0) echo yes ;; 1) echo no ;; *) echo unreadable ;; esac
 }
+
+look()	# LIST: is the list held good, none or damaged? MARK. REGIME: unkeyed, keyed or lost
+{
+	# A root from before there were lists has no verifier, or one that knows nothing of
+	# lists and marks. A unit on such a root was never keyed, unless it carries a list or
+	# the mark all the same: then it is a keyed unit on a root that can judge nothing, and
+	# takes nothing sealed.
+	if [ ! -x "$RELEASE" ] || ! "$RELEASE" mark --environment /dev/null 2>&1 | grep -q 'stock environment'; then
+		LIST=none MARK=no
+		/usr/sbin/durable-run sh -c '[ ! -e "$1" ]' sh "$KEYS" > /dev/null 2>&1 || LIST=damaged
+		! head -c 16384 "$(partition "$MARKED")" 2>/dev/null | tr '\0' '\n' | grep -qx 'w1700k_keyed=1' ||
+			MARK=yes
+		[ "$LIST$MARK" = noneno ] && REGIME=unkeyed || REGIME=lost
+		return 0
+	fi
+	MARK=$(mark)
+	rm -f "$HELD" "$HELD.new"
+	/usr/sbin/durable-run sh -c '[ ! -e "$1" ] || cat "$1" > "$2"' sh "$KEYS" "$HELD" > /dev/null ||
+		fail "durable storage could not be read for the key list"
+	if [ ! -e "$HELD" ]; then
+		LIST=none
+	elif "$RELEASE" list --keys "$HELD" > /dev/null 2>&1; then
+		LIST=good
+	else
+		LIST=damaged
+	fi
+	case $LIST in
+	good) REGIME=keyed ;;
+	none) [ "$MARK" = no ] && REGIME=unkeyed || REGIME=lost ;;
+	*) REGIME=lost ;;
+	esac
+}
+
+generation() { "$RELEASE" list --keys "$HELD" 2>/dev/null | sed -n 's/^generation=//p'; }
+
+lost() { fail "this unit was given a list of keys and holds none that reads (list $LIST, mark $MARK): it takes no" \
+	"sealed update until it is given a list at the bench again (system-update first)${1:-}"; }
+
+at_the_bench()	# $1 names what is being done
+{
+	[ "$(tty 2>/dev/null || :)" = "$CONSOLE" ] ||
+		fail "$1 is done at the bench, on the unit's serial console, and nowhere else"
+}
+
+keep_list()	# put $HELD.new, which the verifier wrote, in the list's place
+{
+	/usr/sbin/durable-run sh -eu -c '
+		cp "$2" "$1.part"
+		sync
+		mv "$1.part" "$1"
+		sync
+		[ "$(sha256sum < "$1" | cut -d" " -f1)" = "$(sha256sum < "$2" | cut -d" " -f1)" ]
+	' sh "$KEYS" "$HELD.new" > /dev/null
+}
+
+settled()	# what is kept of the newest release settled on: its number, then its manifest's digest;
+		# `none' before the first, and nothing at all when durable storage does not say
+{
+	/usr/sbin/durable-run sh -c 'if [ -e "$1" ]; then echo "floor: $(cat "$1")"; else echo "floor: none"; fi' \
+		sh "$FLOOR" | sed -n 's/^floor: //p'
+}
+
+release_floor()	# the newest release settled on; 0 before the first; `unreadable' for what is no number
+{
+	set -- $(settled)
+	case ${1:-} in none) echo 0 ;; ''|*[!0-9]*) echo unreadable ;; *) echo "$1" ;; esac
+}
+
+floor()		# the same for a decision: a number that does not read stops it
+{
+	number=$(release_floor)
+	[ "$number" != unreadable ] || fail "the number of the release this unit settled on does not read" \
+		"($FLOOR): it takes no release until it is keyed at the bench again"
+	echo "$number"
+}
+
+verified() { "$RELEASE" number --state "$STATE" 2>/dev/null || :; }
 
 permitted()	# may the image with digest $1 be staged, given the flag $2? $3 names it
 {
-	pinned || return 0
-	case ${2:-} in
-	--unsigned)
+	look
+	[ "$REGIME" != unkeyed ] || return 0
+	if [ "${2:-}" = --unsigned ]; then
 		echo "system-update: taking $3 unsigned, on the owner's word" >&2
-		return 0 ;;
-	--from-release)
-		[ -n "$("$RELEASE" number 2>/dev/null || :)" ] || return 1
-		echo "system-update: taking $3 as built by the host from release $("$RELEASE" number); it is not checked here" >&2
-		return 0 ;;
-	esac
-	"$RELEASE" allows "$1"
+		return 0
+	fi
+	[ "$REGIME" = keyed ] || lost ", or pass --unsigned for a build of your own"
+	if [ "${2:-}" = --from-release ]; then
+		[ -n "$(verified)" ] || return 1
+		echo "system-update: taking $3 as built by the host from release $(verified); it is not checked here" >&2
+		return 0
+	fi
+	"$RELEASE" allows --state "$STATE" "$1"
 }
 
 note_release()	# beside what is staged: the release it comes from, for `confirm` to keep
 {
-	number=$("$RELEASE" number 2>/dev/null || :)
+	number=$(verified)
 	[ -n "$number" ] || return 0
-	/usr/sbin/durable-run sh -c 'echo "$2" > "$1/release" && sync' sh "$STAGED" "$number" > /dev/null ||
-		fail "the release's number could not be noted"
+	/usr/sbin/durable-run sh -c 'echo "$2 $3" > "$1/release" && sync' sh "$STAGED" "$number" \
+		"$(digest < "$STATE/manifest")" > /dev/null || fail "the release's number could not be noted"
+}
+
+unnote_release()	# what is staged on the owner's word comes from no release, and moves no floor
+{
+	/usr/sbin/durable-run sh -c 'rm -f "$1/release" && sync' sh "$STAGED" > /dev/null ||
+		fail "an earlier release's number could not be forgotten"
 }
 
 # The request first, written out, and only then the images: the request is what the loader
@@ -184,21 +312,95 @@ status)
 	echo "loader_tried=$(loader_note loader_tried)"
 	echo "loader_booted=$(loader_note loader_booted)"
 	echo "loader_failed=$(loader_note loader_failed)"
-	echo "release_keys=$("$RELEASE" pinned 2>/dev/null || :)"
+	look
+	echo "keys=$REGIME"
+	echo "key_mark=$MARK"
+	echo "key_list=$LIST"
+	echo "key_generation=$(generation)"
+	echo "release_keys=$("$RELEASE" list --keys "$HELD" 2>/dev/null | grep -c '^release ' || :)"
 	echo "release=$(release_floor)"
-	echo "release_verified=$("$RELEASE" number 2>/dev/null || :)"
+	set -- $(settled)
+	echo "release_manifest=${2:-}"
+	echo "release_verified=$(verified)"
 	;;
 release)
 	envelope=${2:-}
 	[ -f "$envelope" ] || fail "usage: system-update release ENVELOPE"
-	pinned || fail "this unit pins no release key; it takes any update"
-	"$RELEASE" verify --floor "$(release_floor)" "$envelope" > /dev/null ||
+	alone
+	# What was verified before stands for nothing once another release is asked about.
+	rm -rf "$STATE"
+	look
+	[ "$REGIME" != unkeyed ] || fail "this unit holds no list of keys; it takes any update"
+	[ "$REGIME" = keyed ] || lost
+	number=$(floor) || exit 1
+	"$RELEASE" verify --keys "$HELD" --state "$STATE" --floor "$number" "$envelope" > /dev/null ||
 		fail "not a release this unit takes"
-	echo "system-update: release $("$RELEASE" number) verified; its images can be staged"
+	# The number this unit settled on is one release: another under the same number is not it.
+	set -- $(settled)
+	if [ "$(verified)" = "${1:-}" ] && [ -n "${2:-}" ] && [ "$(digest < "$STATE/manifest")" != "$2" ]; then
+		rm -rf "$STATE"
+		fail "this is ANOTHER release $1 than the one this unit settled on: two were sealed under one number"
+	fi
+	echo "system-update: release $(verified) verified; its images can be staged"
+	;;
+keys)
+	look
+	[ "$LIST" = good ] || fail "this unit holds no list of keys that reads ($LIST)"
+	cat "$HELD"
+	;;
+rotate)
+	envelope=${2:-}
+	[ -f "$envelope" ] || fail "usage: system-update rotate ENVELOPE"
+	alone
+	look
+	[ "$REGIME" != unkeyed ] || fail "this unit holds no list of keys: its first is given at the bench" \
+		"(system-update first)"
+	[ "$REGIME" = keyed ] || lost
+	said=$("$RELEASE" rotate --keys "$HELD" --out "$HELD.new" "$envelope") || fail "not a list this unit takes"
+	case $said in
+	*unchanged) echo "system-update: this is the list held ($said)"; exit 0 ;;
+	esac
+	keep_list || fail "the new list could not be kept; look at what is held (system-update keys)"
+	# A release verified under the list that was held is not one verified under this.
+	rm -rf "$STATE"
+	echo "system-update: the list of keys is now $said"
+	;;
+first)
+	envelope=${2:-}
+	[ -f "$envelope" ] || fail "usage: system-update first ENVELOPE"
+	at_the_bench "giving a unit its first list of keys"
+	alone
+	rm -rf "$STATE"
+	look
+	[ "$LIST" != good ] || fail "this unit holds a list of keys ($(generation)): a new one" \
+		"reaches it as a rotation, or unkey it first (init/bench unkey)"
+	# The mark comes before the list, and from the stock boot loader's prompt: a unit that
+	# stops between the two takes nothing, which is the side to fall on.
+	[ "$MARK" = yes ] || fail "this unit is not marked as keyed (mark $MARK): the mark is set at the stock" \
+		"boot loader's prompt before the list is given (init/bench key does both)"
+	said=$("$RELEASE" rotate --first --out "$HELD.new" "$envelope") || fail "not a first list"
+	keep_list || fail "the unit is marked keyed and the list could not be kept: it takes nothing until" \
+		"this is done again"
+	# Release numbers start again with the keys that seal them.
+	/usr/sbin/durable-run sh -c 'rm -f "$1" && sync' sh "$FLOOR" > /dev/null ||
+		fail "the list is kept, but the old release number could not be forgotten"
+	echo "system-update: this unit is keyed; its list is $said"
+	"$RELEASE" list --keys "$HELD.new"
+	;;
+unkey)
+	at_the_bench "unkeying a unit"
+	alone
+	rm -rf "$STATE"
+	/usr/sbin/durable-run sh -c 'rm -f "$1" "$1.part" "$2" && sync' sh "$KEYS" "$FLOOR" > /dev/null ||
+		fail "the list could not be removed; nothing is changed"
+	look
+	echo "system-update: this unit holds no list of keys (mark $MARK). While it is marked it takes nothing" \
+		"sealed: the mark is cleared at the stock boot loader's prompt (init/bench unkey does both)"
 	;;
 stage)
 	image=${2:-} want=${3:-}
 	[ -f "$image" ] && [ -n "$want" ] || fail "usage: system-update stage IMAGE SHA256 [--from-release | --unsigned]"
+	alone
 	installed || fail "this boot runs from RAM, not from the installed root"
 	loader_applies || fail "the loader on this unit does not apply staged updates: " \
 		"flash it once over the serial console (init/flash --loader)"
@@ -236,12 +438,13 @@ stage)
 		mv "$staged/request.part" "$staged/request"
 		sync
 	' sh "$STAGED" "$image" "$want" "$root" "$old" "$size" || fail "nothing is staged"
-	[ "${4:-}" = --unsigned ] || note_release
+	if [ "${4:-}" = --unsigned ]; then unnote_release; else note_release; fi
 	echo "system-update: staged $want over $old; reboot to have the loader write it"
 	;;
 stage-loader)
 	image=${2:-} want=${3:-}
 	[ -f "$image" ] && [ -n "$want" ] || fail "usage: system-update stage-loader IMAGE SHA256 [--unsigned]"
+	alone
 	installed || fail "this boot runs from RAM, not from the installed root"
 	loader_starts_second || fail "the loader on this unit starts no second loader: " \
 		"flash it once over the serial console (init/flash --loader)"
@@ -275,10 +478,11 @@ stage-loader)
 		mv "$staged/request.part" "$staged/request"
 		sync
 	' sh "$STAGED" "$image" "$want" "$size" || fail "no loader is staged"
-	[ "${4:-}" = --unsigned ] || note_release
+	if [ "${4:-}" = --unsigned ]; then unnote_release; else note_release; fi
 	echo "system-update: staged the loader $want; reboot to have the first loader write and start it"
 	;;
 confirm)
+	alone
 	now=$(running)
 	request=$(request)
 	root=$(field "$request" update_new)
@@ -291,17 +495,24 @@ confirm)
 		[ "$(second_loader)" = "$loader" ] || fail "loader-b does not hold the staged loader $loader"
 	fi
 	# What was staged from a release moves the floor up to it: nothing older is taken again.
-	number=$(/usr/sbin/durable-run sh -c '[ ! -f "$1/release" ] || echo "release: $(cat "$1/release")"' \
+	noted=$(/usr/sbin/durable-run sh -c '[ ! -f "$1/release" ] || echo "release: $(cat "$1/release")"' \
 		sh "$STAGED" | sed -n 's/^release: //p')
+	number=${noted%% *}
 	case $number in *[!0-9]*) number= ;; esac
-	[ -z "$number" ] || [ "$number" -gt "$(release_floor)" ] || number=
-	forget
+	if [ -n "$number" ]; then
+		kept=$(floor) || exit 1
+		[ "$number" -gt "$kept" ] || number=
+	fi
+	# The number first, then what was staged: a unit that stops between the two has moved
+	# its floor and still has its update to settle, not the other way round.
 	[ -z "$number" ] || /usr/sbin/durable-run sh -c \
-		'echo "$2" > "$1.part" && sync && mv "$1.part" "$1" && sync' sh "$FLOOR" "$number" > /dev/null ||
-		fail "settled, but the release's number could not be kept"
+		'echo "$2" > "$1.part" && sync && mv "$1.part" "$1" && sync' sh "$FLOOR" "$noted" > /dev/null ||
+		fail "the release's number could not be kept; nothing is settled"
+	forget
 	echo "system-update: settled on root $now${loader:+ and loader $loader}${number:+, release $number}"
 	;;
 cancel)
+	alone
 	request=$(request)
 	unwritten "$request" "not cancelled" either
 	forget
@@ -309,7 +520,8 @@ cancel)
 	;;
 *)
 	echo "usage: system-update status | release ENVELOPE | stage IMAGE SHA256 [--from-release | --unsigned] |" >&2
-	echo "       stage-loader IMAGE SHA256 [--unsigned] | confirm | cancel" >&2
+	echo "       stage-loader IMAGE SHA256 [--unsigned] | confirm | cancel |" >&2
+	echo "       keys | rotate ENVELOPE | first ENVELOPE | unkey" >&2
 	exit 2
 	;;
 esac
