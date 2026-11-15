@@ -1,33 +1,55 @@
 # SPDX-License-Identifier: MIT
 """The update archive (w1700k-update.tar, written by platform/images.py): the second loader and
 the generic root with a manifest of their digests and of the flash layout they are built for.
-Read whole and checked before anything is used: what does not hold together is refused."""
+Read whole and checked before anything is used: what does not hold together is refused.
+
+A release is such an archive with one member more, `manifest.wms2`: the manifest again, sealed
+with a release key (`seal.py`, `init/sign`). The manifest lists the digest of every image, so
+the one signature covers them all. Whether the seal is a key's that matters is not decided
+here, where no key is known: a unit decides it, and the tool that sends it the archive."""
 import hashlib
 import io
 import json
 import tarfile
 
+from . import seal
 from .console import StepFailed
 
 FORMAT = 1
 LOADER, ROOT = 'w1700k-loader-b.itb', 'rootfs.squashfs'
+SEALED = 'manifest.wms2'
 LIMIT = 64 << 20
 
 
 def read(path):
     """(manifest, {name: bytes}) of the archive at `path`."""
+    manifest, data, _ = read_release(path)
+    return manifest, data
+
+
+def read_release(path):
+    """(manifest, {name: bytes}, the sealed manifest or None) of the archive at `path`. A seal
+    is only known here to be over this archive's own manifest, not whose it is."""
     try:
         with tarfile.open(path, mode='r:') as archive:
             members = {m.name: m for m in archive.getmembers()}
-            if set(members) != {'manifest.json', LOADER, ROOT} or not all(m.isfile() for m in members.values()):
+            if set(members) - {SEALED} != {'manifest.json', LOADER, ROOT} \
+                    or not all(m.isfile() for m in members.values()):
                 raise StepFailed(f'{path} is not a W1700K update archive: it holds {sorted(members)}')
             if any(m.size > LIMIT for m in members.values()):
                 raise StepFailed(f'{path}: a member is larger than any image of a unit')
             data = {name: archive.extractfile(member).read() for name, member in members.items()}
     except (OSError, tarfile.TarError) as error:
         raise StepFailed(f'{path} cannot be read as an update archive: {error}') from None
+    sealed, text = data.pop(SEALED, None), data.pop('manifest.json')
+    if sealed is not None:
+        try:
+            if seal.body_of(sealed) != text:
+                raise StepFailed(f'{path}: what is sealed in it is not its own manifest')
+        except seal.Refused as error:
+            raise StepFailed(f'{path}: {SEALED} is {error}') from None
     try:
-        manifest = json.loads(data.pop('manifest.json'))
+        manifest = json.loads(text)
         listed = manifest['files']
         partitions = {name: tuple(span) for name, span in manifest['partitions'].items()}
         if manifest['format'] != FORMAT:
@@ -39,7 +61,22 @@ def read(path):
     except (KeyError, TypeError, ValueError) as error:
         raise StepFailed(f'{path}: the manifest does not read as one ({error!r})') from None
     manifest['partitions'] = partitions
-    return manifest, data
+    return manifest, data, sealed
+
+
+def sign(path, output, release, sign_with, when_ms=None):
+    """The archive at `path` as release number `release` in `output`: the same images, the
+    manifest with the number in it, and that manifest sealed by `sign_with(message)`."""
+    manifest, data, _ = read_release(path)
+    manifest = {**manifest, 'release': release,
+                'partitions': {name: list(span) for name, span in manifest['partitions'].items()}}
+    text = (json.dumps(manifest, indent=1) + '\n').encode()
+    try:
+        sealed = seal.seal(text, release, sign_with, when_ms)
+    except seal.Refused as error:
+        raise StepFailed(str(error)) from None
+    _write(output, {'manifest.json': text, SEALED: sealed, **data})
+    return sealed
 
 
 def write(path, loader, root, partitions):
@@ -48,7 +85,10 @@ def write(path, loader, root, partitions):
     manifest = {'format': FORMAT, 'partitions': {name: list(span) for name, span in partitions.items()},
                 'files': {name: {'sha256': hashlib.sha256(data).hexdigest(), 'bytes': len(data)}
                           for name, data in files.items()}}
-    files = {'manifest.json': (json.dumps(manifest) + '\n').encode(), **files}
+    _write(path, {'manifest.json': (json.dumps(manifest) + '\n').encode(), **files})
+
+
+def _write(path, files):
     with tarfile.open(path, mode='w', format=tarfile.USTAR_FORMAT) as archive:
         for name, data in files.items():
             info = tarfile.TarInfo(name)
