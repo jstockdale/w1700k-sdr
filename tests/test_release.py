@@ -467,6 +467,9 @@ class Verifier(Built):
         sealed = seal.seal(MANIFEST, 5, self.sign)
         self.assertEqual(self.verify(sealed, floor=4).returncode, 0)
         self.assertEqual(self.verify(sealed, floor=5).returncode, 0, 'the same release again is no step back')
+        for odd in (' 4', '+4', '-1', '4 ', '0x4', '', '4.0'):
+            with self.subTest(floor=odd):
+                self.assertEqual(self.verify(sealed, floor=odd).returncode, 2, 'a floor is a number written plainly')
         shutil.rmtree(self.state)
         result = self.verify(sealed, floor=6)
         self.assertEqual(result.returncode, 1)
@@ -1848,6 +1851,13 @@ class Issued(unittest.TestCase):
             'w1700k-sdr-release-dev-spare': '86d548358ed224560dd25e0a31272bb3d67deca36ea6978617b4c434e0ecf453'
                                             '187dc89de60ca5338f200bf35003eda5fe729787bad89c9330ac50654294c20a'}
 
+    # Each list since: its label, who sealed it, and the keys that were new in it, each with the
+    # signature over the same bytes by which it showed it is held.
+    SINCE = (('1.2', 'w1700k-sdr-authority-dev-primary', 'keys',
+              {'w1700k-sdr-release-dev-primary-2': ('2329d353dd0bdf1e', '9b4bb84c85625393',
+                                                    '171ad9a8413e4b0ab70072dba9398c76500767b9dade4c5a251f1b02c4ec1d5a'
+                                                    '9b21bd4f44da629586b49ec2541ddf615f85e179ec3ef5e6167512228d757909')}),)
+
     def chain(self):
         sealed = [path.read_bytes() for path in self.CHAIN.glob('*.wms2')]
         return sorted(sealed, key=lambda envelope: seal.parse_list(seal.body_of(envelope)).stamp)
@@ -1864,6 +1874,24 @@ class Issued(unittest.TestCase):
         bundle.chain(chain)
         for name, envelope in zip(sorted(path.name for path in self.CHAIN.glob('*.wms2')), chain):
             self.assertEqual(name, f'w1700k-keys-{seal.parse_list(seal.body_of(envelope)).label}.wms2')
+
+    def test_every_list_since_follows_from_the_one_before_and_its_new_keys_are_held(self):
+        chain = self.chain()
+        self.assertEqual(len(chain), 1 + len(self.SINCE), 'a list in the chain that this test does not know')
+        held, _ = seal.rotated(None, chain[0])
+        for envelope, (label, sealer, scope, new) in zip(chain[1:], self.SINCE):
+            with self.subTest(label):
+                following, by = seal.rotated(held, envelope)
+                self.assertEqual((following.label, by.name, by.scope), (label, sealer, scope))
+                fresh = {key.name: key for key in following.keys if key.public not in {k.public for k in held.keys}}
+                self.assertEqual(set(fresh), set(new))
+                message = b'\x16\x00w1700k-sdr/rotate-keys' + envelope[:-64]
+                for name, (unit_print, registry, proof) in new.items():
+                    key = fresh[name]
+                    self.assertEqual((seal.fingerprint(key.public), seal.registry_fingerprint(key.public)),
+                                     (unit_print, registry))
+                    self.assertTrue(seal.verifies(key.public, message, bytes.fromhex(proof)), name)
+                held = following
 
     def test_each_release_key_proved_it_is_held_twice(self):
         self.assertEqual(hashlib.sha256(self.PROOF).hexdigest(),
