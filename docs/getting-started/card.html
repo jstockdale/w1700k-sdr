@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>W1700K SDR Quick Start Card</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@100..125,500..800&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+/* A two-sided card, half letter (5.5 x 8.5 in). Print at 100 %, both sides, flipped on the long edge. */
+@page { size: 5.5in 8.5in; margin: 0; }
+:root {
+  --ink: #12161c; --soft: #4b5462; --faint: #858e9b; --rule: #cfd4dc; --code: #eef0f3; --lens: #14161a;
+  --display: "Archivo", "Arial Narrow", "Helvetica Neue", Arial, sans-serif;
+  --body: "IBM Plex Sans", "Segoe UI", Helvetica, Arial, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, Menlo, Consolas, monospace;
+}
+* { box-sizing: border-box; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+html, body { margin: 0; padding: 0; background: #fff; color: var(--ink); }
+body { font: 400 8.6pt/1.42 var(--body); }
+.sheet { width: 5.5in; height: 8.5in; padding: 0.34in 0.4in 0.3in; display: flex; flex-direction: column; gap: 0.085in; overflow: hidden; page-break-after: always; break-after: page; background: #fff; }
+.sheet:last-child { page-break-after: auto; break-after: auto; }
+@media screen {
+  body { background: #d9dce1; padding: 24px 0; display: flex; flex-direction: column; align-items: center; gap: 24px; }
+  .sheet { box-shadow: 0 2px 14px rgba(0, 0, 0, 0.18); }
+}
+
+.brand { font: 600 6.6pt/1 var(--display); font-stretch: 118%; letter-spacing: 0.22em; text-transform: uppercase; color: var(--soft); display: flex; align-items: center; gap: 6pt; }
+.brand::before { content: ""; width: 16pt; height: 5.5pt; border-radius: 2pt; background: #fff; border: 0.75pt solid var(--ink); }
+.head { display: flex; justify-content: space-between; align-items: flex-end; gap: 12pt; border-bottom: 1.5pt solid var(--ink); padding-bottom: 7pt; }
+h1 { margin: 5pt 0 0; font: 800 25pt/0.95 var(--display); font-stretch: 112%; letter-spacing: -0.02em; }
+.kind { font: 500 10pt/1.2 var(--display); color: var(--soft); text-align: right; white-space: nowrap; }
+h2 { margin: 0; font: 700 10.5pt/1.2 var(--display); font-stretch: 108%; }
+p { margin: 0; }
+code, pre { font-family: var(--mono); }
+code { font-size: 0.92em; }
+.small { font-size: 7.4pt; line-height: 1.38; color: var(--soft); }
+
+.unit { display: grid; grid-template-columns: 1fr 1fr; gap: 5pt 14pt; }
+.unit div { display: flex; flex-direction: column; gap: 9pt; }
+.unit div.wide { grid-column: 1 / -1; }
+.unit label { font: 500 6pt/1 var(--mono); letter-spacing: 0.1em; text-transform: uppercase; color: var(--faint); }
+.unit span { border-bottom: 0.75pt solid var(--ink); height: 7pt; }
+
+ol.steps { list-style: none; margin: 0; padding: 0; counter-reset: s; display: flex; flex-direction: column; gap: 6.5pt; }
+ol.steps > li { counter-increment: s; display: grid; grid-template-columns: 19pt 1fr; }
+ol.steps > li::before { content: counter(s, decimal-leading-zero); font: 500 7.6pt/1.6 var(--mono); color: var(--faint); }
+ol.steps b { font: 600 9pt/1.3 var(--display); display: block; }
+ol.steps > li > div { display: flex; flex-direction: column; gap: 2.5pt; min-width: 0; }
+pre { margin: 1pt 0 0; background: var(--code); border-radius: 3pt; padding: 3.5pt 5pt; font-size: 6.7pt; line-height: 1.5; white-space: pre; overflow: hidden; }
+
+svg { display: block; width: 100%; height: auto; }
+svg text { font-family: var(--body); font-size: 9px; fill: var(--ink); }
+svg text.m { font-family: var(--mono); font-size: 8px; fill: var(--soft); }
+svg text.t { font-family: var(--display); font-weight: 700; font-size: 11px; }
+
+table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+th { text-align: left; font: 500 5.8pt/1.2 var(--mono); letter-spacing: 0.1em; text-transform: uppercase; color: var(--faint); padding: 0 6pt 3pt 0; border-bottom: 1pt solid var(--ink); }
+td { padding: 1.8pt 6pt 1.8pt 0; border-bottom: 0.5pt solid var(--rule); vertical-align: middle; }
+.legend td:first-child { width: 40pt; }
+.legend td:nth-child(2) { font-weight: 600; width: 37%; }
+.legend td:nth-child(3) { color: var(--soft); }
+.legend tr.mod td:nth-child(2) { font-weight: 400; }
+.lens { display: block; width: 32pt; height: 11pt; border-radius: 3pt; border: 0.75pt solid var(--lens); background: var(--lens); }
+/* Print cannot move, so motion is drawn: a fade for breathing, hard bars for blinking, the hue circle for the rainbow. */
+.solid { background: var(--c); }
+.breath { background: linear-gradient(90deg, var(--c), var(--lens) 50%, var(--c)); }
+.up { background: linear-gradient(90deg, var(--lens), var(--c)); }
+.down { background: linear-gradient(90deg, var(--c), var(--lens)); }
+.fill { background: linear-gradient(90deg, #3a3d42, #fff 80%); }
+.bars { background: repeating-linear-gradient(90deg, var(--c) 0 5.33pt, var(--lens) 5.33pt 10.66pt); }
+.hue { background: linear-gradient(90deg, #f00, #ff0, #0f0, #0ff, #2a48ff, #f0f, #f00); }
+.three { background: linear-gradient(90deg, #00f0ff 0 33.3%, #2a48ff 33.3% 66.6%, #ff22ff 66.6%); }
+.lift { background: linear-gradient(90deg, #00e000 0 60%, #c8ffc8 60% 78%, #00e000 78%); }
+.foot { margin-top: auto; border-top: 0.75pt solid var(--rule); padding-top: 5pt; display: flex; justify-content: space-between; gap: 10pt; font-size: 6.6pt; color: var(--faint); }
+ul { margin: 0; padding-left: 11pt; display: flex; flex-direction: column; gap: 2pt; }
+</style>
+</head>
+<body>
+
+<div class="sheet">
+  <div class="head">
+    <div><div class="brand">Whitehat Hardware</div><h1>W1700K SDR</h1></div>
+    <div class="kind">Quick start</div>
+  </div>
+
+  <div class="unit">
+    <div><label>Serial</label><span></span></div>
+    <div><label>Software</label><span></span></div>
+    <div class="wide"><label>SSH host key fingerprint (SHA256)</label><span></span></div>
+  </div>
+
+  <p>Your unit arrives with the SDR system installed and no login key of anyone's. Cable it, set up a Linux host, give it your key with a paperclip, and start a stream. No serial console is needed.</p>
+
+  <svg viewBox="0 0 470 118" role="img" aria-label="Cabling: wan to the host's stream port, lan3 to its control port">
+    <rect x="1" y="6" width="150" height="106" rx="6" fill="#f3f4f6" stroke="#12161c"/>
+    <text class="t" x="12" y="24">W1700K SDR</text>
+    <rect x="115" y="36" width="36" height="22" rx="3" fill="#fff" stroke="#12161c"/><text x="133" y="50" text-anchor="middle" class="m" style="fill:#12161c">wan</text>
+    <text x="108" y="45" text-anchor="end">10 GbE</text><text class="m" x="108" y="56" text-anchor="end">10.77.0.1</text>
+    <rect x="115" y="76" width="36" height="22" rx="3" fill="#fff" stroke="#12161c"/><text x="133" y="90" text-anchor="middle" class="m" style="fill:#12161c">lan3</text>
+    <text x="108" y="85" text-anchor="end">1 GbE</text><text class="m" x="108" y="96" text-anchor="end">192.168.1.1</text>
+    <path d="M151 47 H319" stroke="#12161c" stroke-width="3.5" fill="none"/><text x="235" y="40" text-anchor="middle" font-weight="600">IQ stream</text><text class="m" x="235" y="60" text-anchor="middle">10GBASE-T or 5 Gbit/s adapter</text>
+    <path d="M151 87 H319" stroke="#12161c" stroke-width="1.2" fill="none"/><text x="235" y="80" text-anchor="middle" font-weight="600">Control, ssh</text><text class="m" x="235" y="100" text-anchor="middle">any Ethernet port</text>
+    <rect x="319" y="6" width="150" height="106" rx="6" fill="#f3f4f6" stroke="#12161c"/>
+    <text class="t" x="364" y="24">Linux host</text>
+    <rect x="319" y="36" width="36" height="22" rx="3" fill="#fff" stroke="#12161c"/><text x="362" y="45">stream port</text><text class="m" x="362" y="56">10.77.0.10, MTU 9216</text>
+    <rect x="319" y="76" width="36" height="22" rx="3" fill="#fff" stroke="#12161c"/><text x="362" y="85">control port</text><text class="m" x="362" y="96">192.168.1.10</text>
+  </svg>
+
+  <ol class="steps">
+    <li><div><b>Cable it and power it on</b>
+      <p><code>wan</code> to the host's stream port, <code>lan3</code> to its control port. Wait for the LED to turn white and brighten: red, a rainbow, then yellow while the stream port links (6 s, or 18 s on a USB adapter).</p></div></li>
+    <li><div><b>Get the software</b>
+      <pre>git clone https://github.com/jstockdale/w1700k-sdr
+cd w1700k-sdr &amp;&amp; make firmware host</pre></div></li>
+    <li><div><b>Give the host its two addresses</b>
+      <pre>sudo init/host/link keep CONTROL 192.168.1.10/24
+sudo init/host/link keep STREAM 10.77.0.10/24 9216</pre>
+      <p class="small">CONTROL and STREAM are your interface names (<code>ip link</code>). The stream needs the jumbo frames.</p></div></li>
+    <li><div><b>Give the unit your key</b>
+      <pre>init/key --known-hosts ~/.ssh/known_hosts</pre>
+      <p>Then hold the reset button with a paperclip. The LED rises white for 10 s, then flashes and pulses blue: let go. It breathes blue, then turns green when your key is in.</p>
+      <p class="small">Check the host key fingerprint the command prints against the one above.</p></div></li>
+    <li><div><b>Start the receiver</b>
+      <pre>host/stream/build/w1700k-stream &amp;
+host/spectrum/build/w1700k-spectrum --controller "host/bin/w1700k serve"</pre>
+      <p>Open <code>http://127.0.0.1:8073/</code> and press ▶.</p></div></li>
+  </ol>
+
+  <div class="foot"><span>Whitehat Hardware · W1700K SDR</span><span>The LED and your link: other side</span></div>
+</div>
+
+<div class="sheet">
+  <div class="head">
+    <div><div class="brand">Whitehat Hardware</div><h1>The LED</h1></div>
+    <div class="kind">Green go · yellow look · red stop</div>
+  </div>
+
+  <table class="legend">
+    <thead><tr><th></th><th>What you see</th><th>What it means</th></tr></thead>
+    <tbody>
+      <tr><td><span class="lens breath" style="--c:#ffd500"></span></td><td>Yellow, breathing</td><td>No link on the stream port.</td></tr>
+      <tr><td><span class="lens fill"></span></td><td>White, brightening</td><td>Powered and linked; radio not loaded yet.</td></tr>
+      <tr><td><span class="lens solid" style="--c:#00e000"></span></td><td>Green, steady</td><td>Ready: radio loaded, not streaming.</td></tr>
+      <tr><td><span class="lens three"></span></td><td>Cyan, blue or magenta</td><td>Streaming at 40, 80 or 160 Msps.</td></tr>
+      <tr><td><span class="lens hue"></span></td><td>The rainbow, round in 6 s</td><td>Streaming at 320 Msps.</td></tr>
+      <tr class="mod"><td><span class="lens solid" style="--c:#00f0ff"></span></td><td>… steady</td><td>Lossless: every sample bit for bit.</td></tr>
+      <tr class="mod"><td><span class="lens breath" style="--c:#00f0ff"></span></td><td>… breathing</td><td>Fewer bits per sample, to fit the link.</td></tr>
+      <tr class="mod"><td><span class="lens bars" style="--c:#00f0ff"></span></td><td>… blinking slowly</td><td>Started, but nothing is leaving the port.</td></tr>
+      <tr><td><span class="lens bars" style="--c:#ffd500"></span></td><td>Yellow, blinking</td><td>Out of lock: tune back into the band.</td></tr>
+      <tr><td><span class="lens bars" style="--c:#ff1a1a"></span></td><td>Red, blinking</td><td>The stream ended by itself.</td></tr>
+      <tr><td><span class="lens lift"></span></td><td>A short lift towards white</td><td>The unit heard a change from the host.</td></tr>
+      <tr><td><span class="lens solid" style="--c:#ff1a1a"></span></td><td>Red, never changing</td><td>Did not finish booting. Cycle the power.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>The reset button</h2>
+  <table class="legend">
+    <thead><tr><th></th><th>While you hold</th><th>Letting go</th></tr></thead>
+    <tbody>
+      <tr><td><span class="lens up" style="--c:#00e000"></span></td><td>Green, rising</td><td>At 5 s: switches your key on.</td></tr>
+      <tr><td><span class="lens down" style="--c:#ff1a1a"></span></td><td>Red, sinking</td><td>At 5 s: switches your key off.</td></tr>
+      <tr><td><span class="lens up" style="--c:#ffffff"></span></td><td>White, rising for 10 s</td><td>No key yet: nothing to switch.</td></tr>
+      <tr><td><span class="lens breath" style="--c:#00e000"></span></td><td>5 s: that colour, pulsing</td><td>Switches it. Off, the key is kept.</td></tr>
+      <tr><td><span class="lens breath" style="--c:#1f52ff"></span></td><td>10 s: blue, pulsing</td><td>Takes a new key: <code>init/key</code>.</td></tr>
+      <tr><td><span class="lens bars" style="--c:#ff1a1a"></span></td><td>15 s: red, blinking hard</td><td>Erases the key.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>What your link carries</h2>
+  <table>
+    <thead><tr><th>Stream link</th><th>Lossless, all 14 bits</th><th>Reduced to fit</th></tr></thead>
+    <tbody>
+      <tr><td>10 Gbit/s</td><td>320 Msps</td><td></td></tr>
+      <tr><td>5 Gbit/s</td><td>160 Msps</td><td>320 Msps at 14 bits per I/Q pair</td></tr>
+      <tr><td>2.5 Gbit/s</td><td>80 Msps</td><td>160 Msps at 14 bits per I/Q pair</td></tr>
+      <tr><td>1 Gbit/s</td><td></td><td>80 Msps at 8 bits, 40 Msps at 16 bits</td></tr>
+    </tbody>
+  </table>
+  <p class="small">The software packs the samples to fit the link. The 2.5 and 1 Gbit/s rows are computed, not yet run.</p>
+
+  <p class="small"><strong>Read before use.</strong> The unit receives only; still, put an attenuator between an antenna port and a sensitive instrument. Only the reset button changes the login key.</p>
+
+  <div class="foot"><span>Whitehat Hardware · W1700K SDR</span><span>Addresses and commands are the software's defaults</span></div>
+</div>
+
+</body>
+</html>
