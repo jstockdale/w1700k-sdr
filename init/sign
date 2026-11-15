@@ -7,6 +7,9 @@
     init/sign archive --key KEYFILE --release N [ARCHIVE] [-o OUT]
     init/sign check --keys FILE ARCHIVE           # is it a release, and which of these keys' is it
 
+    init/sign request --release N [ARCHIVE] [-o REQUEST]       # for a key that signs elsewhere:
+    init/sign attach --request REQUEST --signature SIG --keys FILE [ARCHIVE] [-o OUT]
+
 A unit built with release keys in it (`W1700K_RELEASE_KEYS=FILE make`, see platform/README.md)
 takes over ssh only what one of them sealed, and nothing older than the release it has settled
 on. `keygen` writes the private half of a key to KEYFILE, readable by you alone, and prints the
@@ -18,13 +21,24 @@ number in its manifest and the manifest sealed, to OUT (default: w1700k-release-
 it). The manifest lists the SHA-256 of every image in the archive, so the one signature covers
 them all. N only ever goes up: a unit that has settled on release 7 refuses release 6.
 
+A key that never leaves its keeper signs in two steps. `request` writes what there is to sign
+for release N: a small JSON file with the release number, the exact bytes (`sign`, in hex: the
+topic, the envelope's header and the manifest, which is readable in them from `manifest_at`)
+and their SHA-256. The keeper signs those bytes (Ed25519, RFC 8032) and returns 64 bytes.
+`attach` takes them as 128 hex digits or a file of them, checks them against FILE's public
+keys, and writes the release; a signature that is not over this request, by one of those keys,
+writes nothing. The archive has to be the one the request was made of.
+
 The envelope is Whitehat Hardware's WMS2 (`seal/`, init/initkit/seal.py). Signing takes the
 Python package `cryptography` or PyNaCl; checking takes neither.
 """
 import argparse
+import hashlib
+import json
 import os
 from pathlib import Path
 import sys
+import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from initkit import bundle, config, seal                # noqa: E402
@@ -40,6 +54,38 @@ def read_seed(path):
     if len(seed) != 32:
         raise StepFailed(f'{path} is not a signing key: it holds {len(seed)} bytes, not 32')
     return seed
+
+
+def read_request(path):
+    """(release number, time, the bytes to sign) of a signing request."""
+    try:
+        request = json.loads(Path(path).read_text())
+        release, when, message = request['release'], request['time_ms'], bytes.fromhex(request['sign'])
+        if type(release) is not int or type(when) is not int:
+            raise ValueError('its release and time are not numbers')
+        if hashlib.sha256(message).hexdigest() != request['sign_sha256']:
+            raise ValueError('its bytes are not the ones its SHA-256 names')
+    except (OSError, KeyError, TypeError, ValueError) as error:
+        raise StepFailed(f'{path} is not a signing request: {error}') from None
+    return release, when, message
+
+
+def read_signature(given):
+    """A signature given as 128 hex digits, or as a file of them."""
+    try:
+        text = Path(given).read_text() if Path(given).is_file() else given
+        signature = bytes.fromhex(''.join(text.split()))
+    except (OSError, ValueError) as error:
+        raise StepFailed(f'not a signature (128 hex digits, or a file of them): {error}') from None
+    if len(signature) != seal.SIGNATURE:
+        raise StepFailed(f'a signature is {seal.SIGNATURE} bytes; this is {len(signature)}')
+    return signature
+
+
+def unwritten(path, what):
+    if path.exists():
+        raise StepFailed(f'{path} exists; {what} is never overwritten')
+    return path
 
 
 def key_line(public, note):
@@ -60,6 +106,16 @@ def main():
     check = verbs.add_parser('check')
     check.add_argument('--keys', type=Path, required=True, metavar='FILE')
     check.add_argument('archive', type=Path, metavar='ARCHIVE')
+    request = verbs.add_parser('request')
+    request.add_argument('--release', type=int, required=True, metavar='N')
+    request.add_argument('archive', type=Path, nargs='?', default=config.UPDATE, metavar='ARCHIVE')
+    request.add_argument('-o', '--output', type=Path, metavar='REQUEST')
+    attach = verbs.add_parser('attach')
+    attach.add_argument('--request', type=Path, required=True, metavar='REQUEST')
+    attach.add_argument('--signature', required=True, metavar='SIG')
+    attach.add_argument('--keys', type=Path, required=True, metavar='FILE')
+    attach.add_argument('archive', type=Path, nargs='?', default=config.UPDATE, metavar='ARCHIVE')
+    attach.add_argument('-o', '--output', type=Path, metavar='OUT')
     args = parser.parse_args()
     try:
         if args.verb == 'keygen':
@@ -81,10 +137,40 @@ def main():
         elif args.verb == 'archive':
             public, sign = seal.signer(read_seed(args.key))
             output = args.output or args.archive.with_name(f'w1700k-release-{args.release}.tar')
-            if output.exists() and output.resolve() != args.archive.resolve():
-                raise StepFailed(f'{output} exists; a release is never overwritten')
+            if output.resolve() != args.archive.resolve():
+                unwritten(output, 'a release')
             bundle.sign(args.archive, output, args.release, sign)
             print(f'sign: {output} is release {args.release}, sealed by {seal.fingerprint(public)}')
+        elif args.verb == 'request':
+            when = int(time.time() * 1000)
+            manifest, message = bundle.to_sign(args.archive, args.release, when)
+            output = unwritten(args.output or args.archive.with_name(f'w1700k-release-{args.release}.request.json'),
+                               'a request that may be out for signing')
+            digest = hashlib.sha256(message).hexdigest()
+            output.write_text(json.dumps({
+                'request': 'a signature for a W1700K SDR release: Ed25519 (RFC 8032) over the bytes in `sign`',
+                'product': seal.PRODUCT, 'topic': seal.TOPIC, 'release': args.release, 'time_ms': when,
+                'manifest_sha256': hashlib.sha256(manifest).hexdigest(),
+                'manifest_at': len(message) - len(manifest), 'bytes': len(message),
+                'sign': message.hex(), 'sign_sha256': digest}, indent=1) + '\n')
+            print(f'sign: {output} asks for release {args.release} of {args.archive}: {len(message)} bytes to '
+                  f'sign, SHA-256 {digest}')
+        elif args.verb == 'attach':
+            release, when, message = read_request(args.request)
+            signature = read_signature(args.signature)
+            keys = seal.read_keys(args.keys.read_text())
+            key = next((key for key in keys if seal.verifies(key, message, signature)), None)
+            if key is None:
+                raise StepFailed(f'that signature is not over the bytes of {args.request} by a key in {args.keys} ('
+                                 + (', '.join(map(seal.fingerprint, keys)) or 'it holds none') + ')')
+            output = unwritten(args.output or args.archive.with_name(f'w1700k-release-{release}.tar'), 'a release')
+
+            def returned(asked):
+                if asked != message:
+                    raise StepFailed(f'{args.archive} is not the archive {args.request} was made of')
+                return signature
+            bundle.sign(args.archive, output, release, returned, when, keys)
+            print(f'sign: {output} is release {release}, sealed by {seal.fingerprint(key)}')
         else:
             keys = seal.read_keys(args.keys.read_text())
             manifest, _, sealed = bundle.read_release(args.archive)

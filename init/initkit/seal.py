@@ -157,19 +157,32 @@ def _signed(header, body):
     return struct.pack('<H', len(topic)) + topic + header + body
 
 
-def seal(body, release, sign, when_ms=None):
-    """`body` as release number `release`, signed with `sign(message) -> 64 bytes`."""
+def unsigned(body, release, when_ms=None):
+    """(header, the bytes a key signs) for `body` as release number `release`. The two halves
+    of sealing are apart so that a key held elsewhere can sign: `signed` takes what it returns."""
     if not 0 < release < 1 << 64:
         raise Refused('a release number is a whole number from 1')
     if not body or b'\0' in body:
         raise Refused('a manifest is text')
+    if HEADER + len(body) + SIGNATURE > ENVELOPE_MOST:
+        raise Refused(f'the manifest is too long for a release ({len(body)} bytes)')
     when_ms = int(time.time() * 1000) if when_ms is None else when_ms
     header = (MAGIC + bytes((CONTROL, 0)) + PRODUCT.encode().ljust(DEVICE, b'\0')
               + struct.pack('<QQH', release, when_ms, 0))
-    envelope = header + body + sign(_signed(header, body))
-    if len(envelope) > ENVELOPE_MOST:
-        raise Refused(f'the manifest is too long for a release ({len(body)} bytes)')
-    return envelope
+    return header, _signed(header, body)
+
+
+def signed(header, body, signature):
+    """The envelope of `header`, `body` and a signature over what `unsigned` gave for them."""
+    if len(signature) != SIGNATURE:
+        raise Refused(f'a signature is {SIGNATURE} bytes, not {len(signature)}')
+    return header + body + signature
+
+
+def seal(body, release, sign, when_ms=None):
+    """`body` as release number `release`, signed with `sign(message) -> 64 bytes`."""
+    header, message = unsigned(body, release, when_ms)
+    return signed(header, body, sign(message))
 
 
 def body_of(envelope):
