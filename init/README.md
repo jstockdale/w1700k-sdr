@@ -303,81 +303,168 @@ serial console: `init/flash --loader`.
 
 ### Signed releases
 
-A unit can be built to take over ssh only what a release key sealed. It is a
-property of the root: a build with `W1700K_RELEASE_KEYS=FILE` puts the public
-keys in FILE into it, and a unit on that root pins them.
+A unit can be keyed: given a list of keys, after which it takes over ssh only
+what a release key of that list sealed. The list is not in the root. It is in
+the unit's durable storage, where no update reaches it, so a key that seals
+releases cannot change who is trusted by shipping a root.
+
+Each key in a list has a scope ([`seal/`](../seal/README.md) has the list's
+form and the rules in full):
+
+| Scope | Seals | Kept |
+| --- | --- | --- |
+| `release` | releases | where releases are made |
+| `keys` | the next list of an epoch, which changes release keys only | offline |
+| `root` | that, and the first list of the next epoch, which may change any key | offline, and apart from the `keys` key |
+
+A list is of an epoch and a generation, written `E.G`: `1.1` is a unit's first
+list, `1.2` the next of that epoch, `2.1` the first of the next. Only a `root`
+key starts an epoch, and lists are in order by epoch first, so a `root` key's
+list comes after whatever a `keys` key has sealed.
+
+With keys of your own, all on this host:
 
 ```sh
-init/sign keygen ~/keys/w1700k-primary.key >  release-keys   # the private half stays in the file
-init/sign keygen ~/keys/w1700k-spare.key   >> release-keys   # a second, to keep offline
-W1700K_RELEASE_KEYS=release-keys make                          # units of this build pin both
+for k in root keys release; do init/sign keygen ~/keys/$k.key > ~/keys/$k.pub; done
+init/sign list --generation 1.1 -o keys-1.1.txt \
+    $(cat ~/keys/root.pub):root:my-root $(cat ~/keys/keys.pub):keys:my-keys \
+    $(cat ~/keys/release.pub):release:my-release
+init/sign rotate --key ~/keys/root.key --list keys-1.1.txt      # w1700k-keys-1.1.wms2: the first list, sealed
+init/bench key w1700k-keys-1.1.wms2                             # at the bench, on the serial console
 
-init/sign archive --key ~/keys/w1700k-primary.key --release 7  # w1700k-release-7.tar, beside the archive
+init/sign archive --key ~/keys/release.key --release 7 --carry .   # w1700k-release-7.tar
 init/flash --bundle platform/build/images/w1700k-release-7.tar
 ```
 
-A key that never leaves its keeper signs in two steps, and nothing on the build
-host ever holds it:
-
-```sh
-init/sign request --release 7                  # w1700k-release-7.request.json: the bytes to sign
-# the keeper signs them (Ed25519, RFC 8032) and returns 64 bytes
-init/sign attach --request platform/build/images/w1700k-release-7.request.json \
-    --signature SIG --keys seal/whitehat-release-keys      # w1700k-release-7.tar
-```
-
-The request is a small JSON file: the release number, the exact bytes (the
-topic, the envelope's header and the manifest, which a keeper can read in
-them) and their SHA-256. `attach` takes the signature as 128 hex digits or a
-file of them, and writes nothing unless it is the signature of one of the
-keys given, over that request, for the archive the request was made of. The result is byte for byte
-what a key on the host would have sealed at that moment.
-
-[`seal/whitehat-release-keys`](../seal/whitehat-release-keys) holds Whitehat
-Hardware's two release keys, which sign this way: build with
-`W1700K_RELEASE_KEYS=seal/whitehat-release-keys` for a unit that takes only
-their releases.
-
-- **A release** is the update archive with one member more: its manifest,
-  sealed. The manifest lists the SHA-256 of every image, so one signature
-  covers them all. The envelope is Whitehat Hardware's WMS2, the one its
-  devices take their commands in ([`seal/`](../seal/README.md)).
-- **Checked twice.** `init/flash --bundle` reads the unit's keys and checks the
-  seal before it sends anything; the unit checks it again with its own
-  verifier, and that is the check that counts.
+- **A release** is the update archive with its manifest sealed. The manifest
+  lists the SHA-256 of every image, so one signature covers them all, and
+  names the commit it was made from. The envelope is Whitehat Hardware's WMS2,
+  the one its devices take their commands in.
+- **Checked twice.** `init/flash --bundle` reads the unit's list and checks the
+  seal before it sends any image; then the unit's own verifier checks it
+  against the list the unit holds. The steps around that check are
+  `system-update`, which this tool sends to the unit from its own tree each
+  time, so a host tool from before there were keys asks for none of it: keep
+  the tool that updates a keyed unit current.
 - **Nothing older.** The release number only goes up. A unit keeps the number
   of the newest release it has settled on (confirmed, not merely been sent),
-  in durable storage, and refuses an older one. It has no clock, so the number
-  is all it can hold a release to.
-- **Either key.** Any pinned key may seal a release, so the spare takes over if
-  the first is lost. Keys are replaced by a release whose root holds the new
-  ones.
+  in durable storage, with the digest of its manifest. It refuses an older
+  one, and another release under the same number. It has no clock, so the
+  number is all it can hold a release to. If what it keeps does not read, it
+  takes no release.
 - **`--unsigned`** is the owner's word: `init/flash --ssh --unsigned` sends a
-  build of your own to a unit that pins keys. Whoever has root on a unit owns
-  it; the keys guard against an archive that is not what it claims, not
-  against the owner.
-- **A unit with no keys** takes any update, as before, and is told when an
-  archive is signed that nothing checks the seal.
+  build of your own to a keyed unit. Whoever has root on a unit owns it; the
+  keys guard against an archive that is not what it claims, not against the
+  owner.
+- **An unkeyed unit** takes any update, as before, and is told when an archive
+  is signed that nothing checks the seal. A unit someone built and installed
+  themselves is unkeyed until they key it.
 
-What the unit cannot check yet is its root. Each unit's root is built on the
-host from the release's root, because its ssh host key is in it, so the root a
-unit is sent is in no manifest. The tool checks the release's root against the
-manifest before it builds the unit's from it; the unit takes that root because
-a release was verified, and says that the root itself was not. The loader is
-the same for every unit, and the unit does check it. This closes when one root
-fits every unit ([the roadmap](../docs/roadmap.md)).
+#### The first list, at the bench
 
-Tried on a unit (a W1700K2) with throwaway keys:
+A first list has nothing before it to be checked against: it is sealed by a
+root key it names itself. What makes it the right list is a person. `init/bench
+key` prints the fingerprints of the list's `root` and `keys` keys and stops
+until you have held them to the record of how the keys were issued; then it
+types the list into the unit's serial console, where `system-update first`
+takes it. A unit takes a first list on its console and nowhere else.
 
-| Sent to a unit that pins two keys | What happened |
-| --- | --- |
-| The unsigned archive, and this build over ssh | Refused by the tool, which names the unit's keys and `--unsigned` |
-| Release 5, sealed by the first key | Checked by the tool and by the unit, written, confirmed; the unit's floor became 5 |
-| Release 4 after that | Refused by the tool, and by the unit when asked directly |
-| Release 6 sealed by a key the unit does not pin | Refused by both |
-| Release 6 sealed by the spare key | Verified by both |
-| A loader no release lists | Refused by the unit |
-| The unit's previous root, with `--unsigned` | Taken |
+Before the list the unit gets a mark that it is keyed: `w1700k_keyed=1` in the
+stock boot loader's environment, which `init/bench key` sets at that loader's
+prompt (the unit restarts once for it). That environment is where the unit's
+`bootcmd` is kept: it is outside durable storage and outside everything an
+update replaces, and nothing a unit runs writes it. There are three kinds of
+unit:
+
+| | It has | It takes |
+| --- | --- | --- |
+| Unkeyed | no mark, no list | any update |
+| Keyed | a list that reads | releases and rotations sealed for it; `--unsigned` |
+| Lost | the mark, or a list, but no list that reads | `--unsigned` only, until it is keyed at the bench again |
+
+So a keyed unit whose durable storage is lost or replaced does not quietly
+become one that takes anything. A stock environment that does not read counts
+as a mark: what cannot be told is not taken for unkeyed. `init/bench unkey`
+takes a unit back to unkeyed (the list first, the mark last), and `init/bench
+show` says which it is. Keying starts the release numbers again.
+
+#### Replacing a key
+
+A rotation is a new list, complete, sealed by a key of the list a unit holds.
+If only release keys change, it is the next generation of the epoch, and the
+`keys` key seals it. If a `root` or `keys` line changes, it is generation 1 of
+the next epoch, and only the `root` key seals it.
+
+```sh
+init/sign list --generation 1.2 -o keys-1.2.txt ...             # the whole new list
+init/sign rotate --key ~/keys/keys.key --list keys-1.2.txt --held keys-1.1.txt
+init/sign archive --key ~/keys/new-release.key --release 8 --carry .
+
+init/sign list --generation 2.1 -o keys-2.1.txt ...             # a new keys key: the next epoch
+init/sign rotate --key ~/keys/root.key --list keys-2.1.txt --held keys-1.2.txt
+```
+
+`--carry DIR` puts every rotation so far (each `*.wms2` in DIR) into the
+release, and their digests into its sealed manifest, so that an archive from
+which one was taken, or to which one was added, is not the release. `init/flash --bundle` gives a unit the ones it has not had, in order,
+before it judges the release by the unit's list; it does so even when the unit
+already has the release's images. One the unit would not take is said and
+passed over, and the release is judged by the list the unit then holds. A rotation needs nobody's word: it is sealed
+by a key the unit already trusts for exactly that, and it changes who seals
+and nothing else. A unit that takes a list with no `release` key takes no
+release until a later list gives it one.
+
+#### A key that never leaves its keeper
+
+A key held elsewhere signs in two steps, for a release and for a rotation
+alike, and nothing on the build host ever holds it:
+
+```sh
+init/sign request --domain production --release 7 --carry .   # w1700k-release-7.request.json
+# the keeper signs the bytes in it (Ed25519, RFC 8032) and returns 64 bytes
+init/sign attach --request platform/build/images/w1700k-release-7.request.json \
+    --signature SIG --keys keys-1.2.txt --carry .          # w1700k-release-7.tar
+
+init/sign rotate-request --domain production --list keys-1.3.txt --held keys-1.2.txt
+init/sign rotate-proof --request w1700k-keys-1.3.request.json --name new-release --signature SIG
+init/sign rotate-attach --request w1700k-keys-1.3.request.json --signature SIG --held keys-1.2.txt
+```
+
+A request is a small JSON file: which keys are asked (`domain`: development
+or production), the topic, the product, the counter (the release number or
+the generation), the exact bytes to sign (`auth_hex`: the topic, the
+envelope's header and the manifest or the list, which a keeper can read in
+them) and their SHA-256. A rotation's request also says which scope has to
+sign it, carries the list held, and names the keys that are new in the list.
+A keeper may want each new key to show it is held before sealing a list that
+names it: `rotate-proof` puts that key's signature over the same bytes into
+the request, once it verifies. The attach step takes the signature as
+128 hex digits or a file of them, and writes nothing unless it is over that
+request by a key that may seal it. The result is byte for byte what a key on
+the host would have sealed at that moment.
+
+Whitehat Hardware's keys sign this way. [`seal/development/`](../seal/development)
+holds its development lists of keys as they were sealed; units that ship hold
+other keys.
+
+#### What it does not do
+
+- **Firmware is root.** A unit that has installed a thief's release is the
+  thief's, whatever list it held. The list protects the units that have not.
+- **The unit cannot check its root yet.** Each unit's root is built on the
+  host from the release's root, because its ssh host key is in it, so the root
+  a unit is sent is in no manifest. The tool checks the release's root against
+  the manifest before it builds the unit's from it; the unit takes that root
+  because a release was verified, and says that the root itself was not. The
+  loader is the same for every unit, and the unit does check it. This closes
+  when one root fits every unit ([the roadmap](../docs/roadmap.md)).
+- **A stolen root key** can start the next epoch with a list of its own, and a
+  unit takes whichever it is given first.
+- **Nothing tells a unit or its host what it has not been given.** Whoever
+  delivers can hold back a rotation or a newer release. A dated statement of
+  what is current, sealed by a `timestamp` key, is what would; it is not built.
+- **Whoever is root on a unit** can do by hand everything the bench does. The
+  mark and the console are there so that nothing asked over the network does.
 
 ### A unit installed from an earlier version
 
