@@ -11,6 +11,8 @@ in LICENSES/.
   GPL-2.0 WITH Linux-syscall-note   include/uapi/w1700k_sdr.h
   BSD-3-Clause-Clear                files derived from MediaTek's mt76 driver,
                                     which keep their original attribution
+  BSD-2-Clause OR CC0-1.0           Monocypher (seal/monocypher.*, seal/optional/),
+                                    vendored unchanged with its own notices
 
 MIT licence for this project:
 

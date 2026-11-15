@@ -12,7 +12,7 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / 'init')]
-from initkit import bundle, config, provision, remote  # noqa: E402
+from initkit import bundle, config, provision, remote, seal  # noqa: E402
 from initkit.console import StepFailed  # noqa: E402
 
 OLD = hashlib.sha256(b'the root that runs').hexdigest()
@@ -585,6 +585,156 @@ class RemoteJoint(unittest.TestCase):
         unit = JointUnit(loader_takes=False)
         with self.assertRaisesRegex(StepFailed, 'the new loader did not start'):
             self.run_update(unit)
+
+
+class ReleaseUnit(JointUnit):
+    """A unit built with release keys: system-update's rules for staging, as the script has
+    them (tests/test_release.py runs the script itself)."""
+
+    def __init__(self, keys, floor=0, **options):
+        super().__init__(**options)
+        self.keys, self.floor = keys, floor
+        self.verified = self.noted = None
+        self.flags = {}
+
+    def call(self, command, data=None, timeout=120):
+        if command == f'cat {remote.RELEASE_KEYS}' and not self.down:
+            self.calls.append(command)
+            return 0, ''.join(key.hex() + '\n' for key in self.keys)
+        if not command.startswith('sh -s -- ') or self.down:
+            return super().call(command, data, timeout)
+        verb, *arguments = command.split()[3:]
+        if verb == 'status':
+            code, text = super().call(command, data, timeout)
+            return code, text + f'release_keys={len(self.keys)}\nrelease={self.floor}\n'
+        if verb == 'release':
+            self.calls.append(command)
+            try:
+                number, body, _ = seal.unseal(self.files[arguments[0]], self.keys)
+            except seal.Refused:
+                return 1, 'system-update: not a release this unit takes\n'
+            if number < self.floor:
+                return 1, f'w1700k-release: release {number} is older than release {self.floor}\n'
+            self.verified = (number, body.decode())
+            return 0, f'system-update: release {number} verified\n'
+        if verb in ('stage', 'stage-loader'):
+            path, digest, *flags = arguments
+            self.flags[verb] = flags
+            listed = self.verified and f'"{digest}"' in self.verified[1]
+            if not (flags == ['--unsigned'] or listed
+                    or (flags == ['--from-release'] and verb == 'stage' and self.verified)):
+                self.calls.append(command)
+                return 1, 'system-update: this unit takes releases: verify one first\n'
+            if flags != ['--unsigned'] and self.verified:
+                self.noted = self.verified[0]
+            return super().call(' '.join(command.split()[:6]), data, timeout)
+        code, text = super().call(command, data, timeout)
+        if verb == 'confirm' and code == 0 and self.noted:
+            self.floor = max(self.floor, self.noted)
+        if verb in ('confirm', 'cancel'):
+            self.noted = None
+        return code, text
+
+    def reboot(self):
+        super().reboot()
+        self.verified = None                # /run does not outlive a reboot
+
+
+class Releases(RemoteJoint):
+    """A unit that pins release keys takes over ssh what one of them sealed, and nothing else
+    without the owner's word."""
+
+    def setUp(self):
+        super().setUp()
+        try:
+            self.primary, self.sign = seal.signer(bytes((1,)) * 32)
+            self.stranger, self.sign_stranger = seal.signer(bytes((3,)) * 32)
+        except seal.Refused as error:
+            self.skipTest(str(error))
+        self.plain = self.work / 'w1700k-update.tar'
+        bundle.write(self.plain, self.loader_image.read_bytes(), b'hsqs the release root',
+                     config.partitions.GEOMETRY)
+
+    def release(self, number, sign=None):
+        path = self.work / f'w1700k-release-{number}.tar'
+        bundle.sign(self.plain, path, number, sign or self.sign)
+        return path
+
+    def test_a_release_is_checked_here_then_by_the_unit_and_then_sent(self):
+        unit = ReleaseUnit([self.primary])
+        self.assertEqual(self.run_update(unit, self.release(4)), 0)
+        self.assertEqual(self.verbs(unit), ['status', 'cat', 'cat', 'release', 'cat', 'stage-loader', 'cat',
+                                            'stage', 'reboot', '/usr/sbin/verify-storage', 'status', 'confirm'])
+        self.assertEqual(unit.flags, {'stage-loader': [], 'stage': ['--from-release']},
+                         'the loader is in the manifest; the root is this unit\'s, built from it')
+        self.assertEqual((unit.running, unit.second, unit.floor), (self.root, self.loader, 4))
+        self.assertIn('release 4, sealed by ' + seal.fingerprint(self.primary), self.said())
+
+    def test_an_unsigned_archive_or_build_is_not_sent_without_the_owners_word(self):
+        for archive in (self.plain, None):
+            with self.subTest(archive=archive):
+                unit = ReleaseUnit([self.primary])
+                with self.assertRaisesRegex(StepFailed, 'takes only releases sealed by a key it pins.*'
+                                                        '--unsigned'):
+                    self.run_update(unit, archive)
+                self.assertEqual(self.verbs(unit), ['status', 'cat'], 'its keys were read; nothing was sent')
+                self.assertEqual(self.run_update(unit, archive, unsigned=True), 0)
+                self.assertEqual(unit.flags, {'stage-loader': ['--unsigned'], 'stage': ['--unsigned']})
+                self.assertEqual(unit.floor, 0, 'a build of the owner\'s moves no floor')
+                self.assertIn('as a build of your own', self.said())
+
+    def test_a_release_sealed_by_a_stranger_is_refused_before_anything_is_sent(self):
+        unit = ReleaseUnit([self.primary])
+        with self.assertRaisesRegex(StepFailed, "not a release this unit takes.*none of the release keys'"):
+            self.run_update(unit, self.release(4, self.sign_stranger))
+        self.assertEqual(self.verbs(unit), ['status', 'cat'])
+        self.assertEqual(unit.files, {})
+
+    def test_a_release_older_than_the_units_is_refused_before_anything_is_sent(self):
+        unit = ReleaseUnit([self.primary], floor=9)
+        with self.assertRaisesRegex(StepFailed, 'release 4; this unit has settled on release 9'):
+            self.run_update(unit, self.release(4))
+        self.assertEqual(unit.files, {})
+        self.assertEqual(self.run_update(unit, self.release(9)), 0, 'the same release again is no step back')
+
+    def test_an_archive_the_unit_would_refuse_is_refused_even_when_it_has_all_of_it(self):
+        unit = ReleaseUnit([self.primary], floor=9)
+        unit.running, unit.second = self.root, self.loader
+        for archive, why in ((self.release(4), 'settled on release 9'),
+                             (self.release(12, self.sign_stranger), 'none of the release keys'),
+                             (self.plain, 'takes only releases')):
+            with self.subTest(why), self.assertRaisesRegex(StepFailed, why):
+                self.run_update(unit, archive)
+        self.assertEqual(self.run_update(unit, self.release(12)), 0)
+        self.assertIn('already current', self.said())
+
+    def test_the_units_own_refusal_stops_the_update_too(self):
+        unit = ReleaseUnit([self.primary])
+        unit.keys = [self.primary]
+        archive = self.release(4)
+        # The host believes a key the unit does not act on: the unit's word is the last.
+        with mock.patch.object(seal, 'unseal', side_effect=[(4, b'', self.primary), seal.Refused('no')]):
+            with self.assertRaisesRegex(StepFailed, 'the unit does not take this release'):
+                self.run_update(unit, archive)
+        self.assertEqual((unit.staged, unit.lstaged), ('', ''))
+
+    def test_a_unit_with_no_keys_takes_a_release_as_any_archive_and_is_told_nothing_checks_it(self):
+        unit = JointUnit()
+        self.assertEqual(self.run_update(unit, self.release(4, self.sign_stranger)), 0)
+        self.assertIn('pins no release key: nothing checks the seal', self.said())
+        self.assertNotIn('release', self.verbs(unit))
+
+    def test_the_root_alone_and_the_loader_alone_need_the_word_as_well(self):
+        def sleep(seconds):
+            self.now += seconds
+        for run, verb in ((remote.run, 'stage'), (remote.run_loader, 'stage-loader')):
+            with self.subTest(verb), mock.patch.object(config, 'ROOTFS', self.root_image):
+                unit = ReleaseUnit([self.primary])
+                with self.assertRaisesRegex(StepFailed, 'takes only releases'):
+                    run(self.settings, link=unit, clock=lambda: self.now, sleep=sleep)
+                self.assertEqual(run(self.settings, link=unit, clock=lambda: self.now, sleep=sleep,
+                                     unsigned=True), 0)
+                self.assertEqual(unit.flags[verb], ['--unsigned'])
 
 
 if __name__ == '__main__':

@@ -19,12 +19,14 @@ import subprocess
 import tempfile
 import time
 
-from . import bundle, config, provision
+from . import bundle, config, provision, seal
 from .console import StepFailed
 
 SCRIPT = config.ROOT / 'platform/rootfs/overlay/usr/sbin/system-update'
 STAGING = '/work/system-update.squashfs'      # in RAM on the unit
 LOADER_STAGING = '/work/system-update.loader'
+RELEASE_STAGING = '/work/system-update.release'
+RELEASE_KEYS = '/etc/w1700k/release-keys'
 DOWN_SECONDS = 90           # for a rebooting unit to stop answering
 UP_SECONDS = 240            # for it to answer again: the loader's write, then the boot
 POWER_CYCLE_SECONDS = 900   # for the operator to power-cycle a unit that did not come back
@@ -87,6 +89,66 @@ def status(link):
     return dict(line.split('=', 1) for line in text.splitlines() if '=' in line)
 
 
+# What system-update is told when staging the loader and the root, by the terms admit() found.
+STAGING_FLAGS = {'any': ([], []), 'unsigned': (['--unsigned'], ['--unsigned']),
+                 'release': ([], ['--from-release'])}
+
+
+def admit(link, state, sealed=None, unsigned=False):
+    """On what terms this unit takes the update: 'any', 'unsigned' or 'release'. Nothing is
+    sent here, and it is asked before anything else is decided, so that an archive the unit
+    would refuse is refused even when the unit already has everything in it.
+
+    A unit that pins release keys takes what one of them sealed and nothing older than the
+    release it has settled on. `sealed` is the archive's sealed manifest, checked here against
+    the unit's own keys; present() then has the unit check it, which is what counts.
+    `unsigned` is the owner's word for a build of their own."""
+    if state.get('release_keys') in (None, '', '0'):
+        if sealed is not None:
+            print('  the archive is a signed release, but this unit pins no release key: '
+                  'nothing checks the seal')
+        return 'any'
+    code, text = link.call(f'cat {RELEASE_KEYS}')
+    try:
+        keys = seal.read_keys(text) if code == 0 else []
+    except seal.Refused as error:
+        raise StepFailed(f"the unit's release keys do not read as keys: {error}") from None
+    if not keys:
+        raise StepFailed(f'the unit says it pins release keys, but {RELEASE_KEYS} could not be read')
+    pinned = ', '.join(seal.fingerprint(key) for key in keys)
+    if unsigned:
+        print(f'  this unit takes releases ({pinned}); sending this as a build of your own (--unsigned)')
+        return 'unsigned'
+    if sealed is None:
+        raise StepFailed(f'this unit takes only releases sealed by a key it pins ({pinned}): give it '
+                         'a signed archive (init/flash --bundle), or pass --unsigned for a build of '
+                         'your own')
+    try:
+        number, _, key = seal.unseal(sealed, keys)
+    except seal.Refused as error:
+        raise StepFailed(f'the archive is not a release this unit takes: {error}') from None
+    floor = int(state.get('release') or 0)
+    if number < floor:
+        raise StepFailed(f'the archive is release {number}; this unit has settled on release {floor} '
+                         'and takes nothing older')
+    print(f'  release {number}, sealed by {seal.fingerprint(key)}')
+    return 'release'
+
+
+def present(link, terms, sealed):
+    """Before staging: have the unit verify the release itself. Returns the flags for staging
+    the loader and the root. The root goes `--from-release`: it is this unit's root, built here
+    from the release's, and the unit cannot check that (system-update says so too)."""
+    if terms == 'release':
+        code, text = link.call(f'cat > {RELEASE_STAGING}', data=sealed)
+        if code:
+            raise StepFailed(f'the release did not reach the unit: {text.strip()[-300:]}')
+        code, text = tool(link, 'release', RELEASE_STAGING)
+        if code:
+            raise StepFailed(f'the unit does not take this release: {text.strip()[-300:]}')
+    return STAGING_FLAGS[terms]
+
+
 def wait(link, answering, seconds, clock, sleep):
     """True once the unit answers (or, with answering False, stops answering)."""
     deadline = clock() + seconds
@@ -99,7 +161,7 @@ def wait(link, answering, seconds, clock, sleep):
 
 
 def run(settings, serial=None, authorized_key=None, link=None, clock=time.monotonic, sleep=time.sleep,
-        no_login_key=False):
+        no_login_key=False, unsigned=False):
     config.require_images(config.ROOTFS)
     serial = config.pick_unit(settings.data_dir, serial)
     directory = config.unit_dir(settings.data_dir, serial)
@@ -131,12 +193,13 @@ def run(settings, serial=None, authorized_key=None, link=None, clock=time.monoto
         raise StepFailed('the loader on this unit does not apply staged updates: flash it '
                          'once over the serial console (init/flash --loader)')
     check_layout(link)
+    _, root_flags = present(link, admit(link, state, unsigned=unsigned), None)
 
     print(f'  rootfs: sending {Path(image).name} ({len(data)} bytes)')
     code, text = link.call(f'cat > {STAGING}.part && mv {STAGING}.part {STAGING}', data=data, timeout=300)
     if code:
         raise StepFailed(f'the image did not reach the unit: {text.strip()[-300:]}')
-    code, text = tool(link, 'stage', STAGING, digest, timeout=600)
+    code, text = tool(link, 'stage', STAGING, digest, *root_flags, timeout=600)
     if code:
         raise StepFailed(f'the unit did not stage it: {text.strip()[-300:]}')
     print('  rootfs: staged; rebooting, and the loader writes it')
@@ -191,7 +254,7 @@ def check_layout(link, expected=None):
 
 
 def run_joint(settings, serial=None, authorized_key=None, bundle_path=None, link=None,
-              clock=time.monotonic, sleep=time.sleep, no_login_key=False):
+              clock=time.monotonic, sleep=time.sleep, no_login_key=False, unsigned=False):
     """The loader and the root in one go, with one reboot: from the update archive at
     `bundle_path` (init/flash --bundle), or from this build's images. Both are staged, the
     first loader writes and starts the second, which writes the root, and once the system is
@@ -199,10 +262,10 @@ def run_joint(settings, serial=None, authorized_key=None, bundle_path=None, link
     out; what is not confirmed is undone by the next boot, each part as it is alone."""
     serial = config.pick_unit(settings.data_dir, serial)
     directory = config.unit_dir(settings.data_dir, serial)
-    layout = None
+    layout = sealed = None
     with tempfile.TemporaryDirectory(prefix='w1700k-update-') as temporary:
         if bundle_path is not None:
-            manifest, files = bundle.read(bundle_path)
+            manifest, files, sealed = bundle.read_release(bundle_path)
             layout, loader_data = manifest['partitions'], files[bundle.LOADER]
             generic = Path(temporary) / bundle.ROOT
             generic.write_bytes(files[bundle.ROOT])
@@ -227,6 +290,7 @@ def run_joint(settings, serial=None, authorized_key=None, bundle_path=None, link
     check_layout(link, layout)
     print(f'flash: the unit runs root {state["running"][:12]}, second loader '
           f'{state["second_loader"][:12] or "absent"}')
+    terms = admit(link, state, sealed, unsigned)
     need_root, need_loader = state['running'] != root, state['second_loader'] != loader
     if no_login_key and need_root:
         check_paperclip_key(link)
@@ -245,9 +309,11 @@ def run_joint(settings, serial=None, authorized_key=None, bundle_path=None, link
     if not need_root and not need_loader:
         print('  loader and rootfs: already current')
         return 0
+    loader_flags, root_flags = present(link, terms, sealed)
 
-    for wanted, name, data, path, verb in ((need_loader, 'loader', loader_data, LOADER_STAGING, 'stage-loader'),
-                                           (need_root, 'rootfs', root_data, STAGING, 'stage')):
+    for wanted, name, data, path, verb, flags in (
+            (need_loader, 'loader', loader_data, LOADER_STAGING, 'stage-loader', loader_flags),
+            (need_root, 'rootfs', root_data, STAGING, 'stage', root_flags)):
         if not wanted:
             print(f'  {name}: already current')
             continue
@@ -255,7 +321,7 @@ def run_joint(settings, serial=None, authorized_key=None, bundle_path=None, link
         code, text = link.call(f'cat > {path}.part && mv {path}.part {path}', data=data, timeout=300)
         if code:
             raise StepFailed(f'the {name} image did not reach the unit: {text.strip()[-300:]}')
-        code, text = tool(link, verb, path, hashlib.sha256(data).hexdigest(), timeout=600)
+        code, text = tool(link, verb, path, hashlib.sha256(data).hexdigest(), *flags, timeout=600)
         if code:
             cancel(link)
             raise StepFailed(f'the unit did not stage the {name}: {text.strip()[-300:]}')
@@ -302,7 +368,7 @@ def confirm_joint(link, root, loader, storage=None):
 
 
 def run_loader(settings, serial=None, authorized_key=None, link=None, clock=time.monotonic,
-               sleep=time.sleep):
+               sleep=time.sleep, unsigned=False):
     """A newer loader over ssh: the second loader (config.LOADER_B) is staged, the unit's first
     loader writes it to `loader-b` at the reboot and starts it, and once the system is up on
     it, it is confirmed. One that is never confirmed is removed by the first loader at the
@@ -336,12 +402,13 @@ def run_loader(settings, serial=None, authorized_key=None, link=None, clock=time
         print('  loader: already current')
         return 0
 
+    loader_flags, _ = present(link, admit(link, state, unsigned=unsigned), None)
     print(f'  loader: sending {config.LOADER_B.name} ({len(data)} bytes)')
     code, text = link.call(f'cat > {LOADER_STAGING}.part && mv {LOADER_STAGING}.part {LOADER_STAGING}',
                            data=data, timeout=300)
     if code:
         raise StepFailed(f'the image did not reach the unit: {text.strip()[-300:]}')
-    code, text = tool(link, 'stage-loader', LOADER_STAGING, digest, timeout=600)
+    code, text = tool(link, 'stage-loader', LOADER_STAGING, digest, *loader_flags, timeout=600)
     if code:
         raise StepFailed(f'the unit did not stage it: {text.strip()[-300:]}')
     print('  loader: staged; rebooting, and the first loader writes and starts it')

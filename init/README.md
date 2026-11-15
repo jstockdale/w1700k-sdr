@@ -301,6 +301,62 @@ Both updates need a loader that knows them. A unit installed before they
 existed says so before anything is sent; give it the new loader once, over the
 serial console: `init/flash --loader`.
 
+### Signed releases
+
+A unit can be built to take over ssh only what a release key sealed. It is a
+property of the root: a build with `W1700K_RELEASE_KEYS=FILE` puts the public
+keys in FILE into it, and a unit on that root pins them.
+
+```sh
+init/sign keygen ~/keys/w1700k-primary.key >  release-keys   # the private half stays in the file
+init/sign keygen ~/keys/w1700k-spare.key   >> release-keys   # a second, to keep offline
+W1700K_RELEASE_KEYS=release-keys make                          # units of this build pin both
+
+init/sign archive --key ~/keys/w1700k-primary.key --release 7  # w1700k-release-7.tar, beside the archive
+init/flash --bundle platform/build/images/w1700k-release-7.tar
+```
+
+- **A release** is the update archive with one member more: its manifest,
+  sealed. The manifest lists the SHA-256 of every image, so one signature
+  covers them all. The envelope is Whitehat Hardware's WMS2, the one its
+  devices take their commands in ([`seal/`](../seal/README.md)).
+- **Checked twice.** `init/flash --bundle` reads the unit's keys and checks the
+  seal before it sends anything; the unit checks it again with its own
+  verifier, and that is the check that counts.
+- **Nothing older.** The release number only goes up. A unit keeps the number
+  of the newest release it has settled on (confirmed, not merely been sent),
+  in durable storage, and refuses an older one. It has no clock, so the number
+  is all it can hold a release to.
+- **Either key.** Any pinned key may seal a release, so the spare takes over if
+  the first is lost. Keys are replaced by a release whose root holds the new
+  ones.
+- **`--unsigned`** is the owner's word: `init/flash --ssh --unsigned` sends a
+  build of your own to a unit that pins keys. Whoever has root on a unit owns
+  it; the keys guard against an archive that is not what it claims, not
+  against the owner.
+- **A unit with no keys** takes any update, as before, and is told when an
+  archive is signed that nothing checks the seal.
+
+What the unit cannot check yet is its root. Each unit's root is built on the
+host from the release's root, because its ssh host key is in it, so the root a
+unit is sent is in no manifest. The tool checks the release's root against the
+manifest before it builds the unit's from it; the unit takes that root because
+a release was verified, and says that the root itself was not. The loader is
+the same for every unit, and the unit does check it. This closes when one root
+fits every unit ([the roadmap](../docs/roadmap.md)).
+
+Tried on a unit (a W1700K2) with throwaway keys:
+
+| Sent to a unit that pins two keys | What happened |
+| --- | --- |
+| The unsigned archive, and this build over ssh | Refused by the tool, which names the unit's keys and `--unsigned` |
+| Release 5, sealed by the first key | Checked by the tool and by the unit, written, confirmed; the unit's floor became 5 |
+| Release 4 after that | Refused by the tool, and by the unit when asked directly |
+| Release 6 sealed by a key the unit does not pin | Refused by both |
+| Release 6 sealed by the spare key | Verified by both |
+| A loader no release lists | Refused by the unit |
+| The unit's previous root, with `--unsigned` | Taken |
+
 ### A unit installed from an earlier version
 
 The flash layout changed twice in November 2026. Until then our `durable`

@@ -6,9 +6,12 @@
 # environment). init/flash --ssh drives this.
 #
 #   system-update status                what runs, what is staged, what the loader made of it
-#   system-update stage IMAGE SHA256    leave IMAGE (a SquashFS root, e.g. in /work) for the
+#   system-update release ENVELOPE      verify a release's sealed manifest (manifest.wms2 of a
+#                                       signed archive) against the keys this unit pins
+#   system-update stage IMAGE SHA256 [--from-release | --unsigned]
+#                                       leave IMAGE (a SquashFS root, e.g. in /work) for the
 #                                       loader, with the running root beside it to go back to
-#   system-update stage-loader IMAGE SHA256
+#   system-update stage-loader IMAGE SHA256 [--unsigned]
 #                                       leave IMAGE (a second loader, w1700k-loader-b.itb) for
 #                                       the first loader to put in `loader-b` and start
 #   system-update confirm               what was staged runs and is wanted: settle on it
@@ -21,12 +24,26 @@
 # After `stage`, reboot. The loader writes the new root, reads it back and boots
 # it; `confirm` then keeps it. A boot that finds it still unconfirmed puts the
 # previous root back, so a root that does not come up is undone by a power cycle.
+#
+# A unit built with release keys (/etc/w1700k/release-keys) stages only what a release
+# sealed by one of them lists: `release` first, then the images, whose digests must be in
+# its manifest. The release's number is kept once the update is confirmed, and nothing
+# older is taken after that; a unit has no clock, so the number is all it can hold a
+# release to. Two things pass without being in a manifest, and each says so:
+#   --unsigned       the owner's own build. Whoever can run this as root owns the unit.
+#   --from-release   a root. Until one root fits every unit, the host builds each unit's
+#                    root (its ssh host key is in it) from the release's root, which it has
+#                    checked against the manifest; this unit cannot check that, and takes
+#                    the root because a release was verified, not because the root was.
+# A unit with no release keys takes any update, as before.
 set -eu
 . /etc/w1700k/storage.conf
 STAGED=/durable/update
 MARK='staged-update 1'		# in the description of a loader that applies updates
 SECOND_MARK='second-loader 1'	# and of one that starts a second loader from `loader-b`
 SECOND_KIND='W1700K SDR second ARM loader'	# the description of such a second loader
+RELEASE=/usr/sbin/w1700k-release	# the verifier, and the release it verified this boot (in RAM)
+FLOOR=/durable/release		# the number of the newest release this unit settled on
 
 fail() { echo "system-update: $*" >&2; exit 1; }
 
@@ -79,6 +96,38 @@ staged_loader()	# the staged second loader's digest; nothing when none is staged
 	' sh "$STAGED" | sed -n 's/^request: //p'
 }
 
+pinned() { "$RELEASE" pinned > /dev/null 2>&1; }
+
+release_floor()	# the newest release settled on; 0 before the first
+{
+	floor=$(/usr/sbin/durable-run sh -c '[ ! -f "$1" ] || echo "floor: $(cat "$1")"' sh "$FLOOR" |
+		sed -n 's/^floor: //p')
+	case $floor in ''|*[!0-9]*) echo 0 ;; *) echo "$floor" ;; esac
+}
+
+permitted()	# may the image with digest $1 be staged, given the flag $2? $3 names it
+{
+	pinned || return 0
+	case ${2:-} in
+	--unsigned)
+		echo "system-update: taking $3 unsigned, on the owner's word" >&2
+		return 0 ;;
+	--from-release)
+		[ -n "$("$RELEASE" number 2>/dev/null || :)" ] || return 1
+		echo "system-update: taking $3 as built by the host from release $("$RELEASE" number); it is not checked here" >&2
+		return 0 ;;
+	esac
+	"$RELEASE" allows "$1"
+}
+
+note_release()	# beside what is staged: the release it comes from, for `confirm` to keep
+{
+	number=$("$RELEASE" number 2>/dev/null || :)
+	[ -n "$number" ] || return 0
+	/usr/sbin/durable-run sh -c 'echo "$2" > "$1/release" && sync' sh "$STAGED" "$number" > /dev/null ||
+		fail "the release's number could not be noted"
+}
+
 forget()
 {
 	/usr/sbin/durable-run rm -rf "$STAGED" > /dev/null || fail "the staged files are still there"
@@ -99,14 +148,28 @@ status)
 	echo "loader_tried=$(loader_note loader_tried)"
 	echo "loader_booted=$(loader_note loader_booted)"
 	echo "loader_failed=$(loader_note loader_failed)"
+	echo "release_keys=$("$RELEASE" pinned 2>/dev/null || :)"
+	echo "release=$(release_floor)"
+	echo "release_verified=$("$RELEASE" number 2>/dev/null || :)"
+	;;
+release)
+	envelope=${2:-}
+	[ -f "$envelope" ] || fail "usage: system-update release ENVELOPE"
+	pinned || fail "this unit pins no release key; it takes any update"
+	"$RELEASE" verify --floor "$(release_floor)" "$envelope" > /dev/null ||
+		fail "not a release this unit takes"
+	echo "system-update: release $("$RELEASE" number) verified; its images can be staged"
 	;;
 stage)
 	image=${2:-} want=${3:-}
-	[ -f "$image" ] && [ -n "$want" ] || fail "usage: system-update stage IMAGE SHA256"
+	[ -f "$image" ] && [ -n "$want" ] || fail "usage: system-update stage IMAGE SHA256 [--from-release | --unsigned]"
 	installed || fail "this boot runs from RAM, not from the installed root"
 	loader_applies || fail "the loader on this unit does not apply staged updates: " \
 		"flash it once over the serial console (init/flash --loader)"
 	[ "$(digest < "$image")" = "$want" ] || fail "$image is not $want"
+	permitted "$want" "${4:-}" "this root" || fail "this unit takes releases: verify one first " \
+		"(system-update release), whose manifest lists this root or with --from-release; " \
+		"or pass --unsigned for a build of your own"
 	root=$(volume rootfs)
 	sys=/sys/class/ubi/${root##*/}
 	room=$(($(cat "$sys/reserved_ebs") * $(cat "$sys/usable_eb_size")))
@@ -134,17 +197,22 @@ stage)
 		mv "$staged/request.part" "$staged/request"
 		sync
 	' sh "$STAGED" "$image" "$want" "$root" "$old" "$size" || fail "nothing is staged"
+	[ "${4:-}" = --unsigned ] || note_release
 	echo "system-update: staged $want over $old; reboot to have the loader write it"
 	;;
 stage-loader)
 	image=${2:-} want=${3:-}
-	[ -f "$image" ] && [ -n "$want" ] || fail "usage: system-update stage-loader IMAGE SHA256"
+	[ -f "$image" ] && [ -n "$want" ] || fail "usage: system-update stage-loader IMAGE SHA256 [--unsigned]"
 	installed || fail "this boot runs from RAM, not from the installed root"
 	loader_starts_second || fail "the loader on this unit starts no second loader: " \
 		"flash it once over the serial console (init/flash --loader)"
 	[ "$(digest < "$image")" = "$want" ] || fail "$image is not $want"
 	head -c 512 "$image" | grep -q "$SECOND_KIND" ||
 		fail "$image is not a second loader (w1700k-loader-b.itb)"
+	case ${4:-} in ''|--unsigned) ;; *) fail "usage: system-update stage-loader IMAGE SHA256 [--unsigned]" ;; esac
+	permitted "$want" "${4:-}" "this loader" || fail "this unit takes releases: verify one first " \
+		"(system-update release) whose manifest lists this loader, or pass --unsigned for a " \
+		"build of your own"
 	node=$(partition loader-b)
 	room=$(cat "/sys/class/mtd/$(basename "${node%ro}")/size")
 	size=$(wc -c < "$image")
@@ -166,6 +234,7 @@ stage-loader)
 		mv "$staged/request.part" "$staged/request"
 		sync
 	' sh "$STAGED" "$image" "$want" "$size" || fail "no loader is staged"
+	[ "${4:-}" = --unsigned ] || note_release
 	echo "system-update: staged the loader $want; reboot to have the first loader write and start it"
 	;;
 confirm)
@@ -179,15 +248,24 @@ confirm)
 			fail "the staged loader $loader did not start this boot"
 		[ "$(second_loader)" = "$loader" ] || fail "loader-b does not hold the staged loader $loader"
 	fi
+	# What was staged from a release moves the floor up to it: nothing older is taken again.
+	number=$(/usr/sbin/durable-run sh -c '[ ! -f "$1/release" ] || echo "release: $(cat "$1/release")"' \
+		sh "$STAGED" | sed -n 's/^release: //p')
+	case $number in *[!0-9]*) number= ;; esac
+	[ -z "$number" ] || [ "$number" -gt "$(release_floor)" ] || number=
 	forget
-	echo "system-update: settled on root $now${loader:+ and loader $loader}"
+	[ -z "$number" ] || /usr/sbin/durable-run sh -c \
+		'echo "$2" > "$1.part" && sync && mv "$1.part" "$1" && sync' sh "$FLOOR" "$number" > /dev/null ||
+		fail "settled, but the release's number could not be kept"
+	echo "system-update: settled on root $now${loader:+ and loader $loader}${number:+, release $number}"
 	;;
 cancel)
 	forget
 	echo "system-update: nothing is staged"
 	;;
 *)
-	echo "usage: system-update status | stage IMAGE SHA256 | stage-loader IMAGE SHA256 | confirm | cancel" >&2
+	echo "usage: system-update status | release ENVELOPE | stage IMAGE SHA256 [--from-release | --unsigned] |" >&2
+	echo "       stage-loader IMAGE SHA256 [--unsigned] | confirm | cancel" >&2
 	exit 2
 	;;
 esac
