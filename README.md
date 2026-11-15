@@ -233,6 +233,11 @@ who has the tools but does not build. Either command takes about a minute.
   loader that is never confirmed is undone by the next boot: the previous
   root is written back, the second loader is removed. A unit that does not
   come back from an update is recovered by a power cycle.
+- **A unit can be built to take signed releases only.** With release keys in
+  its root, it stages what a release sealed by one of them lists, and nothing
+  older than the release it has settled on; `init/sign` seals an archive.
+  `--unsigned` is the owner's word for a build of their own
+  ([init/README.md](init/README.md#signed-releases)).
 - **An archive built for another flash layout is not sent**, nor is this
   build to a unit installed under an older one, over the network or the serial
   console: the tool compares the unit's partitions first, and says how such a
@@ -314,6 +319,7 @@ the most CPU, in `tests/build/host-bench.txt` and `.json`. With
 ## Licence
 
 MIT, except the Linux driver and kernel patches (GPL-2.0-only), U-Boot patches
-(GPL-2.0+), the driver's user-space header (GPL-2.0 WITH Linux-syscall-note)
-and files derived from MediaTek's mt76 driver (BSD-3-Clause-Clear). See
+(GPL-2.0+), the driver's user-space header (GPL-2.0 WITH Linux-syscall-note),
+files derived from MediaTek's mt76 driver (BSD-3-Clause-Clear) and the
+vendored Monocypher in `seal/` (BSD-2-Clause OR CC0-1.0). See
 [LICENSE](LICENSE).

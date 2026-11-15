@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""Make an update archive a release: seal its manifest with a release key.
+
+    init/sign keygen KEYFILE                      # a new signing key, and its line for a unit
+    init/sign public KEYFILE                      # that line again
+    init/sign archive --key KEYFILE --release N [ARCHIVE] [-o OUT]
+    init/sign check --keys FILE ARCHIVE           # is it a release, and which of these keys' is it
+
+A unit built with release keys in it (`W1700K_RELEASE_KEYS=FILE make`, see platform/README.md)
+takes over ssh only what one of them sealed, and nothing older than the release it has settled
+on. `keygen` writes the private half of a key to KEYFILE, readable by you alone, and prints the
+public half as one line of such a file. Keep two: one to sign with, one that stays offline until
+the first is lost.
+
+`archive` writes ARCHIVE (default: this build's w1700k-update.tar) again as release N, with the
+number in its manifest and the manifest sealed, to OUT (default: w1700k-release-N.tar beside
+it). The manifest lists the SHA-256 of every image in the archive, so the one signature covers
+them all. N only ever goes up: a unit that has settled on release 7 refuses release 6.
+
+The envelope is Whitehat Hardware's WMS2 (`seal/`, init/initkit/seal.py). Signing takes the
+Python package `cryptography` or PyNaCl; checking takes neither.
+"""
+import argparse
+import os
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from initkit import bundle, config, seal                # noqa: E402
+from initkit.console import StepFailed                  # noqa: E402
+
+
+def read_seed(path):
+    try:
+        text = Path(path).read_text().strip()
+        seed = bytes.fromhex(text)
+    except (OSError, ValueError) as error:
+        raise StepFailed(f'{path} is not a signing key: {error}') from None
+    if len(seed) != 32:
+        raise StepFailed(f'{path} is not a signing key: it holds {len(seed)} bytes, not 32')
+    return seed
+
+
+def key_line(public, note):
+    return f'{public.hex()}  {note} ({seal.fingerprint(public)})'
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    verbs = parser.add_subparsers(dest='verb', required=True)
+    for name in ('keygen', 'public'):
+        verb = verbs.add_parser(name)
+        verb.add_argument('keyfile', type=Path, metavar='KEYFILE')
+    archive = verbs.add_parser('archive')
+    archive.add_argument('--key', type=Path, required=True, metavar='KEYFILE')
+    archive.add_argument('--release', type=int, required=True, metavar='N')
+    archive.add_argument('archive', type=Path, nargs='?', default=config.UPDATE, metavar='ARCHIVE')
+    archive.add_argument('-o', '--output', type=Path, metavar='OUT')
+    check = verbs.add_parser('check')
+    check.add_argument('--keys', type=Path, required=True, metavar='FILE')
+    check.add_argument('archive', type=Path, metavar='ARCHIVE')
+    args = parser.parse_args()
+    try:
+        if args.verb == 'keygen':
+            seed = seal.new_seed()
+            public, _ = seal.signer(seed)
+            # Made new and for its owner alone, or not at all: a key is never overwritten.
+            try:
+                handle = os.open(args.keyfile, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:
+                raise StepFailed(f'{args.keyfile} exists; a key is never overwritten') from None
+            with os.fdopen(handle, 'w') as stream:
+                stream.write(seed.hex() + '\n')
+            print(f'sign: the signing key is in {args.keyfile}; keep it private. Its line for a '
+                  'release-keys file:', file=sys.stderr)
+            print(key_line(public, args.keyfile.stem))
+        elif args.verb == 'public':
+            public, _ = seal.signer(read_seed(args.keyfile))
+            print(key_line(public, args.keyfile.stem))
+        elif args.verb == 'archive':
+            public, sign = seal.signer(read_seed(args.key))
+            output = args.output or args.archive.with_name(f'w1700k-release-{args.release}.tar')
+            if output.exists() and output.resolve() != args.archive.resolve():
+                raise StepFailed(f'{output} exists; a release is never overwritten')
+            bundle.sign(args.archive, output, args.release, sign)
+            print(f'sign: {output} is release {args.release}, sealed by {seal.fingerprint(public)}')
+        else:
+            keys = seal.read_keys(args.keys.read_text())
+            manifest, _, sealed = bundle.read_release(args.archive)
+            if sealed is None:
+                raise StepFailed(f'{args.archive} is not sealed: an update archive, not a release')
+            release, _, key = seal.unseal(sealed, keys)
+            print(f'sign: {args.archive} is release {release}, sealed by {seal.fingerprint(key)}; '
+                  f'its {len(manifest["files"])} images are the ones its manifest lists')
+    except (StepFailed, seal.Refused) as error:
+        sys.exit(f'sign: {error}')
+    except OSError as error:
+        sys.exit(f'sign: {error}')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
