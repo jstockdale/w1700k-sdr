@@ -15,7 +15,6 @@ import argparse
 import hashlib
 import os
 from pathlib import Path
-import re
 import shutil
 import struct
 import subprocess
@@ -35,10 +34,6 @@ MODULE = ROOT / 'kernel/w1700k_sdr/build/w1700k_sdr.ko'
 CLIENT_DIR = ROOT / 'kernel/w1700k_sdr/build'
 CLIENTS = ('mt7996-probe', 'mt7996-download', 'mt7996-stream', 'mt7996-ctl', 'w1700k-led',
            'w1700k-key', 'w1700k-gps', 'w1700k-release')
-# The public keys a unit of this build takes releases from: the file this names goes into
-# the root as /etc/w1700k/release-keys (seal/release.c reads it; init/sign makes its
-# lines). Unset, the root has no such file and the unit takes any update.
-RELEASE_KEYS = 'W1700K_RELEASE_KEYS'
 LICENSE = ROOT / 'kernel/w1700k_sdr/LICENSE.mt76'
 # Host tools that the kernel and U-Boot builds take from Buildroot.
 HOST_PACKAGES = ('host-bison', 'host-flex')
@@ -101,27 +96,9 @@ def fw_env_config():
             f'/dev/ubi0:{secondary} 0x0 {size:#x}\n')
 
 
-def release_keys():
-    """The release-keys file named by the environment, checked, or None."""
-    path = os.environ.get(RELEASE_KEYS)
-    if not path:
-        return None
-    require(Path(path).is_file(), f'{RELEASE_KEYS}={path} is not a file')
-    data = Path(path).read_bytes()
-    keys = [line.split()[0] for line in data.decode('ascii', 'replace').splitlines()
-            if line.strip() and not line.lstrip().startswith('#')]
-    require(keys and len(keys) <= 8 and all(re.fullmatch(r'[0-9a-f]{64}', key) for key in keys),
-            f'{path} is not a release-keys file: one to eight public keys of 64 hex digits, '
-            'one to a line (init/sign public KEYFILE prints such a line)')
-    return data
-
-
 def overlay_files(with_sdr):
     """Every overlay file as {relative path: (bytes, mode)}."""
     files = {}
-    keys = release_keys()
-    if keys is not None:
-        files['etc/w1700k/release-keys'] = (keys, 0o644)
     templates = UNIT / 'overlay'
     for path in sorted(templates.rglob('*')):
         if path.is_file():

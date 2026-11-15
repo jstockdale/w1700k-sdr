@@ -26,7 +26,7 @@ SCRIPT = config.ROOT / 'platform/rootfs/overlay/usr/sbin/system-update'
 STAGING = '/work/system-update.squashfs'      # in RAM on the unit
 LOADER_STAGING = '/work/system-update.loader'
 RELEASE_STAGING = '/work/system-update.release'
-RELEASE_KEYS = '/etc/w1700k/release-keys'
+ROTATION_STAGING = '/work/system-update.keys'
 DOWN_SECONDS = 90           # for a rebooting unit to stop answering
 UP_SECONDS = 240            # for it to answer again: the loader's write, then the boot
 POWER_CYCLE_SECONDS = 900   # for the operator to power-cycle a unit that did not come back
@@ -94,43 +94,106 @@ STAGING_FLAGS = {'any': ([], []), 'unsigned': (['--unsigned'], ['--unsigned']),
                  'release': ([], ['--from-release'])}
 
 
+def held_list(link):
+    """The list of keys a keyed unit holds, read here as the unit reads it."""
+    code, text = tool(link, 'keys')
+    try:
+        if code:
+            raise seal.Refused(text.strip()[-300:])
+        return seal.parse_list(text.encode('ascii', 'replace'))
+    except seal.Refused as error:
+        raise StepFailed(f"the unit's list of keys could not be read: {error}") from None
+
+
+def catch_up(link, state, rotations):
+    """Give a keyed unit the rotations it has not had, oldest first, before anything is judged
+    by its keys: each is a complete list sealed by a key of the list before it, which the unit
+    checks itself. Returns the unit's state afterwards. A rotation changes who is trusted and
+    nothing else, so it needs nobody's word; a unit that holds no list is given none here."""
+    if state.get('keys') != 'keyed' or not rotations:
+        return state
+    held, taken = held_list(link), 0
+    for envelope in rotations:
+        try:
+            offered = seal.parse_list(seal.body_of(envelope))
+            if offered.stamp < held.stamp:
+                continue
+            following, by = seal.rotated(held, envelope)
+        except seal.Refused as error:
+            # Said, and passed over: a rotation this unit does not take changes nothing on it,
+            # and must not stand between it and a later one, or a release, that it does take.
+            print(f'  KEYS: a rotation with this update is NOT one this unit takes (it holds list '
+                  f'{held.label}): {error}')
+            continue
+        if by is None:
+            continue
+        code, text = link.call(f'cat > {ROTATION_STAGING}', data=envelope)
+        if code:
+            raise StepFailed(f'the rotation did not reach the unit: {text.strip()[-300:]}')
+        code, text = tool(link, 'rotate', ROTATION_STAGING)
+        if code:
+            raise StepFailed(f'the unit does not take the rotation to list {offered.label}: '
+                             f'{text.strip()[-300:]}')
+        print(f'  keys: list {following.label}, sealed by {by.name} ({by.scope}, '
+              f'{seal.fingerprint(by.public)})')
+        held, taken = following, taken + 1
+    if not taken:
+        return state
+    state = status(link)
+    if state is None or state.get('key_generation') != held.label:
+        raise StepFailed(f'the unit took the rotations and does not say it holds list {held.label}')
+    return state
+
+
 def admit(link, state, sealed=None, unsigned=False):
     """On what terms this unit takes the update: 'any', 'unsigned' or 'release'. Nothing is
     sent here, and it is asked before anything else is decided, so that an archive the unit
     would refuse is refused even when the unit already has everything in it.
 
-    A unit that pins release keys takes what one of them sealed and nothing older than the
-    release it has settled on. `sealed` is the archive's sealed manifest, checked here against
-    the unit's own keys; present() then has the unit check it, which is what counts.
-    `unsigned` is the owner's word for a build of their own."""
-    if state.get('release_keys') in (None, '', '0'):
+    A keyed unit takes what a release key of the list it holds sealed, and nothing older than
+    the release it has settled on. `sealed` is the archive's sealed manifest, checked here
+    against the unit's own list; present() then has the unit check it, which is what counts.
+    A unit that was keyed and holds no list that reads takes nothing sealed at all. `unsigned`
+    is the owner's word for a build of their own, which either kind takes."""
+    regime = state.get('keys') or 'unkeyed'
+    if regime == 'unkeyed':
         if sealed is not None:
-            print('  the archive is a signed release, but this unit pins no release key: '
+            print('  the archive is a signed release, but this unit holds no list of keys: '
                   'nothing checks the seal')
         return 'any'
-    code, text = link.call(f'cat {RELEASE_KEYS}')
-    try:
-        keys = seal.read_keys(text) if code == 0 else []
-    except seal.Refused as error:
-        raise StepFailed(f"the unit's release keys do not read as keys: {error}") from None
-    if not keys:
-        raise StepFailed(f'the unit says it pins release keys, but {RELEASE_KEYS} could not be read')
-    pinned = ', '.join(seal.fingerprint(key) for key in keys)
+    if regime != 'keyed':
+        said = (f'THIS UNIT WAS GIVEN A LIST OF KEYS AND HOLDS NONE THAT READS (its list: '
+                f'{state.get("key_list") or "unknown"}). It takes nothing sealed until it is given a list '
+                'again at the bench (init/bench key)')
+        if not unsigned:
+            raise StepFailed(said + '; --unsigned sends it a build of your own')
+        print(f'  {said}.\n  Sending this as a build of your own (--unsigned)')
+        return 'unsigned'
+    keys = held_list(link)
+    pinned = f'list {keys.label}: ' + (', '.join(
+        f'{key.name} {seal.fingerprint(key.public)}' for key in keys.scoped('release')) or 'no release key')
     if unsigned:
         print(f'  this unit takes releases ({pinned}); sending this as a build of your own (--unsigned)')
         return 'unsigned'
     if sealed is None:
-        raise StepFailed(f'this unit takes only releases sealed by a key it pins ({pinned}): give it '
-                         'a signed archive (init/flash --bundle), or pass --unsigned for a build of '
-                         'your own')
+        raise StepFailed(f'this unit takes only releases sealed by a release key of its list ({pinned}): '
+                         'give it a signed archive (init/flash --bundle), or pass --unsigned for a build '
+                         'of your own')
     try:
-        number, _, key = seal.unseal(sealed, keys)
+        number, body, key = seal.unseal(sealed, keys.release_keys())
     except seal.Refused as error:
-        raise StepFailed(f'the archive is not a release this unit takes: {error}') from None
+        raise StepFailed(f'the archive is not a release this unit takes ({pinned}): {error}') from None
+    if not (state.get('release') or '0').isdigit():
+        raise StepFailed('the number of the release this unit settled on does not read: it takes no release '
+                         'until it is keyed at the bench again (init/bench key)')
     floor = int(state.get('release') or 0)
     if number < floor:
         raise StepFailed(f'the archive is release {number}; this unit has settled on release {floor} '
                          'and takes nothing older')
+    # The number a unit settled on is one release: its manifest, by digest.
+    if number == floor and state.get('release_manifest') not in (None, '', hashlib.sha256(body).hexdigest()):
+        raise StepFailed(f'the archive is ANOTHER release {number} than the one this unit settled on: two '
+                         'were sealed under one number')
     print(f'  release {number}, sealed by {seal.fingerprint(key)}')
     return 'release'
 
@@ -263,9 +326,11 @@ def run_joint(settings, serial=None, authorized_key=None, bundle_path=None, link
     serial = config.pick_unit(settings.data_dir, serial)
     directory = config.unit_dir(settings.data_dir, serial)
     layout = sealed = None
+    rotations = []
     with tempfile.TemporaryDirectory(prefix='w1700k-update-') as temporary:
         if bundle_path is not None:
             manifest, files, sealed = bundle.read_release(bundle_path)
+            rotations = bundle.rotations(bundle_path)
             layout, loader_data = manifest['partitions'], files[bundle.LOADER]
             generic = Path(temporary) / bundle.ROOT
             generic.write_bytes(files[bundle.ROOT])
@@ -290,6 +355,7 @@ def run_joint(settings, serial=None, authorized_key=None, bundle_path=None, link
     check_layout(link, layout)
     print(f'flash: the unit runs root {state["running"][:12]}, second loader '
           f'{state["second_loader"][:12] or "absent"}')
+    state = catch_up(link, state, rotations)
     terms = admit(link, state, sealed, unsigned)
     need_root, need_loader = state['running'] != root, state['second_loader'] != loader
     if no_login_key and need_root:
