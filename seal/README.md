@@ -10,6 +10,12 @@ of those keys sealed. This directory is what verifies that on the unit:
 | `wms2.c`, `include/wms2.h` | Whitehat Hardware: the WMS2 envelope verifier its devices take their commands with | MIT |
 | `monocypher.c`, `monocypher.h`, `optional/monocypher-ed25519.c`, `optional/monocypher-ed25519.h` | Monocypher, by Loup Vaillant, with its RFC 8032 Ed25519 module | BSD-2-Clause OR CC0-1.0 |
 
+`whitehat-release-keys` is not code: it is the public halves of Whitehat
+Hardware's two release keys for this product, issued 2026-11-14, in the form
+`W1700K_RELEASE_KEYS` takes. A test holds each to its fingerprint and to the
+proof of possession its keeper returned. Their private halves sign elsewhere
+(`init/sign request`, `init/sign attach`).
+
 The last two rows are vendored as they came, byte for byte, from Whitehat
 Hardware's `whitehat-watcher` firmware (its `seal` component at commit
 `bf6bc16`, 2026-11-10). They are not edited here: a change belongs there first.

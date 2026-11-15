@@ -64,19 +64,37 @@ def read_release(path):
     return manifest, data, sealed
 
 
-def sign(path, output, release, sign_with, when_ms=None):
-    """The archive at `path` as release number `release` in `output`: the same images, the
-    manifest with the number in it, and that manifest sealed by `sign_with(message)`."""
+def _numbered(path, release):
+    """(the manifest of the archive at `path` with `release` in it, as text; its images)."""
     manifest, data, _ = read_release(path)
     manifest = {**manifest, 'release': release,
                 'partitions': {name: list(span) for name, span in manifest['partitions'].items()}}
-    text = (json.dumps(manifest, indent=1) + '\n').encode()
+    return (json.dumps(manifest, indent=1) + '\n').encode(), data
+
+
+def sign(path, output, release, sign_with, when_ms=None, keys=None):
+    """The archive at `path` as release number `release` in `output`: the same images, the
+    manifest with the number in it, and that manifest sealed by `sign_with(message)`. Given
+    `keys`, nothing is written unless one of them sealed it."""
+    text, data = _numbered(path, release)
     try:
         sealed = seal.seal(text, release, sign_with, when_ms)
+        if keys is not None:
+            seal.unseal(sealed, keys)
     except seal.Refused as error:
         raise StepFailed(str(error)) from None
     _write(output, {'manifest.json': text, SEALED: sealed, **data})
     return sealed
+
+
+def to_sign(path, release, when_ms):
+    """(the manifest, the bytes a key signs) to make the archive at `path` release `release`
+    at `when_ms`: what `sign` would hand its signer, for a key that signs somewhere else."""
+    text, _ = _numbered(path, release)
+    try:
+        return text, seal.unsigned(text, release, when_ms)[1]
+    except seal.Refused as error:
+        raise StepFailed(str(error)) from None
 
 
 def write(path, loader, root, partitions):

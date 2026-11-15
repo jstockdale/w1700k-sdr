@@ -70,7 +70,9 @@ installation, the first loader and the kernel image.
 - **Signed releases, the rest.** A unit built with release keys takes only an
   archive whose manifest one of them sealed, checked by the tool and again by
   the unit, and nothing older than the release it has settled on
-  (`init/sign`, `seal/`). Two things are open. The unit checks the loader
+  (`init/sign`, `seal/`). Whitehat Hardware's two keys are issued and in
+  `seal/whitehat-release-keys`, and sign away from the build host; no release
+  of theirs has been sealed or sent to a unit yet. Two more things are open. The unit checks the loader
   against the manifest but not the root: the root it is sent is its own,
   built on the host from the release's, so the check waits for one root that
   fits every unit (the item above). And the keys a unit pins are the signing

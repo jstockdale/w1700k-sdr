@@ -1,0 +1,12 @@
+# Whitehat Hardware's release keys for W1700K SDR, issued 2026-11-14.
+#
+# A unit built with them takes over ssh only a release one of them sealed:
+#
+#     W1700K_RELEASE_KEYS=seal/whitehat-release-keys make
+#
+# Public halves only. The private halves are with Whitehat Hardware's key
+# agent and sign there (`init/sign request`, `init/sign attach`); the spare
+# seals no release unless the primary is lost. Each line: the Ed25519 public
+# key (RFC 8032), its name, and its fingerprint as a unit prints it.
+8c49b87d67a3e6a53640040e01ef96c5f3e3e60ca12ab7a6e1c730d41cac8fce  w1700k-sdr-release-primary (38b64574d835b7ae)
+1ca10c4a968fe9cd6c6b00e3cc4beb5a1c8a57c88192a0cf72aa0f6abe2b00a9  w1700k-sdr-release-spare (ba61fe09d01305b2)
