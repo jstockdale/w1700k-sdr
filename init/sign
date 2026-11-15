@@ -202,7 +202,8 @@ def show(path):
           + f', {len(files)} images, from {manifest.get("source", "an unnamed source")}')
     if turns:
         keys = bundle.chain(turns)
-        print(f'it carries {len(turns)} rotations, which leave a unit holding:\n{describe(keys)}')
+        print(f'it carries {len(turns)} rotation{"s" if len(turns) != 1 else ""}, which '
+              f'leave{"" if len(turns) != 1 else "s"} a unit holding:\n{describe(keys)}')
         if sealed:
             _, _, key = seal.unseal(sealed, keys.release_keys())
             print(f'and it is sealed by {seal.fingerprint(key)}, a release key of that list')
