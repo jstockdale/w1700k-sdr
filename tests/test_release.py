@@ -536,6 +536,123 @@ class Archive(unittest.TestCase):
         self.assertNotEqual(refused.returncode, 0)
         self.assertIn("none of the release keys'", refused.stderr)
 
+    def requested(self, number=4):
+        """A request for release `number` of the plain archive, as the tool writes it."""
+        made = self.tool('request', '--release', number, self.plain)
+        self.assertEqual(made.returncode, 0, made.stderr)
+        path = self.dir / f'w1700k-release-{number}.request.json'
+        return path, json.loads(path.read_text()), made
+
+    def test_a_key_that_signs_elsewhere_gets_the_bytes_and_returns_a_signature(self):
+        keys = self.dir / 'release-keys'
+        keys.write_text(self.primary.hex() + '  primary\n')
+        path, request, made = self.requested()
+        message = bytes.fromhex(request['sign'])
+        self.assertEqual((request['release'], request['product'], request['topic'], request['bytes']),
+                         (4, seal.PRODUCT, seal.TOPIC, len(message)))
+        self.assertEqual(hashlib.sha256(message).hexdigest(), request['sign_sha256'])
+        self.assertIn(request['sign_sha256'], made.stdout)
+        # What the keeper is asked to sign is the topic, the header and the manifest, in the clear.
+        topic = seal.TOPIC.encode()
+        self.assertEqual(message[:2 + len(topic)], struct.pack('<H', len(topic)) + topic)
+        manifest = message[request['manifest_at']:]
+        self.assertEqual(request['manifest_at'], 2 + len(topic) + seal.HEADER)
+        self.assertEqual(hashlib.sha256(manifest).hexdigest(), request['manifest_sha256'])
+        self.assertEqual(json.loads(manifest)['release'], 4)
+        self.assertIn('never overwritten', self.tool('request', '--release', 4, self.plain).stderr)
+
+        # The keeper signs those bytes and nothing of ours touches its key.
+        signature = self.sign(message)
+        release = self.dir / 'w1700k-release-4.tar'
+        attached = self.tool('attach', '--request', path, '--signature', signature.hex(), '--keys', keys, self.plain)
+        self.assertEqual(attached.returncode, 0, attached.stderr)
+        self.assertIn('is release 4', self.tool('check', '--keys', keys, release).stdout)
+        # It is byte for byte the release a key on this host would have sealed at that moment.
+        whole = self.dir / 'whole.tar'
+        bundle.sign(self.plain, whole, 4, self.sign, request['time_ms'])
+        self.assertEqual(release.read_bytes(), whole.read_bytes())
+        self.assertIn('never overwritten', self.tool('attach', '--request', path, '--signature', signature.hex(),
+                                                     '--keys', keys, self.plain).stderr)
+
+    def test_a_signature_is_attached_only_if_it_is_a_pinned_keys_over_this_request(self):
+        keys, release = self.dir / 'release-keys', self.dir / 'w1700k-release-4.tar'
+        keys.write_text(self.primary.hex() + '\n')
+        path, request, _ = self.requested()
+        message = bytes.fromhex(request['sign'])
+        good, in_file = self.sign(message), self.dir / 'signature'
+        attach = lambda signature, archive=self.plain: self.tool(      # noqa: E731
+            'attach', '--request', path, '--signature', signature, '--keys', keys, archive)
+        for what, signature, said in (
+                ('a stranger', signing(3)[1](message).hex(), 'not over the bytes'),
+                ('another message', self.sign(message + b' ').hex(), 'not over the bytes'),
+                ('one bit', (good[:-1] + bytes((good[-1] ^ 1,))).hex(), 'not over the bytes'),
+                ('half of one', good.hex()[:64], 'a signature is 64 bytes'),
+                ('not hex', 'yes', 'not a signature')):
+            with self.subTest(what):
+                refused = attach(signature)
+                self.assertNotEqual(refused.returncode, 0)
+                self.assertIn(said, refused.stderr)
+                self.assertFalse(release.exists(), 'nothing is written')
+        # The archive the request was made of, and no other.
+        other = self.dir / 'other.tar'
+        bundle.write(other, b'\xd0\x0d\xfe\xed another loader', b'hsqs a root', config.partitions.GEOMETRY)
+        refused = attach(good.hex(), other)
+        self.assertIn('is not the archive', refused.stderr)
+        self.assertFalse(release.exists())
+        # A request someone changed on its way back is not a request.
+        changed = dict(request, release=5)
+        changed['sign'] = request['sign'][:-2] + '00'
+        path.write_text(json.dumps(changed))
+        self.assertIn('not a signing request', attach(good.hex()).stderr)
+        path.write_text(json.dumps(request))
+        # As a file, with the line breaks a keeper's tool may put in it.
+        in_file.write_text(good.hex()[:64] + '\n' + good.hex()[64:] + '\n')
+        self.assertEqual(attach(in_file).returncode, 0)
+        self.assertTrue(release.is_file())
+
+
+class Issued(unittest.TestCase):
+    """seal/whitehat-release-keys: the keys as they were issued, and their proofs of possession."""
+    KEYS = SEAL / 'whitehat-release-keys'
+    # What each key was asked to sign on 2026-11-14 (a WMS2 control envelope on a topic that is
+    # not a release's), and the signature its keeper returned.
+    PROOF = (b'\x14\x00w1700k-sdr/key-proof' + b'WMS2\x02\x00' + b'w1700k-sdr'.ljust(16, b'\0')
+             + struct.pack('<QQH', 1, 0, 0) + b'w1700k-sdr release key proof 04028d2ba19da5ed8463c10838bce40a')
+    RETURNED = {
+        'w1700k-sdr-release-primary': '318d17b0c31c3dba227ac6324253b0dc2ed6552efd396cc99dd4f61f0e57842d'
+                                      '97b0fd72928d9bd553922e98b7a2dce5157b01351a46dc206ddd186c85d1380a',
+        'w1700k-sdr-release-spare': '8cb7f12469bae32a9f9d9175dc2e0779233f4dc62044145718be5fa5cf620a97'
+                                    '611bbd34d99696cecbe3952bbb07204929194a78c71c7857548a0cbc46489d03'}
+
+    def lines(self):
+        return [line.split() for line in self.KEYS.read_text().splitlines() if line and not line.startswith('#')]
+
+    def test_the_file_is_two_keys_each_with_its_own_fingerprint(self):
+        keys = seal.read_keys(self.KEYS.read_text())
+        self.assertEqual(len(keys), 2)
+        self.assertEqual([name for _, name, _ in self.lines()], list(self.RETURNED))
+        for key, (text, _, noted) in zip(keys, self.lines()):
+            self.assertEqual((key.hex(), f'({seal.fingerprint(key)})'), (text, noted))
+
+    def test_each_key_proved_it_is_held(self):
+        self.assertEqual(hashlib.sha256(self.PROOF).hexdigest(),
+                         'be58e07d949e97b6f0440a609799608bb65132ebe02c22585b8734cd998cb3c3')
+        keys = seal.read_keys(self.KEYS.read_text())
+        for key, (_, name, _) in zip(keys, self.lines()):
+            signature = bytes.fromhex(self.RETURNED[name])
+            self.assertTrue(seal.verifies(key, self.PROOF, signature), name)
+            self.assertFalse(any(seal.verifies(other, self.PROOF, signature) for other in keys if other != key))
+
+    @unittest.skipUnless(shutil.which(CC), 'no C compiler')
+    def test_a_unit_reads_the_file_as_two_keys(self):
+        with tempfile.TemporaryDirectory() as build:
+            program = Path(build) / 'w1700k-release'
+            subprocess.run([CC, '-std=c99', '-D_POSIX_C_SOURCE=200809L', '-Wno-comment', '-I', str(SEAL),
+                            '-I', str(SEAL / 'include'), *(str(SEAL / source) for source in SOURCES),
+                            '-o', str(program)], check=True, capture_output=True)
+            pinned = subprocess.run([str(program), 'pinned', '--keys', str(self.KEYS)], capture_output=True, text=True)
+            self.assertEqual((pinned.returncode, pinned.stdout), (0, '2\n'))
+
 
 if __name__ == '__main__':
     unittest.main()
