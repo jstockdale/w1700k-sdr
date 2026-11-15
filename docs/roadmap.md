@@ -67,9 +67,15 @@ installation, the first loader and the kernel image.
   cannot update it. Either an "adopt" step makes the directory from the unit
   over ssh, or the host key moves out of the root, beside the paperclip key's
   slot, and one root fits every unit.
-- **A signed update archive.** Every image is hashed before and after it is
-  written, which guards against corruption and says nothing of who made it.
-  A signature over the archive's manifest, checked by `init/flash --bundle`.
+- **Signed releases, the rest.** A unit built with release keys takes only an
+  archive whose manifest one of them sealed, checked by the tool and again by
+  the unit, and nothing older than the release it has settled on
+  (`init/sign`, `seal/`). Two things are open. The unit checks the loader
+  against the manifest but not the root: the root it is sent is its own,
+  built on the host from the release's, so the check waits for one root that
+  fits every unit (the item above). And the keys a unit pins are the signing
+  keys themselves, two of them; a chain from a key kept offline to
+  short-lived signing keys would let one be replaced without an update.
 - **The kernel image over ssh.** It is a volume beside the root and could be
   staged and confirmed the same way; today it takes the console.
 - **The first loader over ssh.** It is the one part a unit in the field can

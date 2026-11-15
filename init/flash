@@ -48,6 +48,9 @@ def main():
     parser.add_argument('--bundle', metavar='FILE', type=Path,
                         help='over the network alone: the loader and the root from this update '
                              'archive (w1700k-update.tar), with one reboot')
+    parser.add_argument('--unsigned', action='store_true',
+                        help='over the network, to a unit that takes only signed releases: send '
+                             'this anyway, as a build of your own')
     parser.add_argument('--no-boot', action='store_true',
                         help='stay at the loader prompt afterwards')
     parser.add_argument('--unit', metavar='SERIAL',
@@ -79,12 +82,14 @@ def main():
             return update.detect(settings)
         if args.bundle or (args.ssh and args.loader and args.rootfs):
             return remote.run_joint(settings, args.unit, authorized_key=args.authorized_key,
-                                    bundle_path=args.bundle, no_login_key=args.no_login_key)
+                                    bundle_path=args.bundle, no_login_key=args.no_login_key,
+                                    unsigned=args.unsigned)
         if args.ssh and args.loader:
-            return remote.run_loader(settings, args.unit, authorized_key=args.authorized_key)
+            return remote.run_loader(settings, args.unit, authorized_key=args.authorized_key,
+                                     unsigned=args.unsigned)
         if args.ssh:
             return remote.run(settings, args.unit, authorized_key=args.authorized_key,
-                              no_login_key=args.no_login_key)
+                              no_login_key=args.no_login_key, unsigned=args.unsigned)
         return update.run(settings, args.unit, fit=args.fit or args.system,
                           rootfs=args.rootfs or args.system, durable=args.durable,
                           loader=args.loader, recovery=args.recovery,
