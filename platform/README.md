@@ -35,12 +35,10 @@ Later builds redo only what changed (a no-change platform build takes seconds). 
 `JOBS=N` limits parallel jobs. `make clean` keeps downloads and prepared
 sources; `make distclean` removes `platform/build/` entirely.
 
-`W1700K_RELEASE_KEYS=FILE make` puts the release keys in FILE into the root
-(`/etc/w1700k/release-keys`): a unit of that build takes over ssh only what
-one of them sealed ([`seal/`](../seal/README.md),
-[init/README.md](../init/README.md#signed-releases)). Without it the root has
-no keys and the unit takes any update. The variable has to be set at every
-build of such a root, since a build without it is a different root.
+The root is the same whether or not a unit is keyed: the list of keys a keyed
+unit trusts is in its durable storage, given to it at the bench
+([`seal/`](../seal/README.md), [init/README.md](../init/README.md#signed-releases)),
+and no build puts keys into a root.
 
 Host requirements: a C compiler, make, git, patch, Python 3.10+, perl, rsync,
 bc, cpio, unzip, xxd and the usual Buildroot prerequisites. Bison and flex are built

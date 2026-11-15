@@ -67,17 +67,17 @@ installation, the first loader and the kernel image.
   cannot update it. Either an "adopt" step makes the directory from the unit
   over ssh, or the host key moves out of the root, beside the paperclip key's
   slot, and one root fits every unit.
-- **Signed releases, the rest.** A unit built with release keys takes only an
-  archive whose manifest one of them sealed, checked by the tool and again by
-  the unit, and nothing older than the release it has settled on
-  (`init/sign`, `seal/`). Whitehat Hardware's two keys are issued and in
-  `seal/whitehat-release-keys`, and sign away from the build host; no release
-  of theirs has been sealed or sent to a unit yet. Two more things are open. The unit checks the loader
-  against the manifest but not the root: the root it is sent is its own,
-  built on the host from the release's, so the check waits for one root that
-  fits every unit (the item above). And the keys a unit pins are the signing
-  keys themselves, two of them; a chain from a key kept offline to
-  short-lived signing keys would let one be replaced without an update.
+- **Signed releases, the rest.** A keyed unit holds a list of keys with
+  scopes, takes only a release a release key of it sealed, and takes a new
+  list only from a root or keys key of the one it holds (`init/sign`,
+  `init/bench`, `seal/`). Whitehat Hardware's development keys are issued and
+  sign away from the build host, and their first list is sealed
+  (`seal/development/`). Open: no release sealed by those keys has been on a
+  unit yet, and no list of theirs, only throwaway ones; the unit checks the loader
+  against the manifest but not the root, which is its own, built on the host
+  from the release's, so the check waits for one root that fits every unit
+  (the item above); and nothing yet fetches the newest release and the
+  rotations for a host to hand to its unit.
 - **The kernel image over ssh.** It is a volume beside the root and could be
   staged and confirmed the same way; today it takes the console.
 - **The first loader over ssh.** It is the one part a unit in the field can

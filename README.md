@@ -256,9 +256,11 @@ who has the tools but does not build. Either command takes about a minute.
   loader that is never confirmed is undone by the next boot: the previous
   root is written back, the second loader is removed. A unit that does not
   come back from an update is recovered by a power cycle.
-- **A unit can be built to take signed releases only.** With release keys in
-  its root, it stages what a release sealed by one of them lists, and nothing
-  older than the release it has settled on; `init/sign` seals an archive.
+- **A unit can be keyed to take signed releases only.** Given a list of keys
+  at the bench, it stages what a release sealed by a release key of that list
+  lists, and nothing older than the release it has settled on. The list is in
+  its durable storage, where no update reaches it, and changes only by a list
+  sealed by a key above the release keys; `init/sign` seals both.
   `--unsigned` is the owner's word for a build of their own
   ([init/README.md](init/README.md#signed-releases)).
 - **An archive built for another flash layout is not sent**, nor is this
