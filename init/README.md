@@ -316,6 +316,28 @@ init/sign archive --key ~/keys/w1700k-primary.key --release 7  # w1700k-release-
 init/flash --bundle platform/build/images/w1700k-release-7.tar
 ```
 
+A key that never leaves its keeper signs in two steps, and nothing on the build
+host ever holds it:
+
+```sh
+init/sign request --release 7                  # w1700k-release-7.request.json: the bytes to sign
+# the keeper signs them (Ed25519, RFC 8032) and returns 64 bytes
+init/sign attach --request platform/build/images/w1700k-release-7.request.json \
+    --signature SIG --keys seal/whitehat-release-keys      # w1700k-release-7.tar
+```
+
+The request is a small JSON file: the release number, the exact bytes (the
+topic, the envelope's header and the manifest, which a keeper can read in
+them) and their SHA-256. `attach` takes the signature as 128 hex digits or a
+file of them, and writes nothing unless it is the signature of one of the
+keys given, over that request, for the archive the request was made of. The result is byte for byte
+what a key on the host would have sealed at that moment.
+
+[`seal/whitehat-release-keys`](../seal/whitehat-release-keys) holds Whitehat
+Hardware's two release keys, which sign this way: build with
+`W1700K_RELEASE_KEYS=seal/whitehat-release-keys` for a unit that takes only
+their releases.
+
 - **A release** is the update archive with one member more: its manifest,
   sealed. The manifest lists the SHA-256 of every image, so one signature
   covers them all. The envelope is Whitehat Hardware's WMS2, the one its
