@@ -31,8 +31,9 @@ insmod /lib/modules/w1700k_sdr.ko || {
 # Who the unit is to a host that logs in: its ssh host keys as the loader handed them over from
 # durable storage, or a key for this boot when it handed over none.
 /usr/sbin/w1700k-hostkey boot || status=W1700K_BOOT_DEGRADED
-# Root's login keys: the one built into this root, if any, and the paperclip key's slot as the
-# loader handed it over. The reset button is watched from inittab (w1700k-keyslot serve).
+# Root's login keys: the unit's list and the paperclip key's slot, each as the loader handed it
+# over from durable storage. The reset button is watched from inittab (w1700k-keyslot serve).
+/usr/sbin/w1700k-login boot || status=W1700K_BOOT_DEGRADED
 /usr/sbin/w1700k-keyslot boot || status=W1700K_BOOT_DEGRADED
 /etc/init.d/S50dropbear start || status=W1700K_BOOT_DEGRADED
 echo "$status"

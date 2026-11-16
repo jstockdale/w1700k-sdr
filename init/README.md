@@ -118,7 +118,8 @@ It stops stock U-Boot at power-on and then:
    `calibration` partition in the backup) as `eeprom.bin` beside the backup,
    where the host tools find it; `init/eeprom --unit SERIAL` does the same for
    an existing backup;
-3. builds the unit's root filesystem with your SSH key;
+3. takes the built root filesystem as it is, the same for every unit (a unit
+   whose directory holds a `network.conf` of its own gets one made with it);
 4. writes our U-Boot into the `loader` partition through stock U-Boot, reads it
    back and boots that copy;
 5. from our U-Boot, erases `system` and `durable`, creates their UBI volumes,
@@ -128,7 +129,9 @@ It stops stock U-Boot at power-on and then:
 7. boots the installed system and checks it;
 8. has the unit keep the ssh host key it made as its own, in its durable
    storage, and writes `known_hosts` beside the backup from the public half
-   the unit says over the console.
+   the unit says over the console;
+9. adds your SSH public key to the unit's login keys, the first in its list
+   (not with `--no-login-key`).
 
 The unit is then reachable with `ssh root@192.168.1.1`. A full run takes about
 five minutes. Every step is checked before the next one starts; if a run is
@@ -453,15 +456,14 @@ other keys.
 
 - **Firmware is root.** A unit that has installed a thief's release is the
   thief's, whatever list it held. The list protects the units that have not.
-- **The unit cannot check its root yet.** Each unit's root is built on the
-  host from the release's root, because the login key built into it and the
-  unit's network settings are in it, so the root a unit is sent is in no
-  manifest. (Its ssh host key was the third such thing and is now in the
-  unit's durable storage.) The tool checks the release's root against
-  the manifest before it builds the unit's from it; the unit takes that root
-  because a release was verified, and says that the root itself was not. The
-  loader is the same for every unit, and the unit does check it. This closes
-  when one root fits every unit ([the roadmap](../docs/roadmap.md)).
+- **A unit with network settings of its own takes no release as one.**
+  Every unit is sent the release's root as it is, and checks it against the
+  manifest like the loader: its login keys and its ssh host key are in its
+  durable storage, not in its root. The exception is a unit whose directory
+  holds a `network.conf`. Its root is made on the host with that file in it
+  and is in no manifest, so a keyed unit takes it only as a build of your own
+  (`--unsigned`), and keeps no release number for it
+  ([the roadmap](../docs/roadmap.md)).
 - **A stolen root key** can start the next epoch with a list of its own, and a
   unit takes whichever it is given first.
 - **Nothing tells a unit or its host what it has not been given.** Whoever
@@ -539,8 +541,8 @@ to, which is as good an introduction as a host key gets.
   hands to the system, so a normal boot still writes nothing to flash and
   Linux opens durable storage only when the button changes the slot.
 - **Switched off, it is kept but does not log in**, and stays off across
-  restarts until the button switches it on again. A unit whose root has no key
-  built in is then closed to the network altogether.
+  restarts until the button switches it on again. A unit with no login key in
+  its list is then closed to the network altogether.
 - **It needs a loader that knows of the slot.** `init/key` says so when the
   unit's does not: the key then works until the unit restarts. `init/flash
   --ssh` brings the loader up to date.
@@ -548,30 +550,55 @@ to, which is as good an introduction as a host key gets.
   can change the slot, and whoever has one could open the case and use the
   serial console anyway. The slot holds what was last put in it: program your
   own key into a unit that comes from someone else.
-- The key that `init/install` builds into the unit's root is separate and
-  stays as it is; both log in.
+- The unit's list of login keys (below) is separate and stays as it is; its
+  keys and the paperclip key all log in.
 
-### A unit with no key built in
+## Login keys
 
-By default a unit's root carries the installer's public key. `--no-login-key`
-leaves it out, for a unit that is to take its key from its reset button
-alone, a unit made for someone else, say:
+Who may log in to a unit as root is a list of ssh public keys that the unit
+keeps in its durable storage, up to 32 of them, each under a name. It is not
+part of the root, so an update never changes it, and a key is added or
+dropped without a new root. `init/install` puts your key in as the first.
+After that the list is changed on the unit, by someone who can already log
+in:
+
+```sh
+ssh root@192.168.1.1 w1700k-login list
+ssh root@192.168.1.1 w1700k-login add laptop < ~/.ssh/laptop.pub
+ssh root@192.168.1.1 w1700k-login drop laptop
+```
+
+- `add` takes a `.pub` file's line on its input. Without a name it uses the
+  key's comment, in lower case. A change works at once and stays.
+- The loader reads the list at every boot and hands it to the system, like
+  the paperclip key, so a normal boot still writes nothing to flash.
+- The paperclip key is not in the list and `drop` cannot remove it. A unit
+  whose list is empty is reached with a paperclip (`init/key`).
+- A unit installed before the list left the root had one key built into its
+  root. `init/flash --ssh` carries that key into the list, on the unit, before
+  it sends a root without one. Over the console (`init/flash --rootfs`) the
+  old key goes with the old root, and a unit left with an empty list is given
+  your key again.
+
+### A unit with no login key
+
+`--no-login-key` gives a unit no key in its list, for a unit that is to take
+its key from its reset button alone, a unit made for someone else, say:
 
 ```sh
 init/install --no-login-key           # over the console: no key file is needed
-init/flash --rootfs --no-login-key    # the same for an installed unit, over the console
-init/flash --ssh --no-login-key       # or over ssh, to a unit that has a paperclip key
+init/flash --rootfs --no-login-key    # an installed unit, over the console: none is added
+init/flash --ssh --no-login-key       # over ssh: the old root's key is not carried across
 ```
 
 Such a unit answers ssh from nobody until `init/key` and a paperclip give it
-a key. Over ssh the tools therefore send a root without a key only to a unit
-whose paperclip key is switched on and kept by its loader; log in with that
-key (`--authorized-key` names the key the tools log in with, as always), or
-the update cannot be confirmed and the next boot undoes it.
+a key. Over ssh the tools therefore update a unit that would have no key in
+its list only if its paperclip key is switched on and kept by its loader; log
+in with that key (`--authorized-key` names the key the tools log in with, as
+always), or the update cannot be confirmed and the next boot undoes it.
 
-The option is asked for each time. A later root made without it carries a key
-again; the tools say so when the last root made for that unit had none (the
-unit directory's `login-key` notes which).
+The option is asked for each time, and it never removes a key from a list:
+`w1700k-login drop` does that.
 
 ## Returning to stock
 

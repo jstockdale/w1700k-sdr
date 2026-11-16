@@ -299,6 +299,42 @@ A unit has one Ed25519 key. The loader and `w1700k-hostkey` also know the name
 `tests/test_hostkey.py` runs the program over a directory, and
 `tests/test_loader_update.py` the loader's side through its model.
 
+### The login keys
+
+The ssh public keys that may log in as root are a list in `durable`, the file
+`ssh/login`, in the form the loader imports, at most 32 lines:
+
+```
+login_1=ssh-ed25519:AAAA...:desk
+login_2=ssh-rsa:AAAA...:laptop
+```
+
+An entry is one word: the key's type, its base64 body and a name, joined by
+colons, at most 900 characters (an RSA key of 4096 bits fits).
+
+- The loader reads the file at every boot (`login_load`, from `key_pass`) and
+  puts each entry into the device tree, `/chosen/w1700k,login-N`
+  (`login_pass`, from `system_start`), and says `w1700k.login=handed` or
+  `none` on the kernel command line. Thirty-two keys would not fit a kernel
+  command line, which is why the list does not go the paperclip key's way.
+- Each of the 32 places is written out in the loader's scripts, eight to a
+  script. Two limits of this loader, both found on a unit, are why: its shell
+  cannot look a variable up under a name made in a loop, and one command
+  takes at most 16 words, so a single `env import` cannot name them all. The
+  loader names every line it takes, so the file can set nothing else in it.
+  `CONFIG_SYS_FDT_PAD` gives the tree room for all 32 at their longest.
+- `w1700k-login boot`, from `rcS`, checks each entry (a key type the ssh
+  server takes, a body that is base64 and begins with that type, a name) and
+  writes the list to RAM; `w1700k-keyslot boot` then writes root's
+  `authorized_keys` from it. `add` and `drop` change the file inside one
+  `durable-run`, then the list in RAM and `authorized_keys`.
+- `w1700k-login keep`, run by `init/flash` over ssh on a root from before the
+  list left the root, makes the key built into that root the list, unless the
+  unit has a list already.
+
+`tests/test_login.py` runs the program with the slot's over directories, and
+`tests/test_loader_update.py` the loader's side through its model.
+
 ### The paperclip key's slot
 
 The reset button (line 0 of the pin controller, low when pressed; not in the
@@ -320,8 +356,9 @@ key_on=1
   `w1700k.keyslot=on`, `off` or `empty`, and with `on` the key,
   `w1700k.key=TYPE:BASE64`. Nothing of it is saved in the loader's environment.
 - `w1700k-keyslot boot`, from `rcS` before the ssh server starts, writes
-  root's `authorized_keys` in the RAM overlay: the key built into the root
-  (read from the SquashFS below the overlay), and the slot's key if it is on.
+  root's `authorized_keys` in the RAM overlay: the unit's list of login keys
+  (below), and the slot's key if it is on. `refresh` writes it again when the
+  list changes.
   A command line without `w1700k.keyslot=` is a loader that does not know of
   the slot (`persist=0` in `w1700k-keyslot status`).
 
