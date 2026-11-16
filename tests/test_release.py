@@ -2051,7 +2051,7 @@ class Bench(Scripted):
         self.assertEqual(self.keys.read_bytes(), third)
         # The development lists in the repository, as the tool reads a directory of them.
         development = keying.in_order(path.read_bytes() for path in sorted((SEAL / 'development').glob('*.wms2')))
-        self.assertEqual([seal.parse_list(seal.body_of(envelope)).label for envelope in development], ['1.1', '1.2', '2.1'])
+        self.assertEqual([seal.parse_list(seal.body_of(envelope)).label for envelope in development], ['1.1', '1.2', '2.1', '2.2'])
         bundle.chain(development)
 
     def test_lists_that_do_not_follow_one_from_another_are_not_sent(self):
@@ -2553,7 +2553,12 @@ class Issued(unittest.TestCase):
              ('2.1', 'w1700k-sdr-authority-dev-backup', 'root',
               {'w1700k-sdr-authority-dev-primary-2': ('14c5025409ff981f', 'dfa58a73a9d764e9',
                                                       '4a4ce35bda324daaf0f717dbaa5b0c2768caa0484d9be6a6c297d003f5805694'
-                                                      '4611df442a9f32f29d1beda8dbefef87016fc6912637d01bf3793aa1971a0104')}))
+                                                      '4611df442a9f32f29d1beda8dbefef87016fc6912637d01bf3793aa1971a0104')}),
+             # The key that says what is current: added by the keys key, nothing else changed.
+             ('2.2', 'w1700k-sdr-authority-dev-primary-2', 'keys',
+              {'w1700k-sdr-timestamp-dev': ('68b2037fe4017650', 'b4e6cec6cf24308f',
+                                            '6a7d2aabceae02f35ec8470d2d28120aa45ab5bc299643b70ab034b2d66b3e7e'
+                                            '144de4ad32eb2e228cb42f5bf00dc65b93190aca6b55a6e263c70bc85be6a600')}))
 
     def chain(self):
         sealed = [path.read_bytes() for path in self.CHAIN.glob('*.wms2')]
@@ -2591,7 +2596,8 @@ class Issued(unittest.TestCase):
                 held = following
         self.assertEqual([(key.name, key.scope) for key in held.keys],
                          [('w1700k-sdr-authority-dev-backup', 'root'), ('w1700k-sdr-authority-dev-primary-2', 'keys'),
-                          ('w1700k-sdr-release-dev-primary-2', 'release'), ('w1700k-sdr-release-dev-spare', 'release')],
+                          ('w1700k-sdr-release-dev-primary-2', 'release'), ('w1700k-sdr-release-dev-spare', 'release'),
+                          ('w1700k-sdr-timestamp-dev', 'timestamp')],
                          'what a development unit holds today')
 
     def test_each_release_key_proved_it_is_held_twice(self):
@@ -2620,8 +2626,8 @@ class Issued(unittest.TestCase):
                                         '--out', str(held), str(sealed)], capture_output=True, text=True)
                 self.assertEqual(taken.returncode, 0, taken.stderr)
             self.assertEqual(seal.body_of(links(held.read_bytes())[-1]), seal.body_of(self.chain()[-1]))
-            self.assertEqual([seal.parse_list(seal.body_of(link)).label for link in links(held.read_bytes())], ['1.1', '2.1'],
-                             'the first list and the one that began the epoch it is in')
+            self.assertEqual([seal.parse_list(seal.body_of(link)).label for link in links(held.read_bytes())], ['1.1', '2.1', '2.2'],
+                             'the first list, the one that began the epoch it is in, and the one it holds')
 
 
 if __name__ == '__main__':
