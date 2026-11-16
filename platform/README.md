@@ -11,7 +11,8 @@ stock U-Boot (vendor, first stage, never replaced)
 Linux runs from a read-only SquashFS under a RAM overlay, loads the
 `w1700k_sdr` driver at boot, brings up the management port (`lan3`,
 192.168.1.1/24) and the 10 GbE IQ port (`eth1`, 10.77.0.1/24, MTU 9216), and
-starts Dropbear for key-only root logins. Nothing at startup writes NAND.
+starts Dropbear for key-only root logins, with the ssh host key the loader
+handed over from `durable`. Nothing at startup writes NAND.
 
 ## Building
 
@@ -255,6 +256,48 @@ first loader's description carries `second-loader 1` for `system-update`.
 `tests/test_loader_update.py` runs all of it against the flash model; one of
 its cases comes from a unit, where a property was looked up in an image of
 which only the first page had been read.
+
+### The unit's ssh host keys
+
+Who a unit is to a host that logs in is the unit's own and is in no root
+image, so an update never changes it. The keys are the file `ssh/host` in
+`durable`, in the form the loader imports, one line a kind, each the key file
+as Dropbear writes it, in hex:
+
+```
+host_ed25519=0000000b7373682d65643235353139...
+```
+
+A unit has one Ed25519 key. The loader and `w1700k-hostkey` also know the name
+`host_ecdsa`; no tool makes that one yet.
+
+- The loader reads the file at every boot (`key_pass`, with the paperclip
+  key's slot) and starts the system a stage of `bootm` at a time
+  (`system_start`), so that between loading the device tree and handing it
+  over it can add each key to it: `/chosen/security-w1700k-host-KIND`
+  (`host_pass`). The kernel shows a property of that name to root alone. They
+  are private keys, so nothing of them goes on the kernel command line, which
+  the kernel logs; the command line says only `w1700k.hostkey=handed` or
+  `none`. A key must fit the loader's command line: about 450 bytes of key,
+  which Ed25519 and ECDSA are and RSA is not.
+- `w1700k-hostkey boot`, from `rcS` before the ssh server starts, writes each
+  key into `/etc/dropbear` in the RAM overlay, after checking that it is hex
+  and that `dropbearkey` reads it as a key of that kind. With none handed
+  over it makes a key for that boot, so the unit can still be reached; it is
+  another unit to a host at its next boot (`hostkey=temporary` in
+  `w1700k-hostkey status`).
+- `w1700k-hostkey keep` writes the keys this boot uses to `ssh/host`, inside
+  one `durable-run`: the installer runs it once over the serial console, and
+  the unit says the public half there, which is how the host comes to know
+  it. The paperclip key's `program` runs it too, for a unit that has none. A
+  key that is there is not replaced without `--replace`.
+- A unit installed before host keys left the root has its key built into that
+  root. `init/flash` over ssh has such a unit run `keep` first, which carries
+  that key into `durable` on the unit itself, and sends the new root only with
+  a loader that hands the key over, or to a unit that has one.
+
+`tests/test_hostkey.py` runs the program over a directory, and
+`tests/test_loader_update.py` the loader's side through its model.
 
 ### The paperclip key's slot
 

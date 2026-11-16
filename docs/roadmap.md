@@ -61,12 +61,15 @@ installation, the first loader and the kernel image.
 
 ### A unit in someone else's hands
 
-- **Updates for a unit installed elsewhere.** `init/flash --ssh` builds a
-  unit's root on the host from the unit's directory there, which holds its ssh
-  host key. A host that did not install the unit has no such directory, so it
-  cannot update it. Either an "adopt" step makes the directory from the unit
-  over ssh, or the host key moves out of the root, beside the paperclip key's
-  slot, and one root fits every unit.
+- **One root for every unit.** A unit's ssh host key is now its own, in its
+  durable storage, handed to the system by the loader (`w1700k-hostkey`), so
+  a host that did not install a unit needs only the public half
+  (`init/provision --host-key`). Two things are still built into each unit's
+  root on the host: the login key (unless `--no-login-key`) and the unit's
+  `network.conf`. Until they leave it too, beside the host key and the
+  paperclip key's slot, a unit cannot check its root against a release's
+  manifest, and takes it on the host's word (shown on a unit: a changed root
+  offered as "built from this release" was staged).
 - **Signed releases, the rest.** A keyed unit holds a list of keys with
   scopes, takes only a release a release key of it sealed, and takes a new
   list only from a root or keys key of the one it holds (`init/sign`,
@@ -88,7 +91,15 @@ installation, the first loader and the kernel image.
     list to a signed record of the keys issued, as an exact set.
   - *A way to ship.* One step that installs a sealed release and no login
     key, keys the unit, and sets its release number, so that none of it
-    depends on remembering a flag.
+    depends on remembering a flag. Keying a unit again at the bench resets
+    its release number to 0, which is right for a unit being set up and a
+    way back to an old release for one that shipped: in this mode it must
+    not.
+  - *The stored list, checked when read.* A unit keeps its list as text and
+    believes it. One altered into another list that still reads is not
+    noticed, and the true list sent again is then refused as a second list
+    of the same generation. The unit should keep the sealed envelope and
+    verify it against the list's own authorities whenever it reads it.
   - *Development and production.* Nothing in a unit or an envelope says which
     it is: only the list a unit was given does.
   - *A unit that lost its list* is pointed at `--unsigned`, which checks

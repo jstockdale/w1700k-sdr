@@ -1,28 +1,31 @@
 # SPDX-License-Identifier: MIT
-"""The unit's own root filesystem: the built root plus its SSH keys and network.
+"""The unit's own root filesystem: the built root plus its login key and network.
 
 The built rootfs.squashfs is the same for every unit and lets nobody log in.
-This adds, for one unit, the public key allowed to log in as root, the unit's
-SSH host key (made once and kept in the unit directory, so the host key does
-not change between updates) and, if present, the unit's own network.conf. The
-result is written to UBI volume `rootfs` in place of the generic image.
+This adds, for one unit, the public key allowed to log in as root and, if
+present, the unit's own network.conf. The result is written to UBI volume
+`rootfs` in place of the generic image.
+
+The unit's ssh host key is not in its root. The unit makes it and keeps it in
+its durable storage (w1700k-hostkey on the unit); the host knows only its
+public half, as the unit told it over the serial console when it was installed.
 
     unit directory (see config.py)
-      dropbear_ed25519_host_key   generated on first use, or imported
+      known_hosts                 the unit's host key, public half
       network.conf                optional; replaces /etc/w1700k/network.conf
       rootfs.squashfs             the unit's root, rebuilt by every install/update
+      dropbear_ed25519_host_key   only from before host keys left the root: the
+                                  key an older root of this unit carried
 """
 import base64
 import hashlib
 import os
 from pathlib import Path
-import shutil
 import struct
 import subprocess
 import tempfile
 
 from . import config, paperclip
-from .log import private_file
 
 HOST_KEY = 'dropbear_ed25519_host_key'
 LOGIN_KEY = 'login-key'         # in the unit directory: the fingerprint of the key in its root, or `none'
@@ -50,41 +53,6 @@ def _wire(*fields):
     return b''.join(struct.pack('>I', len(field)) + field for field in fields)
 
 
-def dropbear_from_openssh(text):
-    """Convert an unencrypted OpenSSH Ed25519 private key to Dropbear's format.
-
-    Dropbear stores string("ssh-ed25519") + string(seed || public key).
-    """
-    lines = [line.strip() for line in text.strip().splitlines()]
-    if lines[:1] != ['-----BEGIN OPENSSH PRIVATE KEY-----'] or \
-            lines[-1:] != ['-----END OPENSSH PRIVATE KEY-----']:
-        raise ProvisionError('not an OpenSSH private key')
-    blob = base64.b64decode(''.join(lines[1:-1]))
-    magic = b'openssh-key-v1\0'
-    if not blob.startswith(magic):
-        raise ProvisionError('not an openssh-key-v1 private key')
-    offset = len(magic)
-    cipher, offset = _string(blob, offset)
-    _kdf, offset = _string(blob, offset)
-    _options, offset = _string(blob, offset)
-    if cipher != b'none':
-        raise ProvisionError('the host key must not have a passphrase')
-    count, = struct.unpack_from('>I', blob, offset)
-    offset += 4
-    for _ in range(count):
-        _public, offset = _string(blob, offset)
-    private, offset = _string(blob, offset)
-    cursor = 8                                   # two copies of a check integer
-    kind, cursor = _string(private, cursor)
-    if kind != b'ssh-ed25519':
-        raise ProvisionError('the host key must be Ed25519')
-    public, cursor = _string(private, cursor)
-    secret, cursor = _string(private, cursor)
-    if len(public) != 32 or len(secret) != 64 or secret[32:] != public:
-        raise ProvisionError('malformed Ed25519 key')
-    return _wire(b'ssh-ed25519', secret)
-
-
 def host_public_key(dropbear_key):
     """The OpenSSH public key line of a Dropbear Ed25519 private key."""
     kind, offset = _string(dropbear_key, 0)
@@ -99,29 +67,47 @@ def fingerprint(public_line):
     return 'SHA256:' + base64.b64encode(hashlib.sha256(blob).digest()).decode().rstrip('=')
 
 
-def generate_host_key():
-    """A new Ed25519 host key, made with ssh-keygen and converted for Dropbear."""
-    if not shutil.which('ssh-keygen'):
-        raise ProvisionError('ssh-keygen (OpenSSH) is needed to make the unit host key')
-    with tempfile.TemporaryDirectory(prefix='w1700k-key-') as temporary:
-        path = Path(temporary) / 'key'
-        subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-C', 'w1700k',
-                        '-f', str(path)], check=True)
-        return dropbear_from_openssh(path.read_text())
+def known_host(unit_directory, address, lines):
+    """Write the unit's known_hosts from its host keys' public halves ("TYPE BASE64" each);
+    returns the lines written. Nothing else is taken for one: a line is a key type this
+    project knows and base64 that decodes to a key of that type."""
+    entries = []
+    for line in lines:
+        fields = line.split()
+        try:
+            kind = _string(base64.b64decode(fields[1], validate=True), 0)[0]
+        except (IndexError, ValueError, struct.error):
+            kind = None
+        if len(fields) != 2 or kind != fields[0].encode() or kind not in KEY_TYPES:
+            raise ProvisionError(f'not a host key as a unit reports one: {line[:80]!r}')
+        entries.append(f'{address} {fields[0]} {fields[1]}')
+    if not entries:
+        raise ProvisionError('the unit reported no host key')
+    path = Path(unit_directory) / KNOWN_HOSTS
+    path.write_text('\n'.join(entries) + '\n')
+    return entries
 
 
-def host_key(unit_directory, import_from=None):
-    """The unit's Dropbear host key: imported, kept from before, or made now."""
-    path = Path(unit_directory) / HOST_KEY
-    if import_from:
-        data = Path(import_from).read_bytes()
-        if data.startswith(b'-----BEGIN OPENSSH PRIVATE KEY-----'):
-            data = dropbear_from_openssh(data.decode())
-        host_public_key(data)                       # validates
-        private_file(path, data)
-    elif not path.is_file():
-        private_file(path, generate_host_key())
-    return path.read_bytes()
+def public_lines(text):
+    """The host keys in `text`, "TYPE BASE64" each: .pub files, known_hosts lines, or the lines
+    a unit's installer printed, in any mix."""
+    found = []
+    for line in text.splitlines():
+        fields = line.split()
+        for at, field in enumerate(fields[:-1]):
+            if field.encode() in KEY_TYPES:
+                found.append(f'{field} {fields[at + 1]}')
+                break
+    return found
+
+
+def legacy_known_host(unit_directory, address):
+    """A unit directory from before host keys left the root has the key itself and may lack
+    known_hosts: write it from the key, so the unit can be reached to carry the key across."""
+    directory = Path(unit_directory)
+    key = directory / HOST_KEY
+    if key.is_file() and not (directory / KNOWN_HOSTS).is_file():
+        (directory / KNOWN_HOSTS).write_text(f'{address} {host_public_key(key.read_bytes()).decode()}\n')
 
 
 def authorized_key(path=None):
@@ -141,12 +127,9 @@ def authorized_key(path=None):
                          'or create ~/.ssh/id_ed25519.pub')
 
 
-def private_files(unit_directory, public_key, dropbear_key):
+def private_files(unit_directory, public_key):
     """{path in the root: (bytes, mode)} for one unit."""
-    files = {
-        f'etc/dropbear/{HOST_KEY}': (dropbear_key, 0o600),
-        f'etc/dropbear/{HOST_KEY}.pub': (host_public_key(dropbear_key) + b'\n', 0o644),
-    }
+    files = {}
     if public_key is not None:              # None: no login key in the root (--no-login-key)
         files['root/.ssh/authorized_keys'] = (public_key, 0o600)
     network = Path(unit_directory) / NETWORK
@@ -174,7 +157,7 @@ def _write(tree, name, data, mode):
         parent.chmod(saved)
 
 
-def build(unit_directory, public_key, dropbear_key, generic=config.ROOTFS,
+def build(unit_directory, public_key, generic=config.ROOTFS,
           tools=config.SQUASHFS_TOOLS):
     """Write the unit's rootfs.squashfs into its directory and return the path."""
     unsquashfs, mksquashfs = tools / 'unsquashfs', tools / 'mksquashfs'
@@ -187,16 +170,7 @@ def build(unit_directory, public_key, dropbear_key, generic=config.ROOTFS,
         tree = Path(temporary) / 'root'
         subprocess.run([str(unsquashfs), '-no-xattrs', '-quiet', '-no-progress', '-d',
                         str(tree), str(generic)], check=True, stdout=subprocess.DEVNULL)
-        # The generic root links /etc/dropbear to a RAM directory for per-boot keys.
-        dropbear = tree / 'etc/dropbear'
-        if dropbear.is_symlink():
-            etc_mode = dropbear.parent.stat().st_mode & 0o7777
-            dropbear.parent.chmod(etc_mode | 0o700)
-            dropbear.unlink()
-            dropbear.mkdir(mode=0o700)
-            dropbear.parent.chmod(etc_mode)
-        for name, (data, mode) in private_files(unit_directory, public_key,
-                                                 dropbear_key).items():
+        for name, (data, mode) in private_files(unit_directory, public_key).items():
             _write(tree, name, data, mode)
         env = dict(os.environ, TZ='UTC', LC_ALL='C')
         env.pop('SOURCE_DATE_EPOCH', None)
@@ -212,11 +186,9 @@ def build(unit_directory, public_key, dropbear_key, generic=config.ROOTFS,
     return output
 
 
-def provision(unit_directory, authorized_key_path=None, import_host_key=None, address='192.168.1.1',
+def provision(unit_directory, authorized_key_path=None, address='192.168.1.1',
               generic=None, no_login_key=False, say=print):
-    """Build the unit's root (from `generic`, default this build's); returns (image path, host
-    public key line). Also writes `known_hosts` in the unit's directory, for the host tools'
-    `unit.known_hosts`.
+    """Build the unit's root (from `generic`, default this build's); returns the image's path.
 
     With `no_login_key` the root has no login key built in: the unit takes its key from its reset
     button alone (init/key). What the root carries is noted in the unit's directory, and a root
@@ -224,15 +196,13 @@ def provision(unit_directory, authorized_key_path=None, import_host_key=None, ad
     leaving the option out."""
     unit_directory = Path(unit_directory)
     unit_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-    dropbear_key = host_key(unit_directory, import_host_key)
+    legacy_known_host(unit_directory, address)
     key = None if no_login_key else authorized_key(authorized_key_path)
-    image = build(unit_directory, key, dropbear_key, **({'generic': generic} if generic else {}))
-    public = host_public_key(dropbear_key).decode()
-    (unit_directory / KNOWN_HOSTS).write_text(f'{address} {public}\n')
+    image = build(unit_directory, key, **({'generic': generic} if generic else {}))
     carries = 'none' if key is None else paperclip.fingerprint(key.split()[1].decode())
     note = unit_directory / LOGIN_KEY
     if key is not None and note.is_file() and note.read_text().strip() == 'none':
         say(f'note: this root has a login key built in ({carries}); the last one made for this unit '
             'had none (--no-login-key)')
     note.write_text(carries + '\n')
-    return image, public
+    return image
