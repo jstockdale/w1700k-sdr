@@ -792,25 +792,22 @@ class OneRoot(unittest.TestCase):
     def test_a_unit_is_sent_the_built_root_itself(self):
         image = provision.provision(self.dir / 'unit')
         self.assertEqual(Path(image), config.ROOTFS, 'not a copy and not a rebuild: the file a release names')
-        self.assertFalse((self.dir / 'unit' / provision.IMAGE).exists())
         other = self.dir / 'another-build.squashfs'
         other.write_bytes(config.ROOTFS.read_bytes())
         self.assertEqual(Path(provision.provision(self.dir / 'unit', generic=other)), other)
+        (self.dir / 'unit' / provision.NETWORK).write_text('MGMT_IF=lan4\nMGMT_ADDRESS=10.0.0.1/24\n')
+        self.assertEqual(Path(provision.provision(self.dir / 'unit')), config.ROOTFS, 'also for a unit with settings of its own')
+        self.assertEqual(provision.network_settings(self.dir / 'unit'), ['MGMT_IF=lan4', 'MGMT_ADDRESS=10.0.0.1/24'])
+        self.assertEqual(sorted(path.name for path in (self.dir / 'unit').iterdir()), [provision.NETWORK], 'nothing is made here')
 
     def test_the_built_root_holds_nobodys_keys_and_the_programs_that_take_them_from_storage(self):
         names = self.listing(config.ROOTFS)
         self.assertFalse({name for name in names if 'authorized_keys' in name or 'host_key' in name})
-        for program in ('usr/sbin/w1700k-login', 'usr/sbin/w1700k-hostkey', 'usr/sbin/w1700k-keyslot', 'usr/sbin/w1700k-key'):
+        self.assertIn('etc/w1700k/network.conf', names, 'the defaults, the same in every unit')
+        for program in ('usr/sbin/w1700k-login', 'usr/sbin/w1700k-hostkey', 'usr/sbin/w1700k-keyslot', 'usr/sbin/w1700k-key',
+                        'usr/sbin/w1700k-network'):
             self.assertIn(program, names)
 
-    def test_only_network_settings_of_its_own_get_a_unit_a_root_made_for_it(self):
-        directory = self.dir / 'unit'
-        directory.mkdir()
-        (directory / provision.NETWORK).write_text('MGMT_IF=lan4\nMGMT_ADDRESS=10.0.0.1/24\n')
-        image = provision.provision(directory)
-        self.assertEqual(Path(image), directory / provision.IMAGE)
-        self.assertNotEqual(Path(image).read_bytes(), config.ROOTFS.read_bytes())
-        self.assertEqual(self.listing(image), self.listing(config.ROOTFS), 'the same files; one of them is the unit\'s')
 
 
 class Unit:

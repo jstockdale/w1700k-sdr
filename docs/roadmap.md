@@ -61,14 +61,6 @@ installation, the first loader and the kernel image.
 
 ### A unit in someone else's hands
 
-- **Network settings out of the root.** Every unit is sent the same root and
-  checks it against a release's manifest: its login keys (`w1700k-login`, a
-  list of up to 32) and its ssh host key (`w1700k-hostkey`) are in its
-  durable storage, handed to the system by the loader. One thing can still
-  make a root a unit's own: a `network.conf` in its directory on the host. A
-  keyed unit takes such a root only as the owner's build (`--unsigned`) and
-  keeps no release number for it. The settings belong in durable storage
-  too, beside the keys.
 - **Login keys from the host.** The list is changed on the unit, over ssh
   (`w1700k-login add`, `drop`). A host tool for it, and a signed request that
   adds or drops a key, are not built.
@@ -97,11 +89,11 @@ installation, the first loader and the kernel image.
     its release number to 0, which is right for a unit being set up and a
     way back to an old release for one that shipped: in this mode it must
     not.
-  - *The stored list, checked when read.* A unit keeps its list as text and
-    believes it. One altered into another list that still reads is not
-    noticed, and the true list sent again is then refused as a second list
-    of the same generation. The unit should keep the sealed envelope and
-    verify it against the list's own authorities whenever it reads it.
+  - *Which list was the last.* A unit keeps its lists sealed and reads the
+    one it holds by their seals, so nothing altered in its storage reads as a
+    list. A file cut back to where an earlier list ended still reads as that
+    earlier list, and somebody else's whole chain reads as theirs: nothing
+    outside the storage says which list a unit held last.
   - *Development and production.* Nothing in a unit or an envelope says which
     it is: only the list a unit was given does.
   - *A unit that lost its list* is pointed at `--unsigned`, which checks
@@ -121,8 +113,13 @@ installation, the first loader and the kernel image.
   - A watchdog armed by the first loader before it starts the second, so that
     one that hangs is reset without a hand on the plug.
 - **The paths not yet run on a unit:** a console install with
-  `--no-login-key`, and an RSA key handed over by the loader (both pass the
-  tests and the loader's model).
+  `--no-login-key`, an RSA key handed over by the loader (both pass the
+  tests and the loader's model), and a list of keys being written when the
+  plug is pulled. That last one was run with a forced restart, with no sync,
+  at a random moment of the write: 50 times, and each time the unit held the
+  list it had or the new one, read by its seals. A forced restart leaves the
+  flash chip powered, so a write it was in the middle of is finished; a
+  pulled plug does not, and takes a hand.
 
 ### The low-power radio
 

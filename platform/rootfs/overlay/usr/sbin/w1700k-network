@@ -1,23 +1,202 @@
 #!/bin/sh
 # SPDX-License-Identifier: MIT
-# Bring up the management and IQ export ports from /etc/w1700k/network.conf.
+# The management and IQ export ports, and the unit's own settings for them.
+#
+#   w1700k-network [boot]              at start-up: bring both ports up
+#   w1700k-network set [NAME=VALUE...] these settings, or the ones on stdin (lines as in
+#                                      network.conf), become the unit's own, from its next start
+#   w1700k-network keep                on a root from before settings left the root: what its
+#                                      network.conf says other than the defaults becomes the
+#                                      unit's own, unless the unit has settings already
+#   w1700k-network clear               the unit has no settings of its own any more
+#   w1700k-network status              the settings in force, how many are the unit's own, and
+#                                      what the loader said
+#
+# The root's /etc/w1700k/network.conf holds the defaults, the same in every unit. A unit's own
+# settings are in its durable storage and in no root image, so one root fits every unit. They
+# are the file `net/conf`, in the form the loader imports, only the settings the unit sets:
+#
+#   net_mgmt_address=10.0.0.1/24
+#   net_export_mtu=9000
+#
+# Linux opens durable storage only to change it. At every boot it is the loader that reads the
+# file and puts each setting into the device tree it hands over, `/chosen/w1700k,net-NAME`, and
+# says on the kernel command line that it did: `w1700k.net=handed|none`. A loader that says
+# nothing does not know of them: the unit then comes up on the defaults.
+#
+# What is in force goes to /run/w1700k-network.conf, in network.conf's form, for whatever else
+# needs an address.
 set -u
-. /etc/w1700k/network.conf
+DEFAULTS=${W1700K_NETWORK_DEFAULTS:-/etc/w1700k/network.conf}
+RUN=${W1700K_NETWORK_RUN:-/run/w1700k-network.conf}
+CHOSEN=${W1700K_NETWORK_CHOSEN:-/proc/device-tree/chosen}
+CMDLINE=${W1700K_NETWORK_CMDLINE:-/proc/cmdline}
+DURABLE_RUN=${W1700K_NETWORK_DURABLE_RUN:-/usr/sbin/durable-run}
+STORE=${W1700K_NETWORK_DIR:-/durable/net}
+NAMES='MGMT_IF MGMT_ADDRESS EXPORT_IF EXPORT_ADDRESS EXPORT_MTU'
+# The defaults as every root has them: what `keep` holds a root from before against.
+STOCK='MGMT_IF=lan3 MGMT_ADDRESS=192.168.1.1/24 EXPORT_IF=eth1 EXPORT_ADDRESS=10.77.0.1/24 EXPORT_MTU=9216'
+
 failed=0
 fail() { echo "w1700k-network: $*" >&2; failed=1; }
+die() { echo "w1700k-network: $*" >&2; exit 1; }
 
-ip link set "$MGMT_IF" up || fail "cannot bring up $MGMT_IF"
-ip address replace "$MGMT_ADDRESS" dev "$MGMT_IF" || fail "cannot address $MGMT_IF"
+# The name as the loader and the device tree have it: net_mgmt_if, net-mgmt-if.
+lower() { echo "$1" | tr 'A-Z' 'a-z'; }
 
-# The export pump sends 8 KiB slices in single datagrams, so the MTU must be set
-# before the link carries traffic.
-ip link set "$EXPORT_IF" mtu "$EXPORT_MTU" || fail "cannot set the $EXPORT_IF MTU"
-ip link set "$EXPORT_IF" up || fail "cannot bring up $EXPORT_IF"
-ip address replace "$EXPORT_ADDRESS" dev "$EXPORT_IF" || fail "cannot address $EXPORT_IF"
+# Is $2 a value the setting $1 can have? Nothing that is more than a value to a shell or to ip.
+valid()
+{
+	case $1 in
+	MGMT_IF | EXPORT_IF)
+		case $2 in *[!a-z0-9._-]* | '' | [!a-z]*) return 1 ;; esac
+		[ ${#2} -le 15 ] ;;
+	MGMT_ADDRESS | EXPORT_ADDRESS)
+		case $2 in *[!0-9./]* | '') return 1 ;; esac
+		case $2 in [0-9]*.[0-9]*.[0-9]*.[0-9]*/[0-9]*) ;; *) return 1 ;; esac
+		case $2 in *.*.*.*.* | */*/* | *..* | *./* | */) return 1 ;; esac
+		[ ${#2} -le 18 ] && [ "${2#*/}" -le 32 ] ;;
+	EXPORT_MTU)
+		case $2 in *[!0-9]* | '' | 0*) return 1 ;; esac
+		[ ${#2} -le 4 ] && [ "$2" -ge 576 ] && [ "$2" -le 9216 ] ;;
+	*) return 1 ;;
+	esac
+}
 
-# All airoha_eth QDMA interrupts on CPU0, away from the CPUs the stream reader
-# and the export thread are pinned to.
-for irq in $(awk '/airoha_eth/ { sub(":", "", $1); print $1 }' /proc/interrupts); do
-	echo 0 > "/proc/irq/$irq/smp_affinity_list" || fail "cannot pin IRQ $irq"
-done
-exit "$failed"
+said()
+{
+	loader=silent
+	for word in $(cat "$CMDLINE"); do
+		case $word in w1700k.net=handed | w1700k.net=none) loader=${word#*=} ;; esac
+	done
+}
+
+# NAME=VALUE words, each a setting and a value it can have, as the lines the loader imports.
+lines()
+{
+	for word; do
+		name=${word%%=*} value=${word#*=}
+		[ "$name" != "$word" ] && valid "$name" "$value" || die "not a setting and a value it can have: $word"
+		echo "net_$(lower "$name")=$value"
+	done
+}
+
+# The lines on stdin become the unit's own settings ($1 empty), or stay away if it has some
+# already ($1 = keep). What comes back: `own: LINE` for each it then has, and `result:`.
+store()
+{
+	"$DURABLE_RUN" sh -c '
+		set -e
+		dir=$1 keep=$2
+		mkdir -p "$dir"
+		if [ -n "$keep" ] && [ -e "$dir/conf" ]; then
+			sed "s/^/own: /" "$dir/conf"
+			echo "result: there"
+			exit 0
+		fi
+		cat > "$dir/conf.part"
+		if [ -e "$dir/conf" ] && cmp -s "$dir/conf.part" "$dir/conf"; then
+			rm -f "$dir/conf.part"
+			echo "result: same"
+		else
+			mv "$dir/conf.part" "$dir/conf"
+			echo "result: stored"
+		fi
+		sed "s/^/own: /" "$dir/conf"' sh "$STORE" "${1:-}"
+}
+
+# What `store` answered, said: each setting the unit has, and whether anything changed.
+report()
+{
+	result=$(echo "$1" | sed -n 's/^result: //p')
+	case $result in stored | same | there) ;; *) die "the settings could not be stored" ;; esac
+	echo "$1" | sed -n 's/^own: net_//p' | while IFS='=' read -r name value; do
+		echo "own $(echo "$name" | tr 'a-z' 'A-Z')=$value"
+	done
+	echo "own=$(echo "$1" | grep -c '^own: ')"
+	echo "changed=$([ "$result" = stored ] && echo yes || echo no)"
+}
+
+case ${1:-boot} in
+boot)
+	. "$DEFAULTS"
+	said
+	own=0
+	for name in $NAMES; do
+		property=$CHOSEN/w1700k,net-$(lower "$name" | tr '_' '-')
+		[ -r "$property" ] || continue
+		value=$(tr -d '\000' < "$property")
+		if valid "$name" "$value"; then
+			eval "$name=\$value"
+			own=$((own + 1))
+		else
+			fail "the loader handed over no usable $name; the default stands"
+		fi
+	done
+	for name in $NAMES; do eval "echo \"$name=\$$name\""; done > "$RUN.part"
+	mv "$RUN.part" "$RUN"
+	echo "$own $loader" > "$RUN.state"
+
+	ip link set "$MGMT_IF" up || fail "cannot bring up $MGMT_IF"
+	ip address replace "$MGMT_ADDRESS" dev "$MGMT_IF" || fail "cannot address $MGMT_IF"
+
+	# The export pump sends 8 KiB slices in single datagrams, so the MTU must be set
+	# before the link carries traffic.
+	ip link set "$EXPORT_IF" mtu "$EXPORT_MTU" || fail "cannot set the $EXPORT_IF MTU"
+	ip link set "$EXPORT_IF" up || fail "cannot bring up $EXPORT_IF"
+	ip address replace "$EXPORT_ADDRESS" dev "$EXPORT_IF" || fail "cannot address $EXPORT_IF"
+
+	# All airoha_eth QDMA interrupts on CPU0, away from the CPUs the stream reader
+	# and the export thread are pinned to.
+	for irq in $(awk '/airoha_eth/ { sub(":", "", $1); print $1 }' /proc/interrupts); do
+		echo 0 > "/proc/irq/$irq/smp_affinity_list" || fail "cannot pin IRQ $irq"
+	done
+	exit "$failed"
+	;;
+set)
+	shift
+	if [ $# -eq 0 ]; then		# network.conf's lines: comments and blank lines are not settings
+		set -f
+		set -- $(sed -e 's/#.*//' -e 's/[ \t]*$//' -e '/^$/d')
+		set +f
+	fi
+	[ $# -gt 0 ] || die "no settings given (NAME=VALUE; the names are $NAMES)"
+	text=$(lines "$@") || exit 1
+	[ "$(echo "$text" | cut -d= -f1 | sort | uniq -d | wc -l)" -eq 0 ] || die "a setting is given twice"
+	out=$(echo "$text" | store) || die "the settings could not be stored"
+	report "$out"
+	;;
+keep)
+	words=
+	if [ -r "$DEFAULTS" ]; then
+		for name in $NAMES; do
+			value=$(sed -n "s/^$name=//p" "$DEFAULTS" | tail -n 1)
+			case " $STOCK " in *" $name=$value "*) continue ;; esac
+			[ -z "$value" ] || words="$words $name=$value"
+		done
+	fi
+	if [ -n "$words" ]; then
+		text=$(lines $words) || exit 1
+		out=$(echo "$text" | store keep) || die "the settings could not be stored"
+	else				# nothing to carry: say what the unit has, and write nothing
+		out=$("$DURABLE_RUN" sh -c '[ ! -e "$1/conf" ] || sed "s/^/own: /" "$1/conf"; echo "result: there"' sh "$STORE") ||
+			die "the unit's settings could not be read"
+	fi
+	report "$out"
+	;;
+clear)
+	"$DURABLE_RUN" sh -c 'rm -f "$1/conf" "$1/conf.part"' sh "$STORE" > /dev/null || die "the settings could not be cleared"
+	echo "own=0"
+	;;
+status)
+	[ -r "$RUN.state" ] || die "no record of the settings (w1700k-network boot has not run)"
+	cat "$RUN"
+	read -r own loader < "$RUN.state"
+	echo "own=$own"
+	echo "loader=$loader"
+	;;
+*)
+	echo "usage: w1700k-network [boot] | set [NAME=VALUE...] | keep | clear | status" >&2
+	exit 2
+	;;
+esac

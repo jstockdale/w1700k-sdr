@@ -213,6 +213,16 @@ def add_login_key(session, public_line):
     raise StepFailed(f'the unit did not list the key it was given:\n{listed[-300:]}')
 
 
+def network_settings(session, words):
+    """In the installed system: the unit's own network settings become `words` (NAME=VALUE each,
+    from its directory's network.conf). True when that changed what the unit has stored: they
+    apply from its next start."""
+    said = command(session.console, '/usr/sbin/w1700k-network set ' + ' '.join(words), limit=120, strict=False)
+    if not re.search(rf'^own={len(words)}\s*$', said, re.M):
+        raise StepFailed(f'the unit did not store its network settings:\n{said[-300:]}')
+    return bool(re.search(r'^changed=yes\s*$', said, re.M))
+
+
 def boot_recovery(session):
     """At the loader: boot the recovery FIT from RAM, leaving NAND untouched."""
     console = session.console
