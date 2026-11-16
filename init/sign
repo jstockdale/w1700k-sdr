@@ -165,7 +165,7 @@ def carried(directory):
         return []
     try:
         found = [path.read_bytes() for path in sorted(Path(directory).glob('*.wms2'))]
-        found.sort(key=lambda envelope: seal.parse_list(seal.body_of(envelope)).stamp)
+        found.sort(key=lambda envelope: seal.parse_list(seal.body_of(envelope)).stamp)   # by epoch, then generation
     except (OSError, seal.Refused) as error:
         raise StepFailed(f'{directory} holds something that is not a sealed list of keys: {error}') from None
     if not found:

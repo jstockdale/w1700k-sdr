@@ -43,8 +43,7 @@ def main():
         if args.verb == 'key':
             paths = list(args.lists) + (sorted(args.carry.glob('*.wms2')) if args.carry else [])
             try:
-                rotations = sorted((path.read_bytes() for path in paths),
-                                   key=lambda envelope: seal.parse_list(seal.body_of(envelope)).generation)
+                rotations = keying.in_order(path.read_bytes() for path in paths)
             except (OSError, seal.Refused) as error:
                 raise StepFailed(f'not a sealed list of keys: {error}') from None
             return keying.key(settings, rotations)
