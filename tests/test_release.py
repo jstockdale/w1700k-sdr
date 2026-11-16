@@ -1434,6 +1434,21 @@ class Bench(Scripted):
         self.assertEqual(self.keys.read_bytes(), third)
         self.assertIn('holds list 2.2', said)
 
+    def test_lists_are_given_by_epoch_and_then_generation_whatever_order_they_come_in(self):
+        """Generation 1 of the second epoch comes after generation 2 of the first."""
+        second = a_list((1, 2), USUAL[:3])
+        third = a_list((2, 1), ((ROOT_KEY, 'root'), (NEW_KEYS_KEY, 'keys'), (PRIMARY, 'release')))
+        sealed = [rotation(a_list(1), ROOT_KEY), rotation(second, KEYS_KEY), rotation(third, ROOT_KEY)]
+        for shuffled in ([sealed[2], sealed[0], sealed[1]], [sealed[1], sealed[2], sealed[0]], list(reversed(sealed))):
+            self.assertEqual(keying.in_order(shuffled), sealed)
+        result, said = self.key(keying.in_order(reversed(sealed)))
+        self.assertEqual(result, 0, said)
+        self.assertEqual(self.keys.read_bytes(), third)
+        # The development lists in the repository, as the tool reads a directory of them.
+        development = keying.in_order(path.read_bytes() for path in sorted((SEAL / 'development').glob('*.wms2')))
+        self.assertEqual([seal.parse_list(seal.body_of(envelope)).label for envelope in development], ['1.1', '1.2', '2.1'])
+        bundle.chain(development)
+
     def test_lists_that_do_not_follow_one_from_another_are_not_sent(self):
         for name, rotations, why in (
                 ('no first list', [rotation(a_list(1), KEYS_KEY)], 'rotation 1 of 1'),
