@@ -166,6 +166,26 @@ class Install(Bench):
         self.assertIn('your key is in the unit\'s login keys, as "installer@bench"', said)
         self.assertIn('Log in with: ssh root@', said)
 
+    def test_a_units_own_network_settings_go_into_its_storage_and_it_is_started_on_them(self):
+        unit = self.make_unit()
+        directory = config.unit_dir(self.settings.data_dir, 'W1700KTEST0001')
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        (directory / provision.NETWORK).write_text('# the bench\nMGMT_IF=lan4\nEXPORT_MTU=9000\n')
+        with mock.patch('builtins.print') as printed:
+            self.assertEqual(self.install(), 0)
+        self.assertEqual(unit.network, ['MGMT_IF=lan4', 'EXPORT_MTU=9000'])
+        log = [line for _, line in unit.log]
+        stored = log.index('/usr/sbin/w1700k-network set MGMT_IF=lan4 EXPORT_MTU=9000')
+        self.assertIn('run bootcmd', log[stored:], 'the loader hands them over: they apply from the next start')
+        self.assertEqual(unit.state, 'linux')
+        self.assertIn('the unit has its own network settings (MGMT_IF=lan4 EXPORT_MTU=9000)',
+                      ' '.join(str(c.args[0]) for c in printed.call_args_list if c.args))
+
+    def test_a_unit_with_no_network_conf_is_asked_nothing_about_its_network(self):
+        self.make_unit()
+        self.assertEqual(self.install(), 0)
+        self.assertFalse(any('w1700k-network' in line for line in self.commands()))
+
     def test_a_root_flashed_over_the_console_gives_a_unit_with_an_empty_list_the_installers_key(self):
         """A root from before the list left the root had its key built in; it went with it."""
         unit = self.make_unit(installed=True)

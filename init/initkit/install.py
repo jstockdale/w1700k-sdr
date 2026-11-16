@@ -95,6 +95,7 @@ def run(settings, expect_serial=None, authorized_key=None,
             return 0
 
         rootfs = provision.provision(directory, address=settings.device_ip)
+        network = provision.network_settings(directory)
 
         print('install: writing our loader')
         unit.to_stock(console, log, 'dumper')
@@ -117,6 +118,11 @@ def run(settings, expect_serial=None, authorized_key=None,
             # Who may log in is a list the unit keeps; this installer's key is the first in it.
             named = steps.add_login_key(session, login_key)
             print(f'install: your key is in the unit\'s login keys, as "{named}"')
+        if network and steps.network_settings(session, network):
+            # They are read by the loader: the unit comes up on them from its next start.
+            print(f'install: the unit has its own network settings ({" ".join(network)}); starting it on them')
+            unit.to_installed_loader(console, log, 'linux')
+            status = steps.boot_installed(session)
     login = (f'Log in with: ssh root@{settings.device_ip}' if not no_login_key else
              'It has no login key: give it one with its reset button (init/key)')
     print(f'install: done; {status}. {login}\n'

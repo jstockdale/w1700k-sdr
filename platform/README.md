@@ -335,6 +335,34 @@ colons, at most 900 characters (an RSA key of 4096 bits fits).
 `tests/test_login.py` runs the program with the slot's over directories, and
 `tests/test_loader_update.py` the loader's side through its model.
 
+### A unit's own network settings
+
+`/etc/w1700k/network.conf` in the root holds the defaults, the same in every
+unit, and a unit with nothing of its own comes up on them. A unit's own
+settings are the file `net/conf` in `durable`, only the ones it sets:
+
+```
+net_mgmt_address=10.0.0.1/24
+net_export_mtu=9000
+```
+
+- The loader reads the file at every boot (`net_load`, from `key_pass`) and
+  puts each setting into the device tree, `/chosen/w1700k,net-NAME`
+  (`net_pass`), and says `w1700k.net=handed` or `none` on the kernel command
+  line. A setting is data there; on the command line a value with a space in
+  it would be more kernel arguments.
+- `w1700k-network`, from `rcS`, takes each setting the loader handed over if
+  it is a value that setting can have (an interface name, an IPv4 address
+  with its prefix, an MTU from 576 to 9216), and the default otherwise. What
+  is in force goes to `/run/w1700k-network.conf`.
+- `w1700k-network set`, `keep` and `clear` change the file, each inside one
+  `durable-run`. Nothing changes under a running system: the settings apply
+  from the next start. `keep`, on a root from before settings left the root,
+  stores what that root's `network.conf` says other than the defaults.
+
+`tests/test_network.py` runs the program over directories, and
+`tests/test_loader_update.py` the loader's side through its model.
+
 ### The GPS receiver
 
 The board carries an Airoha AG3352 GNSS receiver, which the stock firmware
