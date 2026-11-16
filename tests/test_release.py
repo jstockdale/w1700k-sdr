@@ -107,6 +107,50 @@ def rotation(text, by, **options):
     return seal.seal_list(text, signing(by)[1], **options)
 
 
+CHAIN_MAGIC = b'w1700k-sdr key chain 1\n'
+
+
+def kept(*envelopes):
+    """What a unit keeps of its lists, as seal/release.c reads it: the sealed envelopes that
+    bear out the one it holds, each behind its length."""
+    return CHAIN_MAGIC + b''.join(struct.pack('<I', len(envelope)) + envelope for envelope in envelopes)
+
+
+def links(data):
+    """The envelopes in what a unit keeps."""
+    assert data.startswith(CHAIN_MAGIC), data[:40]
+    found, at = [], len(CHAIN_MAGIC)
+    while at < len(data):
+        length, = struct.unpack_from('<I', data, at)
+        found.append(data[at + 4:at + 4 + length])
+        at += 4 + length
+    return found
+
+
+class Kept(type(Path())):
+    """The file a unit keeps its list in, written and read here as the list's text: a list a
+    test root key is in is kept as the first list a unit was given, sealed by that key. What
+    is no list, or one no test key can seal, is written as it is, and is no list to a unit."""
+
+    def write_bytes(self, data):
+        try:
+            roots = [key.public for key in seal.parse_list(data).keys if key.scope == 'root']
+        except seal.Refused:
+            roots = []
+        by = next((number for number in range(1, 30) if signing(number)[0] in roots), None)
+        return super().write_bytes(data if by is None else kept(rotation(data, by)))
+
+    def read_bytes(self):
+        data = super().read_bytes()
+        return seal.body_of(links(data)[-1]) if data.startswith(CHAIN_MAGIC) else data
+
+    def kept(self):
+        return super().read_bytes()
+
+    def keep(self, data):
+        return super().write_bytes(data)
+
+
 def resealed(envelope, by, topic=seal.ROTATE_TOPIC, change=None):
     """`envelope` with its header or body changed by `change(bytearray)`, and signed again by
     test key `by` under `topic`: what a key holder can make that the tools here would not."""
@@ -308,7 +352,7 @@ class Built(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.dir)
         self.primary, self.sign = signing(PRIMARY)
         self.spare, self.sign_spare = signing(SPARE)
-        self.keys = self.dir / 'keys'
+        self.keys = Kept(self.dir / 'keys')
         self.keys.write_bytes(a_list(1))
         self.state = self.dir / 'state'
         self.out = self.dir / 'keys.new'
@@ -341,7 +385,7 @@ class Built(unittest.TestCase):
         if result.stdout.endswith(b'unchanged\n'):
             self.assertFalse(self.out.exists())
             return 'unchanged', None
-        return 'taken', self.out.read_bytes()
+        return 'taken', seal.body_of(links(self.out.read_bytes())[-1])
 
     def both(self, envelope, first=False):
         """The unit's word on a rotation, which the host's has to be as well."""
@@ -850,6 +894,159 @@ tty() { cat "@D@/tty"; }
 '''
 
 
+@unittest.skipUnless(shutil.which(CC), 'no C compiler')
+class KeptLists(Built):
+    """What a unit keeps of its lists is the sealed envelopes that bear out the one it holds,
+    and every read walks them. So nothing altered on flash reads as a list: it is a list this
+    unit was shown the seals of, or it is none."""
+    SECOND = ((ROOT_KEY, 'root'), (NEW_KEYS_KEY, 'keys'), (PRIMARY, 'release'))
+
+    def take(self, envelope, first=False):
+        """A rotation, taken as system-update takes it: what the verifier wrote is kept."""
+        path = self.dir / 'keys.wms2'
+        path.write_bytes(envelope)
+        result = self.run_it('rotate', *(['--first'] if first else []), '--out', self.out, path)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.keys.keep(self.out.read_bytes())
+
+    def labels(self):
+        return [seal.parse_list(seal.body_of(link)).label for link in links(self.keys.kept())]
+
+    def read(self):
+        """(exit status of `list`, the list's text or what was said)."""
+        shown = self.run_it('list')
+        text = subprocess.run([str(self.program), 'text', '--keys', str(self.keys)], capture_output=True)
+        self.assertEqual(shown.returncode == 0, text.returncode == 0)
+        return shown.returncode, text.stdout if shown.returncode == 0 else shown.stderr.decode(errors='replace')
+
+    def grow(self):
+        """A unit that has lived a while: three epochs, the last with a later list in it."""
+        self.keys.unlink()
+        self.take(rotation(a_list(1), ROOT_KEY), first=True)
+        self.take(rotation(a_list((2, 1), self.SECOND), ROOT_KEY))
+        self.take(rotation(a_list((3, 1), self.SECOND), ROOT_KEY))
+        self.take(rotation(a_list((3, 2), self.SECOND[:2] + ((STRANGER, 'release'),)), NEW_KEYS_KEY))
+        return self.keys.kept()
+
+    def test_it_keeps_the_first_list_each_epochs_first_and_the_one_it_holds(self):
+        self.keys.unlink()
+        self.take(rotation(a_list(1), ROOT_KEY), first=True)
+        self.assertEqual(self.labels(), ['1.1'])
+        self.take(rotation(a_list(2), KEYS_KEY))
+        self.assertEqual(self.labels(), ['1.1', '1.2'])
+        self.take(rotation(a_list(7), ROOT_KEY))
+        self.assertEqual(self.labels(), ['1.1', '1.7'], 'the list between vouches for nothing the first does not')
+        self.take(rotation(a_list((2, 1), self.SECOND), ROOT_KEY))
+        self.assertEqual(self.labels(), ['1.1', '2.1'], 'nor does the last of an epoch that is over')
+        self.take(rotation(a_list((2, 2), self.SECOND), NEW_KEYS_KEY))
+        self.take(rotation(a_list((2, 9), self.SECOND), ROOT_KEY))
+        self.assertEqual(self.labels(), ['1.1', '2.1', '2.9'])
+        self.take(rotation(a_list((3, 1), self.SECOND), ROOT_KEY))
+        self.assertEqual(self.labels(), ['1.1', '2.1', '3.1'])
+        self.assertEqual(self.read(), (0, a_list((3, 1), self.SECOND)))
+
+    def test_within_an_epoch_it_does_not_grow_however_many_lists_come(self):
+        self.keys.unlink()
+        self.take(rotation(a_list(1), ROOT_KEY), first=True)
+        sizes = set()
+        for generation in range(2, 40):
+            self.take(rotation(a_list(generation), KEYS_KEY))
+            sizes.add(len(self.keys.kept()))
+            self.assertEqual(self.labels(), ['1.1', f'1.{generation}'])
+        self.assertLessEqual(max(sizes) - min(sizes), 1, 'but for the digits of the generation')
+
+    def test_a_unit_given_a_later_list_first_keeps_that_as_its_first(self):
+        self.keys.unlink()
+        self.take(rotation(a_list((3, 4)), ROOT_KEY), first=True)
+        self.take(rotation(a_list((3, 6)), KEYS_KEY))
+        self.take(rotation(a_list((3, 8)), KEYS_KEY))
+        self.assertEqual(self.labels(), ['3.4', '3.8'])
+        self.assertEqual(self.read(), (0, a_list((3, 8))))
+
+    def test_one_bit_wrong_anywhere_in_it_and_it_is_no_list(self):
+        whole = self.grow()
+        self.assertEqual(self.read()[0], 0)
+        for at in range(len(whole)):
+            damaged = bytearray(whole)
+            damaged[at] ^= 1 << (at % 8)
+            self.keys.keep(bytes(damaged))
+            status, said = self.read()
+            self.assertEqual(status, 2, f'byte {at} of {len(whole)}: {said}')
+
+    def test_cut_short_it_is_no_list_or_a_list_this_unit_held_before(self):
+        whole = self.grow()
+        held_before = {}
+        at = len(CHAIN_MAGIC)
+        for link in links(whole):
+            at += 4 + len(link)
+            held_before[at] = seal.body_of(link)
+        for length in range(len(whole)):
+            self.keys.keep(whole[:length])
+            status, said = self.read()
+            if length in held_before:
+                self.assertEqual((status, said), (0, held_before[length]), 'never one it did not hold')
+            else:
+                self.assertEqual(status, 2, f'cut to {length}: {said}')
+
+    def test_a_list_altered_into_another_that_reads_is_no_list(self):
+        """What a checksum beside the text would not have stopped: whoever can write the list
+        can write the checksum. The seal cannot be written again."""
+        whole = self.grow()
+        first, second, third, held = links(whole)
+        other = a_list((3, 2), self.SECOND)                 # the release key put back for the stranger
+        forged = held[:40] + other + held[-64:]
+        self.assertEqual(seal.parse_list(seal.body_of(forged)).label, '3.2', 'it is a list, to look at')
+        self.keys.keep(kept(first, second, third, forged))
+        status, said = self.read()
+        self.assertEqual(status, 2)
+        self.assertIn('not borne out by its seal', said)
+
+    def test_what_does_not_follow_is_no_list(self):
+        whole = self.grow()
+        first, second, third, held = links(whole)
+        stranger_first = rotation(a_list(1, ((STRANGER, 'root'),), {STRANGER: 'x'}), STRANGER)
+        cases = {'only the name of a chain': kept(), 'nothing': b'', 'the lists out of order': kept(second, first, third, held),
+                 'one left out': kept(first, third, held), 'the same one twice': kept(first, second, third, held, held),
+                 'an older one after': kept(first, second, third, held, third), 'the first one again': kept(first, second, first),
+                 'something after the last': whole + b'\0', 'a length and nothing': whole + struct.pack('<I', 200),
+                 'a list a stranger sealed, after': kept(first, second, third, held, rotation(a_list((3, 3), self.SECOND), STRANGER)),
+                 'a list sealed by a key of an epoch that is over': kept(first, second, third, rotation(a_list((3, 5), self.SECOND), KEYS_KEY)),
+                 'a release under the name of a list': kept(seal.seal(b'{}', 1, signing(ROOT_KEY)[1])),
+                 'another kind of chain': whole.replace(b'chain 1\n', b'chain 2\n'),
+                 'a length too long to be an envelope': CHAIN_MAGIC + struct.pack('<I', 1 << 20) + first}
+        for name, data in cases.items():
+            with self.subTest(name):
+                self.keys.keep(data)
+                self.assertEqual(self.read()[0], 2)
+        # Somebody else's lists, whole and well sealed, are a list: the first is the anchor.
+        self.keys.keep(kept(stranger_first))
+        self.assertEqual(self.read()[0], 0, 'which is why a unit also has a mark outside its storage, and a bench')
+
+    def test_a_list_kept_as_text_from_before_is_given_again_at_the_bench(self):
+        Path(self.keys).write_bytes(a_list(1))
+        status, said = self.read()
+        self.assertEqual(status, 2)
+        self.assertIn('not a list kept with its seals', said)
+        self.assertIn('at the bench', said)
+        path = self.dir / 'keys.wms2'
+        path.write_bytes(rotation(a_list(2), KEYS_KEY))
+        self.assertEqual(self.run_it('rotate', '--out', self.out, path).returncode, 2, 'it holds no list to judge one by')
+        self.assertFalse(self.out.exists())
+        self.assertEqual(self.verify(seal.seal(b'{}', 1, self.sign)).returncode, 2)
+
+    def test_a_refused_rotation_and_the_list_held_again_write_nothing(self):
+        before = self.grow()
+        for envelope in (rotation(a_list((3, 2), self.SECOND[:2] + ((STRANGER, 'release'),)), NEW_KEYS_KEY),    # held
+                         rotation(a_list((3, 1), self.SECOND), ROOT_KEY), rotation(a_list((3, 9), self.SECOND), STRANGER)):
+            path = self.dir / 'keys.wms2'
+            path.write_bytes(envelope)
+            self.out.unlink(missing_ok=True)
+            self.run_it('rotate', '--out', self.out, path)
+            self.assertFalse(self.out.exists())
+        self.assertEqual(self.keys.kept(), before)
+
+
+@unittest.skipUnless(shutil.which(CC), 'no C compiler')
 class Scripted(Built):
     """The unit's own system-update, run as it is but for where it looks: the verifier is
     the real one, durable storage and the flash are directories. The unit is keyed: it holds
@@ -866,7 +1063,7 @@ class Scripted(Built):
         (d / 'sys/ubi/ubi0_1/usable_eb_size').write_text('126976\n')
         (d / 'durable-run').write_text('#!/bin/sh\n"$@"\n')
         self.keys.unlink()
-        self.keys, self.environment = d / 'durable/keys', d / 'dev/uenv'
+        self.keys, self.environment = Kept(d / 'durable/keys'), d / 'dev/uenv'
         self.keys.write_bytes(a_list(1))
         self.marked(True)
         (d / 'tty').write_text('/dev/pts/0\n')
@@ -1283,6 +1480,52 @@ class UpdateScript(Scripted):
         self.assertIn('durable storage could not be read', status.stderr)
         self.assertNotIn('release=0', status.stdout)
         self.assertEqual(self.release(9).returncode, 1)
+
+    def test_a_stored_list_altered_into_another_that_reads_is_a_lost_unit_and_no_second_list(self):
+        """Found on a unit while lists were kept as text: one digit changed in a stored list was
+        not noticed, and the true list, sent again, was then refused as ANOTHER list of the same
+        generation. A unit keeps the seals now, and reads its list by them."""
+        new = a_list(2, ((ROOT_KEY, 'root'), (KEYS_KEY, 'keys'), (STRANGER, 'release')))
+        self.assertEqual(self.give('rotate', rotation(new, KEYS_KEY)).returncode, 0)
+        self.assertEqual(self.kinds()[:3], ('keyed', 'good', '1.2'))
+        whole = self.keys.kept()
+        first, held = links(whole)
+        other = a_list(2, ((ROOT_KEY, 'root'), (KEYS_KEY, 'keys'), (SPARE, 'release')))
+        self.keys.keep(kept(first, held[:40] + other + held[-64:]))
+        self.assertEqual(self.kinds()[:2], ('lost', 'damaged'))
+        again = self.give('rotate', rotation(new, KEYS_KEY))
+        self.assertEqual(again.returncode, 1)
+        self.assertIn('holds none that reads', again.stderr)
+        self.assertNotIn('ANOTHER', again.stderr)
+        self.assertEqual(self.release(7, signing(SPARE)[1]).returncode, 1, 'and the key written in seals nothing')
+        self.keys.keep(whole)
+        self.assertEqual(self.kinds()[:3], ('keyed', 'good', '1.2'))
+
+    def test_this_program_run_on_a_unit_not_yet_updated_still_says_its_list(self):
+        """The host runs its own copy of this program on the unit, beside whatever verifier the
+        unit's root has. One from before lists were kept sealed keeps the text, and has no word
+        for giving it. (Found on a unit: the update to this root stopped at that.)"""
+        older = self.dir / 'older-verifier'
+        older.write_text(f'''#!/bin/sh
+case $1 in
+text) echo "usage: w1700k-release verify ..." >&2; exit 2 ;;
+list) [ "$(head -c 16 "$3")" = "w1700k-sdr keys " ] && echo "generation=1.1" ;;
+*) exec {self.program} "$@" ;;
+esac
+''')
+        older.chmod(0o755)
+        self.script.write_text(self.script.read_text().replace(f'RELEASE={self.program}', f'RELEASE={older}'))
+        Path(self.keys).write_bytes(a_list(1))
+        said = self.update('keys')
+        self.assertEqual((said.returncode, said.stdout.encode()), (0, a_list(1)), said.stderr)
+
+    def test_a_unit_whose_list_was_kept_as_text_is_lost_until_the_bench_gives_it_again(self):
+        Path(self.keys).write_bytes(a_list(1))
+        self.assertEqual(self.kinds()[:2], ('lost', 'damaged'))
+        self.assertNotEqual(self.update('keys').returncode, 0)
+        refused = self.release(7)
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn('given a list at the bench again', refused.stderr)
 
     def test_a_verification_does_not_outlive_the_list_or_the_next_release_asked_about(self):
         self.assertEqual(self.release(7).returncode, 0)
@@ -1943,7 +2186,9 @@ class Issued(unittest.TestCase):
                 taken = subprocess.run([str(program), 'rotate', *(['--first'] if number == 0 else ['--keys', str(held)]),
                                         '--out', str(held), str(sealed)], capture_output=True, text=True)
                 self.assertEqual(taken.returncode, 0, taken.stderr)
-            self.assertEqual(held.read_bytes(), seal.body_of(self.chain()[-1]))
+            self.assertEqual(seal.body_of(links(held.read_bytes())[-1]), seal.body_of(self.chain()[-1]))
+            self.assertEqual([seal.parse_list(seal.body_of(link)).label for link in links(held.read_bytes())], ['1.1', '2.1'],
+                             'the first list and the one that began the epoch it is in')
 
 
 if __name__ == '__main__':
