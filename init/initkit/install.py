@@ -49,7 +49,7 @@ def examine(console, log, backup_only, accept_untested):
     return nand, backup.read_serial(console)
 
 
-def run(settings, expect_serial=None, authorized_key=None, import_host_key=None,
+def run(settings, expect_serial=None, authorized_key=None,
         force=False, backup_only=False, accept_untested=False, no_login_key=False):
     if backup_only:
         config.require_images(config.DUMPER)
@@ -94,8 +94,8 @@ def run(settings, expect_serial=None, authorized_key=None, import_host_key=None,
             print(f'install: backup {existing}; stopping as asked (--backup-only)')
             return 0
 
-        rootfs, host_key = provision.provision(directory, authorized_key, import_host_key,
-                                             address=settings.device_ip, no_login_key=no_login_key)
+        rootfs = provision.provision(directory, authorized_key, address=settings.device_ip,
+                                     no_login_key=no_login_key)
 
         print('install: writing our loader')
         unit.to_stock(console, log, 'dumper')
@@ -110,10 +110,14 @@ def run(settings, expect_serial=None, authorized_key=None, import_host_key=None,
 
         print('install: booting the installed system')
         status = steps.boot_installed(session)
+        # The unit makes its own ssh host key and keeps it; this console is how the host
+        # comes to know it.
+        print('install: the unit keeps the ssh host key it made')
+        host_keys = provision.known_host(directory, settings.device_ip, steps.host_keys(session) or [])
     login = (f'Log in with: ssh root@{settings.device_ip}' if not no_login_key else
              'It has no login key: give it one with its reset button (init/key)')
     print(f'install: done; {status}. {login}\n'
-          f'install: unit host key {provision.fingerprint(host_key)} '
+          f'install: unit host key {", ".join(provision.fingerprint(line.split(None, 1)[1]) for line in host_keys)} '
           f'(known_hosts line in {directory / provision.KNOWN_HOSTS})\n'
           f'install: backup {existing}')
     return 0

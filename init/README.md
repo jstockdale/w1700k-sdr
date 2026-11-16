@@ -124,15 +124,17 @@ It stops stock U-Boot at power-on and then:
    `calibration` partition in the backup) as `eeprom.bin` beside the backup,
    where the host tools find it; `init/eeprom --unit SERIAL` does the same for
    an existing backup;
-3. builds the unit's root filesystem with your SSH key and a host key made for
-   this unit, and writes `known_hosts` for it beside the backup;
+3. builds the unit's root filesystem with your SSH key;
 4. writes our U-Boot into the `loader` partition through stock U-Boot, reads it
    back and boots that copy;
 5. from our U-Boot, erases `system` and `durable`, creates their UBI volumes,
    and writes and reads back the system FIT, the root and the durable image;
 6. changes stock U-Boot's `bootcmd` to boot our U-Boot from the `loader`
    partition (the old one is kept as `bootcmd_orig`);
-7. boots the installed system and checks it.
+7. boots the installed system and checks it;
+8. has the unit keep the ssh host key it made as its own, in its durable
+   storage, and writes `known_hosts` beside the backup from the public half
+   the unit says over the console.
 
 The unit is then reachable with `ssh root@192.168.1.1`. A full run takes about
 five minutes. Every step is checked before the next one starts; if a run is
@@ -461,8 +463,10 @@ other keys.
 - **Firmware is root.** A unit that has installed a thief's release is the
   thief's, whatever list it held. The list protects the units that have not.
 - **The unit cannot check its root yet.** Each unit's root is built on the
-  host from the release's root, because its ssh host key is in it, so the root
-  a unit is sent is in no manifest. The tool checks the release's root against
+  host from the release's root, because the login key built into it and the
+  unit's network settings are in it, so the root a unit is sent is in no
+  manifest. (Its ssh host key was the third such thing and is now in the
+  unit's durable storage.) The tool checks the release's root against
   the manifest before it builds the unit's from it; the unit takes that root
   because a release was verified, and says that the root itself was not. The
   loader is the same for every unit, and the unit does check it. This closes
@@ -655,15 +659,24 @@ most of it rewriting what changed (about ten blocks a second).
   `init/install --force` reinstalls everything, keeping the backup.
 - An update over the network (`init/flash --rootfs --ssh`) left the unit
   unreachable: power-cycle it; its loader puts the previous root back.
-- The SSH host key of a unit installed elsewhere can be kept with
-  `init/provision --unit SERIAL --import-host-key FILE` before the first
-  `init/flash --rootfs`.
+- A unit's ssh host key is its own, made on the unit and kept in its durable
+  storage; no host has the private half, and no update changes it. A host
+  that did not install the unit needs the public half to know it by:
+  `init/provision --unit SERIAL --host-key FILE`, with the key as the
+  installer printed it, a `known_hosts` line or a `.pub` file.
+- A root flashed over the console onto a unit installed before host keys left
+  the root (`init/flash --rootfs`, with `--loader`) gives the unit a new host
+  key, since the old one went with the old root; the tool records it and says
+  so. Over ssh (`init/flash --ssh`) the unit carries its key across instead.
+  A unit directory from before may still hold `dropbear_ed25519_host_key`,
+  the private key as that root carried it; once the unit is updated nothing
+  reads it, and it is better deleted.
 
 ## Files
 
 | Path | Contents |
 | --- | --- |
-| `~/.local/share/w1700k/units/SERIAL/` | `nand.bin` (the backup), `dropbear_ed25519_host_key`, `rootfs.squashfs` (the unit's root), optional `network.conf`, `nand-raw.bin` and `nand-raw.json` after `init/rawdump` |
+| `~/.local/share/w1700k/units/SERIAL/` | `nand.bin` (the backup), `known_hosts` (the unit's ssh host key, public half), `rootfs.squashfs` (the unit's root), optional `network.conf`, `nand-raw.bin` and `nand-raw.json` after `init/rawdump` |
 | `~/.local/share/w1700k/runs/` | one directory per run: the raw console transcript (`rx.bin`), an event log and saved command output |
 
 A `network.conf` in the unit directory replaces the unit's
