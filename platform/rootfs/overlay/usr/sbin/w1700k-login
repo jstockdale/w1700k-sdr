@@ -1,0 +1,225 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# The login keys: the ssh public keys that may log in to the unit as root. They are a list in the
+# unit's durable storage and in no root image, so one root fits every unit, an update never
+# changes who can log in, and a key is added or dropped without a new root.
+#
+#   w1700k-login boot          at start-up: the list the loader handed over, for this boot
+#   w1700k-login list          the list: `login NAME TYPE BASE64` a line
+#   w1700k-login add [NAME]    the public key on stdin ("TYPE BASE64 [COMMENT]", a .pub file) joins
+#                              the list, under NAME or a name made from its comment
+#   w1700k-login drop NAME     that key leaves the list
+#   w1700k-login keep          on a root from before the list left the root: the key built into
+#                              that root becomes the list, unless the unit has one already
+#   w1700k-login status        how many keys, and what the loader said
+#
+# `add` and `drop` work at once and stay. The list is the file `ssh/login` in durable storage, in
+# the form the loader imports, at most 32 lines:
+#
+#   login_1=ssh-ed25519:AAAA...:desk
+#   login_2=ssh-rsa:AAAA...:laptop
+#
+# An entry is one word: the key's type, its base64 body and a name, joined by colons. The name is
+# lower-case letters, digits and @ . _ -, at most 32, and no two keys share one.
+#
+# Linux opens durable storage only to change it. At every boot it is the loader that reads the
+# file and puts each entry into the device tree it hands over, `/chosen/w1700k,login-N`, and says
+# on the kernel command line that it did: `w1700k.login=handed|none`. A loader that says nothing
+# does not know of the list: a key added then works until the unit restarts.
+#
+# The paperclip key is not in this list. It is one more key, in a slot of its own that only the
+# reset button changes (w1700k-keyslot), and it is how a unit whose list is empty is reached.
+# Root's authorized_keys, in RAM, is this list and that key; w1700k-keyslot writes it.
+set -eu
+RUN=${W1700K_LOGIN_RUN:-/run/w1700k-login}		# this boot's list, as authorized_keys lines
+CHOSEN=${W1700K_LOGIN_CHOSEN:-/proc/device-tree/chosen}
+CMDLINE=${W1700K_LOGIN_CMDLINE:-/proc/cmdline}
+DURABLE_RUN=${W1700K_LOGIN_DURABLE_RUN:-/usr/sbin/durable-run}
+STORE=${W1700K_LOGIN_DIR:-/durable/ssh}
+KEYSLOT=${W1700K_LOGIN_KEYSLOT:-/usr/sbin/w1700k-keyslot}
+BUILT_IN=${W1700K_LOGIN_BUILT_IN:-/.lower/root/.ssh/authorized_keys}
+MOST=32
+ENTRY_MOST=900			# an entry is one property the loader sets, in a buffer of 1024
+
+fail() { echo "w1700k-login: $*" >&2; exit 1; }
+
+# An entry as the list holds it, and nothing a shell, the loader or a device tree would read as
+# more. Sets type, body and name.
+good()
+{
+	[ ${#1} -le "$ENTRY_MOST" ] || return 1
+	case $1 in *[!A-Za-z0-9+/=:@._-]* | '') return 1 ;; esac
+	type=${1%%:*}
+	name=${1##*:}
+	body=${1#"$type":}
+	body=${body%:"$name"}
+	[ "$type:$body:$name" = "$1" ] || return 1
+	case $type in
+	ssh-ed25519 | ecdsa-sha2-nistp256 | ecdsa-sha2-nistp384 | ecdsa-sha2-nistp521 | ssh-rsa) ;;
+	*) return 1 ;;
+	esac
+	case $body in *[!A-Za-z0-9+/=]* | '') return 1 ;; esac
+	case $name in *[!a-z0-9@._-]* | '' | [!a-z0-9]*) return 1 ;; esac
+	[ ${#name} -le 32 ] || return 1
+	# The body is a key of the type it is said to be: it begins with that type's name.
+	[ "$(printf %s "$body" | base64 -d 2>/dev/null | dd bs=1 skip=4 count=${#type} 2>/dev/null)" = "$type" ]
+}
+
+# A name from a key's comment: what of it a name may hold.
+named()
+{
+	printf %s "$1" | tr 'A-Z' 'a-z' | tr -cs 'a-z0-9@._' '-' | sed 's/^[^a-z0-9]*//' | cut -c1-32 | sed 's/-*$//'
+}
+
+said()
+{
+	loader=silent
+	for word in $(cat "$CMDLINE"); do
+		case $word in w1700k.login=handed | w1700k.login=none) loader=${word#*=} ;; esac
+	done
+}
+
+show() { [ ! -r "$RUN" ] || sed 's/^\([^ ]*\) \([^ ]*\) \(.*\)$/login \3 \1 \2/' "$RUN"; }
+
+# The list changed inside durable storage: $1 is add (entry $2), drop (name $2) or keep (entries on
+# stdin, for a unit that has no list). What comes back: the list as it then is, `entry: ENTRY` a
+# line, and `result: ok` or why not.
+change()
+{
+	"$DURABLE_RUN" sh -c '
+		set -e
+		dir=$1 verb=$2 what=$3 most=$4
+		mkdir -p "$dir"
+		chmod 700 "$dir"
+		have=$(sed -n "s/^login_[0-9]*=//p" "$dir/login" 2>/dev/null || :)
+		case $verb in
+		add)
+			count=0
+			for entry in $have; do
+				count=$((count + 1))
+				[ "${entry%:*}" != "${what%:*}" ] || { echo "result: has-key ${entry##*:}"; exit 0; }
+				[ "${entry##*:}" != "${what##*:}" ] || { echo "result: has-name"; exit 0; }
+			done
+			[ "$count" -lt "$most" ] || { echo "result: full"; exit 0; }
+			have="$have $what" ;;
+		drop)
+			kept= found=0
+			for entry in $have; do
+				if [ "${entry##*:}" = "$what" ]; then found=1; else kept="$kept $entry"; fi
+			done
+			[ "$found" = 1 ] || { echo "result: absent"; exit 0; }
+			have=$kept ;;
+		keep)
+			if [ -e "$dir/login" ]; then
+				for entry in $have; do echo "entry: $entry"; done
+				echo "result: there"
+				exit 0
+			fi
+			have=$(cat) ;;
+		esac
+		n=0
+		for entry in $have; do n=$((n + 1)); echo "login_$n=$entry"; done > "$dir/login.part"
+		mv "$dir/login.part" "$dir/login"
+		for entry in $have; do echo "entry: $entry"; done
+		echo "result: ok"' sh "$STORE" "$1" "${2:-}" "$MOST"
+}
+
+# This boot takes the list as `change` reported it: root can log in with it at once. On a root
+# from before the list left the root there is no record to bring up to date.
+adopt()
+{
+	[ -r "$RUN.state" ] || return 0
+	echo "$1" | sed -n 's/^entry: //p' | while read -r entry; do
+		! good "$entry" || echo "$type $body $name"
+	done > "$RUN.part"
+	mv "$RUN.part" "$RUN"
+	[ ! -x "$KEYSLOT" ] || "$KEYSLOT" refresh || fail "the list is kept, but root's login keys could not be rewritten"
+}
+
+case ${1:-} in
+boot)
+	said
+	bad=0 n=1
+	: > "$RUN.part"
+	while [ "$n" -le "$MOST" ]; do
+		property=$CHOSEN/w1700k,login-$n
+		if [ -r "$property" ]; then
+			if good "$(tr -d '\000' < "$property")"; then
+				echo "$type $body $name" >> "$RUN.part"
+			else
+				echo "w1700k-login: the loader handed over no usable key in place $n" >&2
+				bad=1
+			fi
+		fi
+		n=$((n + 1))
+	done
+	mv "$RUN.part" "$RUN"
+	echo "$loader" > "$RUN.state"
+	[ "$bad" = 0 ]
+	;;
+list)
+	[ -r "$RUN.state" ] || fail "no record of the list (w1700k-login boot has not run)"
+	show
+	;;
+status)
+	[ -r "$RUN.state" ] || fail "no record of the list (w1700k-login boot has not run)"
+	echo "login=$(wc -l < "$RUN" | tr -d ' ')"
+	echo "loader=$(cat "$RUN.state")"
+	;;
+add)
+	[ -r "$RUN.state" ] || fail "no record of the list (w1700k-login boot has not run)"
+	given=${2:-}
+	read -r kind text comment || :
+	name=${given:-$(named "$comment")}
+	entry="${kind:-}:${text:-}:${name:-key}"
+	good "$entry" || fail "not a public key and a name as the list holds them (TYPE BASE64 [COMMENT]; a name is lower-case letters, digits and @ . _ -, at most 32)"
+	out=$(change add "$entry") || fail "the list could not be changed"
+	case $(echo "$out" | sed -n 's/^result: //p') in
+	ok) adopt "$out"; show ;;
+	has-key*) fail "that key is in the list already, as $(echo "$out" | sed -n 's/^result: has-key //p')" ;;
+	has-name) fail "a key named $name is in the list: name this one (w1700k-login add NAME)" ;;
+	full) fail "the list is full ($MOST keys): drop one first" ;;
+	*) fail "the list could not be changed" ;;
+	esac
+	;;
+drop)
+	[ -r "$RUN.state" ] || fail "no record of the list (w1700k-login boot has not run)"
+	[ -n "${2:-}" ] || fail "usage: w1700k-login drop NAME"
+	out=$(change drop "$2") || fail "the list could not be changed"
+	case $(echo "$out" | sed -n 's/^result: //p') in
+	ok) adopt "$out"; show ;;
+	absent) fail "no key named $2 is in the list" ;;
+	*) fail "the list could not be changed" ;;
+	esac
+	;;
+keep)
+	if [ -r "$RUN.state" ]; then		# this root has no key of its own to carry
+		show
+		exit 0
+	fi
+	entries= count=0
+	if [ -r "$BUILT_IN" ]; then
+		while read -r type body comment; do
+			case $type in '' | '#'*) continue ;; esac
+			count=$((count + 1))
+			name=$(named "$comment")
+			entry="$type:$body:${name:-key}"
+			case " $entries " in *":${entry##*:} "*) entry="$type:$body:key-$count" ;; esac
+			good "$entry" || fail "the key built into this root, line $count, is not one the list holds"
+			entries="$entries $entry"
+		done < "$BUILT_IN"
+	fi
+	out=$(for entry in $entries; do echo "$entry"; done | change keep) || fail "the list could not be written"
+	case $(echo "$out" | sed -n 's/^result: //p') in
+	ok | there)
+		echo "$out" | sed -n 's/^entry: //p' | while read -r entry; do
+			! good "$entry" || echo "login $name $type $body"
+		done ;;
+	*) fail "the list could not be written" ;;
+	esac
+	;;
+*)
+	echo "usage: w1700k-login boot | list | add [NAME] | drop NAME | keep | status" >&2
+	exit 2
+	;;
+esac

@@ -3,8 +3,9 @@
 # The paperclip key's slot: one login key that only a hand on the unit can put in, switch off
 # and switch on (w1700k-key watches the reset button and calls this).
 #
-#   w1700k-keyslot boot      at start-up: root's login keys are the one built into the root, if
-#                            any, and the slot's key if the loader says it is on
+#   w1700k-keyslot boot      at start-up: root's login keys are the unit's list (w1700k-login)
+#                            and the slot's key if the loader says it is on
+#   w1700k-keyslot refresh   root's login keys written again, after the list changed
 #   w1700k-keyslot program   the key on stdin ("TYPE:BASE64") goes into the slot, switched on
 #   w1700k-keyslot toggle    the slot's key is switched off, or on again
 #   w1700k-keyslot purge     the slot's key is erased
@@ -27,7 +28,7 @@
 set -eu
 RUN=${W1700K_KEYSLOT_RUN:-/run/w1700k-keyslot}
 KEYS=${W1700K_KEYSLOT_KEYS:-/root/.ssh/authorized_keys}
-BUILT_IN=${W1700K_KEYSLOT_BUILT_IN:-/.lower/root/.ssh/authorized_keys}
+LIST=${W1700K_KEYSLOT_LIST:-/run/w1700k-login}		# the unit's list, as w1700k-login left it
 CMDLINE=${W1700K_KEYSLOT_CMDLINE:-/proc/cmdline}
 HOST_KEY=${W1700K_KEYSLOT_HOST_KEY:-/etc/dropbear/dropbear_ed25519_host_key.pub}
 DURABLE_RUN=${W1700K_KEYSLOT_DURABLE_RUN:-/usr/sbin/durable-run}
@@ -49,18 +50,20 @@ good()
 
 persist() { [ -r "$RUN" ] && cut -d' ' -f2 "$RUN" || echo 0; }
 
-# Root's login keys, and the record: STATE, PERSIST, and with `on` the key.
+# Root's login keys, and the record: STATE, PERSIST, and with `on` the key (beside it, for
+# `refresh`).
 apply()
 {
 	directory=$(dirname "$KEYS")
 	mkdir -p "$directory"
 	chmod 700 "$directory"
 	{
-		[ ! -r "$BUILT_IN" ] || cat "$BUILT_IN"
+		[ ! -r "$LIST" ] || cat "$LIST"
 		[ "$1" != on ] || echo "${3%%:*} ${3#*:} paperclip"
 	} > "$KEYS.part"
 	chmod 600 "$KEYS.part"
 	mv "$KEYS.part" "$KEYS"
+	if [ "$1" = on ]; then echo "$3" > "$RUN.key"; else rm -f "$RUN.key"; fi
 	echo "$1 $2" > "$RUN.part"
 	mv "$RUN.part" "$RUN"
 }
@@ -134,6 +137,14 @@ purge)
 	*) fail "the slot could not be erased" ;;
 	esac
 	;;
+refresh)
+	[ -r "$RUN" ] || fail "no record of the slot (w1700k-keyslot boot has not run)"
+	read -r state persist < "$RUN"
+	key=
+	[ ! -r "$RUN.key" ] || key=$(cat "$RUN.key")
+	[ "$state" != on ] || good "$key" || fail "no record of the slot's key"
+	apply "$state" "$persist" "$key"
+	;;
 status)
 	[ -r "$RUN" ] || fail "no record of the slot (w1700k-keyslot boot has not run)"
 	read -r state persist < "$RUN"
@@ -146,7 +157,7 @@ serve)
 	sleep 5		# init starts it again; not in a tight loop if it cannot run
 	;;
 *)
-	echo "usage: w1700k-keyslot boot | program | toggle | purge | status | serve" >&2
+	echo "usage: w1700k-keyslot boot | refresh | program | toggle | purge | status | serve" >&2
 	exit 2
 	;;
 esac

@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""Build a unit's own root filesystem: the built root plus its login key.
+"""Set up this host's directory for a unit, and make its root if it needs one.
 
-init/install and init/flash do this themselves. Run it directly to set up a
-unit directory for a unit installed elsewhere. Its ssh host key is the unit's
-own and stays on it; this host needs the public half, to know the unit by:
+init/install and init/flash do this themselves. Run it directly for a unit
+installed elsewhere. A unit's root is the built one, unless its directory
+holds a network.conf of its own. Its login keys are a list on the unit
+(`w1700k-login` there). Its ssh host key is the unit's own and stays on it;
+this host needs the public half, to know the unit by:
 
     init/provision --unit SERIAL --host-key FILE
 
@@ -25,11 +27,6 @@ def main():
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--unit', metavar='SERIAL', required=True)
     parser.add_argument('--data-dir', type=Path, default=Path(settings['data_dir']))
-    parser.add_argument('--authorized-key', metavar='FILE',
-                        default=settings['authorized_key'])
-    parser.add_argument('--no-login-key', action='store_true',
-                        help='build no login key into the root: the unit takes its key from its '
-                             'reset button alone (init/key)')
     parser.add_argument('--host-key', metavar='FILE', type=Path,
                         help="the unit's ssh host key, public half: recorded as the key this host "
                              'knows the unit by')
@@ -42,8 +39,7 @@ def main():
             for entry in provision.known_host(directory, settings['device_ip'],
                                               provision.public_lines(args.host_key.read_text())):
                 print(f'provision: host key {provision.fingerprint(entry.split(None, 1)[1])}')
-        image = provision.provision(directory, args.authorized_key, address=settings['device_ip'],
-                                    no_login_key=args.no_login_key)
+        image = provision.provision(directory, address=settings['device_ip'])
     except (provision.ProvisionError, OSError) as error:
         sys.exit(f'provision: {error}')
     print(f'provision: {image}')

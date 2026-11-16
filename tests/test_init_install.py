@@ -13,7 +13,7 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / 'init'), str(Path(__file__).resolve().parent)]
-from initkit import backup, config, install, layout, provision, session, stock, update  # noqa: E402
+from initkit import backup, config, install, layout, provision, session, steps, stock, update  # noqa: E402
 from initkit import nand as parts  # noqa: E402
 from initkit.config import partitions  # noqa: E402
 from initkit.console import StepFailed  # noqa: E402
@@ -72,15 +72,23 @@ class Bench(unittest.TestCase):
         finally:
             log.close()
 
+    LOGIN_KEY = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA== Installer@Bench'
+
+    def put(self, console, path, data):
+        """keying.put: a file written into the unit's RAM over the console."""
+        self.unit.__dict__.setdefault('put_files', {})[path] = data
+
     def install(self, **options):
-        key = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA=='
         with mock.patch.object(install, 'open_session', self.open_session), \
-                mock.patch.object(provision, 'authorized_key', return_value=key.encode()), \
+                mock.patch.object(steps.keying, 'put', self.put), \
+                mock.patch.object(provision, 'authorized_key', return_value=(self.LOGIN_KEY + '\n').encode()), \
                 mock.patch.object(provision, 'provision', return_value=self.unit_root):
             return install.run(self.settings, **options)
 
     def flash(self, **options):
         with mock.patch.object(update, 'open_session', self.open_session), \
+                mock.patch.object(steps.keying, 'put', self.put), \
+                mock.patch.object(provision, 'authorized_key', return_value=(self.LOGIN_KEY + '\n').encode()), \
                 mock.patch.object(provision, 'provision', return_value=self.unit_root):
             return update.run(self.settings, **options)
 
@@ -127,17 +135,70 @@ class Install(Bench):
         self.assertEqual(unit.saved.get('bootcmd'), fake.STOCK_BOOTCMD)
 
     def test_an_install_with_no_login_key_needs_no_key_and_says_how_the_unit_gets_one(self):
-        self.make_unit()
-        key = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA=='
+        unit = self.make_unit()
         with mock.patch.object(install, 'open_session', self.open_session), \
                 mock.patch.object(provision, 'authorized_key', side_effect=provision.ProvisionError('no key')), \
-                mock.patch.object(provision, 'provision', return_value=self.unit_root) as provisioned, \
+                mock.patch.object(provision, 'provision', return_value=self.unit_root), \
                 mock.patch('builtins.print') as printed:
             self.assertEqual(install.run(self.settings, no_login_key=True), 0)
-        self.assertTrue(provisioned.call_args.kwargs['no_login_key'])
+        self.assertEqual(unit.__dict__.get('logins', []), [], 'nothing was added to its list')
+        self.assertFalse(any('w1700k-login' in line for line in self.commands('linux')))
         said = ' '.join(str(call.args[0]) for call in printed.call_args_list if call.args)
         self.assertIn('It has no login key: give it one with its reset button (init/key)', said)
         self.assertNotIn('Log in with', said)
+
+    def test_the_installers_key_is_the_first_of_the_units_login_keys_and_in_no_root(self):
+        unit = self.make_unit()
+        with mock.patch.object(provision, 'provision', return_value=self.unit_root) as provisioned, \
+                mock.patch('builtins.print') as printed:
+            with mock.patch.object(install, 'open_session', self.open_session), \
+                    mock.patch.object(steps.keying, 'put', self.put), \
+                    mock.patch.object(provision, 'authorized_key', return_value=(self.LOGIN_KEY + '\n').encode()):
+                self.assertEqual(install.run(self.settings), 0)
+        kind, body, comment = self.LOGIN_KEY.split()
+        self.assertEqual(unit.logins, [('installer@bench', kind, body)])
+        self.assertEqual(unit.put_files[steps.LOGIN_KEY_IN_RAM], (self.LOGIN_KEY + '\n').encode())
+        self.assertEqual(set(provisioned.call_args.kwargs), {'address'}, 'the root is given no key')
+        linux = self.commands('linux')
+        self.assertLess(linux.index('/usr/sbin/w1700k-hostkey keep'),
+                        linux.index(f'/usr/sbin/w1700k-login add < {steps.LOGIN_KEY_IN_RAM}'))
+        said = ' '.join(str(call.args[0]) for call in printed.call_args_list if call.args)
+        self.assertIn('your key is in the unit\'s login keys, as "installer@bench"', said)
+        self.assertIn('Log in with: ssh root@', said)
+
+    def test_a_root_flashed_over_the_console_gives_a_unit_with_an_empty_list_the_installers_key(self):
+        """A root from before the list left the root had its key built in; it went with it."""
+        unit = self.make_unit(installed=True)
+        unit.state, unit.host_kept, unit.host_loader = 'linux', True, 'handed'
+        directory = config.unit_dir(self.settings.data_dir, 'W1700KTEST0001')
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / provision.KNOWN_HOSTS).write_text(f'{self.settings.device_ip} {unit.HOST_KEY}\n')
+        with mock.patch('builtins.print') as printed:
+            self.assertEqual(self.flash(rootfs=True), 0)
+        self.assertEqual([name for name, *_ in unit.logins], ['installer@bench'])
+        self.assertIn('the unit had no login key in its list', ' '.join(str(c.args[0]) for c in printed.call_args_list if c.args))
+
+    def test_a_root_flashed_over_the_console_leaves_a_list_that_has_keys_alone_and_adds_none_when_told(self):
+        for logins, options in (([('desk', 'ssh-ed25519', 'AAAA')], {}), ([], {'no_login_key': True})):
+            with self.subTest(options=options):
+                unit = self.make_unit(installed=True)
+                unit.state, unit.host_kept, unit.host_loader, unit.logins = 'linux', True, 'handed', list(logins)
+                directory = config.unit_dir(self.settings.data_dir, 'W1700KTEST0001')
+                directory.mkdir(parents=True, exist_ok=True)
+                (directory / provision.KNOWN_HOSTS).write_text(f'{self.settings.device_ip} {unit.HOST_KEY}\n')
+                self.settings.data_dir = Path(tempfile.mkdtemp(dir=self.work))      # a run log of its own
+                config.unit_dir(self.settings.data_dir, 'W1700KTEST0001').mkdir(parents=True)
+                self.assertEqual(self.flash(rootfs=True, **options), 0)
+                self.assertEqual(unit.logins, logins)
+
+    def test_a_root_flashed_under_a_loader_from_before_the_list_says_nothing_can_log_in_by_it(self):
+        unit = self.make_unit(installed=True)
+        unit.state, unit.host_kept, unit.host_loader, unit.login_loader = 'linux', True, 'handed', 'silent'
+        config.unit_dir(self.settings.data_dir, 'W1700KTEST0001').mkdir(parents=True, exist_ok=True)
+        with mock.patch('builtins.print') as printed:
+            self.assertEqual(self.flash(rootfs=True), 0)
+        self.assertEqual(unit.__dict__.get('logins', []), [])
+        self.assertIn('does not hand its login keys to the system', ' '.join(str(c.args[0]) for c in printed.call_args_list if c.args))
 
     def test_the_unit_keeps_the_host_key_it_made_and_the_host_learns_it_over_the_console(self):
         unit = self.make_unit()

@@ -25,19 +25,29 @@ ENV_FILE = ROOT / 'platform' / 'loader' / 'an7581_w1700k_sdr_env'
 # this same script started again by `bootm`, as the second loader is the same build.
 HARNESS = r'''
 note() { echo "$*" >> "$M/log"; }
-setenv() { if [ $# -ge 2 ]; then eval "$1=\$2"; else unset "$1"; fi; }
-run() { for name; do eval "$(cat "$M/env/$name")" || return 1; done; }
+# As in U-Boot: a variable set to nothing is gone, and `run` takes a script a boot made itself.
+setenv() { if [ $# -ge 2 ] && [ -n "$2" ]; then eval "$1=\$2"; else unset "$1"; fi; }
+run() {
+    for name; do
+        if [ -f "$M/env/$name" ]; then eval "$(cat "$M/env/$name")" || return 1
+        else eval "eval \"\$$name\"" || return 1; fi
+    done
+}
 saveenv() {
     note saveenv
     for name in update_tried update_failed loader_tried loader_failed loader_booted; do
         eval "[ -z \"\${$name+x}\" ]" || eval "echo \"$name=\$$name\""
     done > "$M/saved"
     for name in update_new update_old update_file update_want update_got loader_new loader_kind key_line key_on gps_v \
-            host_ed25519 host_ecdsa; do
+            host_ed25519 host_ecdsa \
+            login_1 login_2 login_3 login_4 login_5 login_6 login_7 login_8 login_9 login_10 login_11 login_12 login_13 login_14 login_15 login_16 login_17 login_18 login_19 login_20 login_21 login_22 login_23 login_24 login_25 login_26 login_27 login_28 login_29 login_30 login_31 login_32; do
         eval "[ -z \"\${$name+x}\" ]" || { echo "saved a scratch variable: $name" >> "$M/log"; }
     done
 }
 env() {
+    # A command of this loader takes sixteen words at most, its own name among them (seen on a
+    # unit: an import naming more variables than that was refused, and read nothing).
+    [ $# -lt 16 ] || { echo "env: more arguments than the loader takes" >&2; return 1; }
     case $1 in
     exists) eval "[ -n \"\${$2+x}\" ]" ;;
     erase) note "env erase"; rm -f "$M/saved" ;;
@@ -159,7 +169,8 @@ bootm() {
     prep) [ "$stage" = fdt ] || return 1; stage=prep; prepared=$bootargs; return 0 ;;
     go)
         [ "$stage" = prep ] || return 1
-        for name in key_line key_on gps_v host_ed25519 host_ecdsa; do
+        for name in key_line key_on gps_v host_ed25519 host_ecdsa \
+            login_1 login_2 login_3 login_4 login_5 login_6 login_7 login_8 login_9 login_10 login_11 login_12 login_13 login_14 login_15 login_16 login_17 login_18 login_19 login_20 login_21 login_22 login_23 login_24 login_25 login_26 login_27 login_28 login_29 login_30 login_31 login_32; do
             eval "[ -z \"\${$name+x}\" ]" || note "left a scratch variable: $name"
         done
         echo "$prepared" >> "$M/bootargs"
@@ -254,8 +265,8 @@ class LoaderUpdate(Model):
         self.assertTrue(bootcmd.endswith('iminfo ${loadaddr} && run system_start'))
         start = (self.model / 'env' / 'system_start').read_text()
         self.assertEqual(start, 'if bootm start ${loadaddr}#${bootconf} && bootm loados && bootm ramdisk && bootm fdt; '
-                                'then run host_pass; bootm prep && bootm go; fi',
-                         'the same boot, a stage at a time, with the host keys put in before the last two')
+                                'then run host_pass; run login_pass; bootm prep && bootm go; fi',
+                         "the same boot, a stage at a time, with the unit's keys put in before the last two")
 
     def test_nothing_staged_nothing_written(self):
         self.assertEqual(self.boot(), [f'booted {digest(self.OLD)}'])
@@ -534,7 +545,7 @@ class KeySlot(Model):
     storage to find it."""
     KEY = 'ssh-ed25519:AAAAC3NzaC1lZDI1NTE5AAAAIHRoaXMgaXMgbm90IGEgcmVhbCBrZXksIGJ1dCBvaw=='
     PLAIN = 'console=ttyS0,115200 earlycon panic=5 ro rdinit=/init ubi.mtd=system ubi.block=0,rootfs'
-    NO_HOST = ' w1700k.hostkey=none'
+    NO_HOST = ' w1700k.hostkey=none w1700k.login=none'
 
     def slot(self, on, key=KEY):
         directory = self.model / 'durable' / 'key'
@@ -604,7 +615,7 @@ class HostKeys(KeySlot):
     which the kernel logs."""
     ED25519 = '0000000b7373682d6564323535313900000040' + 'a1' * 64
     ECDSA = '0000001365636473612d736861322d6e69737470323536' + 'b2' * 110
-    HANDED = ' w1700k.hostkey=handed'
+    HANDED = ' w1700k.hostkey=handed w1700k.login=none'
     test_no_slot_is_said_to_be_empty = test_a_key_that_is_on_is_handed_over = None
     test_a_key_that_is_off_stays_in_the_slot = test_every_boot_reads_the_slot_anew = None
     test_the_key_is_handed_over_beside_an_update_and_never_saved = None
@@ -682,6 +693,105 @@ class HostKeys(KeySlot):
         self.assertTrue(self.bootargs().endswith(self.HANDED))
         self.assertIn('the second loader starts', self.lines)
         self.assertEqual(self.chosen(), {'security-w1700k-host-ed25519': self.ED25519})
+
+
+class LoginKeys(HostKeys):
+    """The keys that may log in as root (durable `ssh/login`, written by w1700k-login): up to
+    thirty-two, one a line, which the loader reads at every boot and puts into the device tree.
+    The loader names each line it takes, so the file can set nothing else in it."""
+    A = 'ssh-ed25519:AAAAC3NzaC1lZDI1NTE5AAAAIGEgbG9naW4ga2V5IGZvciB0aGUgbW9kZWwsIG9uZSEh:desk'
+    B = 'ssh-rsa:' + 'AAAAB3NzaC1yc2E' + 'A' * 701 + ':laptop'
+    test_a_unit_without_keys_is_told_so = test_a_key_goes_into_the_tree_and_not_onto_the_command_line = None
+    test_a_key_of_each_kind_goes_in_under_its_own_name = test_nothing_else_in_the_file_reaches_the_loader = None
+    test_every_boot_reads_them_anew_and_none_is_saved = test_the_keys_and_the_login_slot_are_handed_over_together = None
+    test_storage_that_cannot_be_read_hands_over_none = None
+    test_the_second_loader_hands_them_over_when_it_boots_the_system = None
+
+    def logins(self, *entries, text=None):
+        directory = self.model / 'durable' / 'ssh'
+        directory.mkdir(exist_ok=True)
+        (directory / 'login').write_text(text if text is not None else
+                                         ''.join(f'login_{n}={entry}\n' for n, entry in enumerate(entries, 1)))
+
+    def test_a_unit_with_no_list_is_told_so(self):
+        self.assertTrue(self.bootargs().endswith(' w1700k.hostkey=none w1700k.login=none'))
+        self.logins()
+        self.assertTrue(self.bootargs().endswith(' w1700k.login=none'), 'an empty list')
+        self.assertEqual(self.chosen(), {})
+
+    def test_each_key_goes_into_the_tree_under_its_place_in_the_list(self):
+        self.logins(self.A, self.B)
+        args = self.bootargs()
+        self.assertTrue(args.endswith(' w1700k.hostkey=none w1700k.login=handed'))
+        self.assertEqual(self.chosen(), {'w1700k,login-1': self.A, 'w1700k,login-2': self.B})
+        self.assertNotIn('AAAA', args, 'eight keys would not fit a kernel command line')
+
+    def test_thirty_two_are_handed_over_and_one_more_is_not(self):
+        entries = [f'ssh-ed25519:AAAAC3NzaC1lZDI1NTE5AAAAI{n}:key-{n}' for n in range(1, 34)]
+        self.logins(*entries)
+        self.bootargs()
+        self.assertEqual(self.chosen(), {f'w1700k,login-{n}': entries[n - 1] for n in range(1, 33)})
+        # The loader's shell cannot look a variable up by a number made in a loop (tried on a
+        # unit: every place got a junk value), so each place is written out; all are the same.
+        scripts = {name: (self.model / 'env' / name).read_text() for name in
+                   ('login_load', 'login_clear', 'login_pass', 'login_give_1', 'login_give_2', 'login_give_3', 'login_give_4')}
+        self.assertEqual(scripts['login_load'].count('ubifsload ${update_spare} ssh/login'), 4,
+                         'read again for each group: an import changes what it reads')
+        for n in range(1, 33):
+            self.assertRegex(scripts['login_load'], rf' login_{n}(;| )')
+            self.assertRegex(scripts['login_clear'] + ';', rf'setenv login_{n};')
+            self.assertIn(f'${{login_{n}}}"; then fdt set /chosen w1700k,login-{n} "${{login_{n}}}"; fi',
+                          scripts[f'login_give_{(n + 7) // 8}'])
+            self.assertIn(f'${{login_{n}}}', scripts['login_pass'])
+        self.assertNotIn('login_33', ''.join(scripts.values()))
+        build = (ROOT / 'platform/loader/an7581_w1700k_sdr_defconfig').read_text()
+        self.assertIn('CONFIG_SYS_FDT_PAD=0x10000\n', build, 'room in the tree for all of them at their longest')
+
+    def test_a_gap_in_the_list_loses_nothing(self):
+        self.logins(text=f'login_2={self.A}\nlogin_7={self.B}\n')
+        self.assertTrue(self.bootargs().endswith(' w1700k.login=handed'))
+        self.assertEqual(self.chosen(), {'w1700k,login-2': self.A, 'w1700k,login-7': self.B})
+
+    def test_nothing_else_in_the_list_reaches_the_loader(self):
+        self.logins(text=f'bootargs=init=/bin/sh\nhost_ed25519={self.ED25519}\nkey_line=ssh-ed25519:AAAA\nkey_on=1\n'
+                         f'login_33={self.A}\nlogin_0={self.A}\nlogin_1={self.A}\nlogin_give_1=reset\nlogin_clear=reset\n')
+        self.assertEqual(self.bootargs(), self.PLAIN + ' w1700k.keyslot=empty w1700k.hostkey=none w1700k.login=handed')
+        self.assertEqual(self.chosen(), {'w1700k,login-1': self.A})
+
+    def test_every_boot_reads_the_list_anew_and_none_of_it_is_saved(self):
+        self.logins(self.A)
+        self.stage(self.NEW, self.OLD)
+        self.bootargs()
+        self.assertIn('saveenv', self.lines)
+        self.assertEqual(self.chosen(), {'w1700k,login-1': self.A})
+        self.assertNotIn('login', ' '.join(self.saved()))
+        self.settle()
+        self.logins(self.B)
+        self.bootargs()
+        self.assertEqual(self.chosen(), {'w1700k,login-1': self.B})
+        (self.model / 'durable' / 'ssh' / 'login').unlink()
+        self.assertTrue(self.bootargs().endswith(' w1700k.login=none'))
+        self.assertEqual(self.chosen(), {})
+
+    def test_the_list_the_identity_key_and_the_paperclip_key_are_handed_over_together(self):
+        self.slot(1)
+        self.keys(f'host_ed25519={self.ED25519}\n')
+        self.logins(self.A)
+        self.assertEqual(self.bootargs(), f'{self.PLAIN} w1700k.keyslot=on w1700k.key={self.KEY} w1700k.hostkey=handed w1700k.login=handed')
+        self.assertEqual(self.chosen(), {'security-w1700k-host-ed25519': self.ED25519, 'w1700k,login-1': self.A})
+
+    def test_storage_that_cannot_be_read_hands_over_no_list(self):
+        self.logins(self.A)
+        (self.model / 'durable').rename(self.model / 'durable.gone')
+        self.assertTrue(self.bootargs().endswith(' w1700k.login=none'))
+        self.assertEqual(self.chosen(), {})
+
+    def test_the_second_loader_hands_the_list_over_when_it_boots_the_system(self):
+        self.logins(self.A)
+        (self.model / 'loaderb').write_bytes(b'FIT:W1700K SDR second ARM loader\nthe second loader\nEND\n')
+        self.assertTrue(self.bootargs().endswith(' w1700k.login=handed'))
+        self.assertIn('the second loader starts', self.lines)
+        self.assertEqual(self.chosen(), {'w1700k,login-1': self.A})
 
 
 if __name__ == '__main__':

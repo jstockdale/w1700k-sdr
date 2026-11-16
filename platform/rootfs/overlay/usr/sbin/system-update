@@ -12,7 +12,7 @@
 #   system-update rotate ENVELOPE       take a new list of keys, sealed by a key of the list held
 #   system-update first ENVELOPE        at the bench: give a marked unit that holds no list its first
 #   system-update unkey                 at the bench: forget the list
-#   system-update stage IMAGE SHA256 [--from-release | --unsigned]
+#   system-update stage IMAGE SHA256 [--unsigned]
 #                                       leave IMAGE (a SquashFS root, e.g. in /work) for the
 #                                       loader, with the running root beside it to go back to
 #   system-update stage-loader IMAGE SHA256 [--unsigned]
@@ -33,13 +33,13 @@
 # where no update reaches it, and stages only what a release sealed by a release key of that
 # list lists: `release` first, then the images, whose digests must be in its manifest. The
 # release's number is kept once the update is confirmed, and nothing older is taken after
-# that; a unit has no clock, so the number is all it can hold a release to. Two things pass
-# without being in a manifest, and each says so:
+# that; a unit has no clock, so the number is all it can hold a release to. One thing passes
+# without being in a manifest, and says so:
 #   --unsigned       the owner's own build. Whoever can run this as root owns the unit.
-#   --from-release   a root. Until one root fits every unit, the host builds each unit's
-#                    root (its ssh host key is in it) from the release's root, which it has
-#                    checked against the manifest; this unit cannot check that, and takes
-#                    the root because a release was verified, not because the root was.
+# A release's root goes to every unit as it is: nothing of a unit is in its root (its login keys
+# and its ssh host key are in durable storage), so the root is checked here like the loader. A
+# root the host made for one unit, with network settings of its own in it, is a build of the
+# owner's and goes as one.
 #
 # The list changes in one way: `rotate`, with a list of a higher generation sealed by a root
 # or keys key of the list held. No update carries a list, so a key that seals releases cannot
@@ -234,11 +234,6 @@ permitted()	# may the image with digest $1 be staged, given the flag $2? $3 name
 		return 0
 	fi
 	[ "$REGIME" = keyed ] || lost ", or pass --unsigned for a build of your own"
-	if [ "${2:-}" = --from-release ]; then
-		[ -n "$(verified)" ] || return 1
-		echo "system-update: taking $3 as built by the host from release $(verified); it is not checked here" >&2
-		return 0
-	fi
 	"$RELEASE" allows --state "$STATE" "$1"
 }
 
@@ -363,14 +358,14 @@ unkey)
 	;;
 stage)
 	image=${2:-} want=${3:-}
-	[ -f "$image" ] && [ -n "$want" ] || fail "usage: system-update stage IMAGE SHA256 [--from-release | --unsigned]"
+	[ -f "$image" ] && [ -n "$want" ] || fail "usage: system-update stage IMAGE SHA256 [--unsigned]"
 	alone
 	installed || fail "this boot runs from RAM, not from the installed root"
 	loader_applies || fail "the loader on this unit does not apply staged updates: " \
 		"flash it once over the serial console (init/flash --loader)"
 	[ "$(digest < "$image")" = "$want" ] || fail "$image is not $want"
 	permitted "$want" "${4:-}" "this root" || fail "this unit takes releases: verify one first " \
-		"(system-update release), whose manifest lists this root or with --from-release; " \
+		"(system-update release), whose manifest lists this root; " \
 		"or pass --unsigned for a build of your own"
 	root=$(volume rootfs)
 	sys=/sys/class/ubi/${root##*/}
@@ -475,7 +470,7 @@ cancel)
 	echo "system-update: nothing is staged"
 	;;
 *)
-	echo "usage: system-update status | release ENVELOPE | stage IMAGE SHA256 [--from-release | --unsigned] |" >&2
+	echo "usage: system-update status | release ENVELOPE | stage IMAGE SHA256 [--unsigned] |" >&2
 	echo "       stage-loader IMAGE SHA256 [--unsigned] | confirm | cancel |" >&2
 	echo "       keys | rotate ENVELOPE | first ENVELOPE | unkey" >&2
 	exit 2
