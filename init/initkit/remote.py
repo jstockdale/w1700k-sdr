@@ -24,6 +24,7 @@ from .console import StepFailed
 
 SCRIPT = config.ROOT / 'platform/rootfs/overlay/usr/sbin/system-update'
 HOSTKEY = config.ROOT / 'platform/rootfs/overlay/usr/sbin/w1700k-hostkey'
+LOGIN = config.ROOT / 'platform/rootfs/overlay/usr/sbin/w1700k-login'
 STAGING = '/work/system-update.squashfs'      # in RAM on the unit
 LOADER_STAGING = '/work/system-update.loader'
 RELEASE_STAGING = '/work/system-update.release'
@@ -60,15 +61,24 @@ class Link:
         return result.returncode, text
 
 
+def login_keys(link):
+    """The names of the login keys in the unit's list as its running root has it, or None on a
+    root from before the list left the root (which has no such record)."""
+    code, text = link.call('sh -s -- list', data=LOGIN.read_bytes(), timeout=60)
+    return None if code else [line.split()[1] for line in text.splitlines() if line.startswith('login ')]
+
+
 def check_paperclip_key(link):
-    """Before a root with no login key built in goes to a unit over ssh: the unit must have a key
-    of its own that will still be there, or nothing could log in to confirm the update (it would
-    be undone by the next boot, and a unit that was reachable would have been made unreachable
-    for that long)."""
+    """Before a root goes over ssh to a unit that will have no login key in its list: the unit
+    must have its paperclip key, switched on and kept by its loader, or nothing could log in to
+    confirm the update (it would be undone by the next boot, and a unit that was reachable would
+    have been made unreachable for that long)."""
+    if login_keys(link):
+        return
     code, text = link.call('/usr/sbin/w1700k-keyslot status')
     state = dict(line.split('=', 1) for line in text.splitlines() if '=' in line) if code == 0 else {}
     if state.get('slot') != 'on' or state.get('persist') != '1':
-        raise StepFailed('a root with no login key would leave this unit with no way in: its paperclip key is '
+        raise StepFailed('with no login key in its list this unit would have no way in: its paperclip key is '
                          + {'off': 'switched off', 'empty': 'not set'}.get(state.get('slot'), 'unknown to its root')
                          + ('' if state.get('persist', '1') == '1' else ' and its loader does not keep one')
                          + '. Give it a key with its reset button first (init/key), and log in with that key')
@@ -80,27 +90,36 @@ def tool(link, *arguments, timeout=180):
     return link.call(command, data=SCRIPT.read_bytes(), timeout=timeout)
 
 
-def keep_host_key(link, loader_coming=False):
-    """Before a root is staged: the unit's ssh host key is in its durable storage, and its loader
-    hands it to the system. No root holds a host key any more, so a unit that ran a root from
-    before has the key built into that root carried across here, on the unit itself; the key
-    does not leave it. Without both, the new root would come up with a key made for that boot,
-    which this host refuses, and the update would be undone.
+def keep_unit_keys(link, loader_coming=False, no_login_key=False):
+    """Before a root is staged: the unit's ssh host key and its login keys are in its durable
+    storage, and its loader hands them to the system. No root holds either any more, so a unit
+    that ran a root from before has the keys built into that root carried across here, on the
+    unit itself; the host key does not leave it. Without that the new root would come up as
+    another unit that lets nobody in, and the update would be undone.
 
-    `loader_coming`: a loader that hands the key over is staged with the root."""
+    `loader_coming`: a loader that hands them over is staged with the root. `no_login_key`: the
+    login key built into an old root is not carried; the unit's paperclip key is its way in."""
     code, text = link.call('sh -s -- keep', data=HOSTKEY.read_bytes(), timeout=180)
     if code:
         raise StepFailed("the unit's ssh host key could not be kept in its durable storage: "
                          f'{text.strip()[-300:]}')
     if not any(line.startswith('hostkey ') for line in text.splitlines()):
         raise StepFailed(f'the unit named no ssh host key that it keeps: {text.strip()[-300:]}')
+    if not no_login_key:
+        code, text = link.call('sh -s -- keep', data=LOGIN.read_bytes(), timeout=180)
+        if code:
+            raise StepFailed("the unit's login keys could not be kept in its durable storage: "
+                             f'{text.strip()[-300:]}')
+        if not any(line.startswith('login ') for line in text.splitlines()):
+            check_paperclip_key(link)
     code, text = link.call('cat /proc/cmdline', timeout=30)
     if code:
         raise StepFailed(f'the unit did not say how it was started: {text.strip()[-200:]}')
-    if not loader_coming and not re.search(r'(?:^|\s)w1700k\.hostkey=(?:handed|none)(?:\s|$)', text):
-        raise StepFailed("the loader on this unit does not hand the unit's ssh host key to the system, and "
-                         'this root holds none: update the loader with it (init/flash --ssh, or '
-                         'init/flash --bundle FILE)')
+    for word, what in (('hostkey', 'ssh host key'), ('login', 'login keys')):
+        if not loader_coming and not re.search(rf'(?:^|\s)w1700k\.{word}=(?:handed|none)(?:\s|$)', text):
+            raise StepFailed(f"the loader on this unit does not hand the unit's {what} to the system, and "
+                             'this root holds none: update the loader with it (init/flash --ssh, or '
+                             'init/flash --bundle FILE)')
 
 
 def status(link):
@@ -114,8 +133,7 @@ def status(link):
 
 
 # What system-update is told when staging the loader and the root, by the terms admit() found.
-STAGING_FLAGS = {'any': ([], []), 'unsigned': (['--unsigned'], ['--unsigned']),
-                 'release': ([], ['--from-release'])}
+STAGING_FLAGS = {'any': ([], []), 'unsigned': (['--unsigned'], ['--unsigned']), 'release': ([], [])}
 
 
 def held_list(link):
@@ -224,8 +242,8 @@ def admit(link, state, sealed=None, unsigned=False):
 
 def present(link, terms, sealed):
     """Before staging: have the unit verify the release itself. Returns the flags for staging
-    the loader and the root. The root goes `--from-release`: it is this unit's root, built here
-    from the release's, and the unit cannot check that (system-update says so too)."""
+    the loader and the root. Both are the release's own, and the unit checks each against the
+    manifest."""
     if terms == 'release':
         code, text = link.call(f'cat > {RELEASE_STAGING}', data=sealed)
         if code:
@@ -252,8 +270,7 @@ def run(settings, serial=None, authorized_key=None, link=None, clock=time.monoto
     config.require_images(config.ROOTFS)
     serial = config.pick_unit(settings.data_dir, serial)
     directory = config.unit_dir(settings.data_dir, serial)
-    image = provision.provision(directory, authorized_key, address=settings.device_ip,
-                                no_login_key=no_login_key)
+    image = provision.provision(directory, address=settings.device_ip)
     data = Path(image).read_bytes()
     digest = hashlib.sha256(data).hexdigest()
     link = link or Link(settings, directory, authorized_key)
@@ -280,7 +297,7 @@ def run(settings, serial=None, authorized_key=None, link=None, clock=time.monoto
         raise StepFailed('the loader on this unit does not apply staged updates: flash it '
                          'once over the serial console (init/flash --loader)')
     check_layout(link)
-    keep_host_key(link)
+    keep_unit_keys(link, no_login_key=no_login_key)
     _, root_flags = present(link, admit(link, state, unsigned=unsigned), None)
 
     print(f'  rootfs: sending {Path(image).name} ({len(data)} bytes)')
@@ -358,9 +375,8 @@ def run_joint(settings, serial=None, authorized_key=None, bundle_path=None, link
         else:
             config.require_images(config.ROOTFS, config.LOADER_B)
             loader_data, generic = config.LOADER_B.read_bytes(), None
-        image = provision.provision(directory, authorized_key, address=settings.device_ip, generic=generic,
-                                    no_login_key=no_login_key)
-    root_data = Path(image).read_bytes()
+        root_data = Path(provision.provision(directory, address=settings.device_ip, generic=generic)).read_bytes()
+    untouched = bundle_path is not None and root_data == files[bundle.ROOT]
     root, loader = hashlib.sha256(root_data).hexdigest(), hashlib.sha256(loader_data).hexdigest()
     link = link or Link(settings, directory, authorized_key)
 
@@ -396,8 +412,12 @@ def run_joint(settings, serial=None, authorized_key=None, bundle_path=None, link
     if not need_root and not need_loader:
         print('  loader and rootfs: already current')
         return 0
+    if need_root and terms == 'release' and not untouched:
+        raise StepFailed("this unit's directory holds a network.conf, so its root is made here, from the "
+                         "release's, and is in no release. A unit that takes releases takes it only as a "
+                         'build of your own: pass --unsigned')
     if need_root:
-        keep_host_key(link, loader_coming=need_loader)
+        keep_unit_keys(link, loader_coming=need_loader, no_login_key=no_login_key)
     loader_flags, root_flags = present(link, terms, sealed)
 
     for wanted, name, data, path, verb, flags in (

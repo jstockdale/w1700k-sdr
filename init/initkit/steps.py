@@ -9,9 +9,11 @@ from pathlib import Path
 import re
 import shutil
 
-from . import config, console as unit, layout, nand as parts, stock
+from . import config, console as unit, keying, layout, nand as parts, stock
 from .console import StepFailed, command, verify_fit
 from .log import sha256_file
+
+LOGIN_KEY_IN_RAM = '/run/login-key.pub'      # on the unit, on its way into the list
 
 
 def serve(session, path, name=None):
@@ -177,11 +179,38 @@ def host_keys(session):
     the key it made for this boot kept as its own if it had none. None when its loader does not
     hand host keys over: then the key is another one at every boot."""
     console = session.console
-    said = command(console, '/usr/sbin/w1700k-hostkey status', limit=30)
+    # (Not `strict`: what these print is keys, and base64 may spell anything.)
+    said = command(console, '/usr/sbin/w1700k-hostkey status', limit=30, strict=False)
     if re.search(r'^loader=silent\s*$', said, re.M):
         return None
-    kept = command(console, '/usr/sbin/w1700k-hostkey keep', limit=120)
+    kept = command(console, '/usr/sbin/w1700k-hostkey keep', limit=120, strict=False)
     return [line.split(None, 1)[1].strip() for line in kept.splitlines() if line.startswith('hostkey ')]
+
+
+def login_keys(session):
+    """In the installed system: (how many login keys the unit's list holds, what its loader said
+    of the list: `handed`, `none`, or `silent` for a loader that does not know of it)."""
+    said = command(session.console, '/usr/sbin/w1700k-login status', limit=30, strict=False)
+    count, loader = re.search(r'^login=(\d+)\s*$', said, re.M), re.search(r'^loader=(\w+)\s*$', said, re.M)
+    if not count or not loader:
+        raise StepFailed(f'the unit did not say what login keys it has:\n{said[-300:]}')
+    return int(count.group(1)), loader.group(1)
+
+
+def add_login_key(session, public_line):
+    """In the installed system: the public key (a .pub file's line) joins the unit's login keys;
+    returns the name the unit lists it under."""
+    console = session.console
+    if isinstance(public_line, bytes):
+        public_line = public_line.decode()
+    kind, body, *comment = public_line.split()
+    keying.put(console, LOGIN_KEY_IN_RAM, f'{kind} {body} {" ".join(comment)}'.strip().encode() + b'\n')
+    listed = command(console, f'/usr/sbin/w1700k-login add < {LOGIN_KEY_IN_RAM}', limit=120, strict=False)
+    for line in listed.splitlines():
+        words = line.split()
+        if words[:1] == ['login'] and words[2:] == [kind, body]:
+            return words[1]
+    raise StepFailed(f'the unit did not list the key it was given:\n{listed[-300:]}')
 
 
 def boot_recovery(session):

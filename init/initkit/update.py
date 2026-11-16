@@ -31,11 +31,12 @@ def run(settings, serial=None, fit=False, rootfs=False, durable=False, loader=Fa
     wanted += [config.LOADER] if loader else []
     wanted += [config.RECOVERY_FIT] if recovery else []
     config.require_images(*wanted)
-    image = None
+    image = login_key = None
     if rootfs:
         serial = config.pick_unit(settings.data_dir, serial)
-        image = provision.provision(config.unit_dir(settings.data_dir, serial),
-                                    authorized_key, address=settings.device_ip, no_login_key=no_login_key)
+        if not no_login_key:
+            login_key = provision.authorized_key(authorized_key)       # fail before touching the unit
+        image = provision.provision(config.unit_dir(settings.data_dir, serial), address=settings.device_ip)
     with open_session(settings, 'flash', write=not recovery) as session:
         console, log = session.console, session.log
         state = unit.identify(console, log)
@@ -82,6 +83,7 @@ def run(settings, serial=None, fit=False, rootfs=False, durable=False, loader=Fa
         status = steps.boot_installed(session)
         if rootfs:
             host_keys(session, config.unit_dir(settings.data_dir, serial), settings.device_ip)
+            login_keys(session, login_key)
     print(f'flash: done; {status}')
     return 0
 
@@ -101,6 +103,19 @@ def host_keys(session, directory, address):
     if before is not None and known.read_text() != before:
         print(f'flash: the unit has a new ssh host key, recorded in {known}; a host that knew the old '
               'one will say so')
+
+
+def login_keys(session, login_key):
+    """After a root was written over the console: a unit left with no login key in its list is
+    given `login_key` (None: none, --no-login-key). A root from before the list left the root
+    had its key built in, and that key went with it."""
+    count, loader = steps.login_keys(session)
+    if loader == 'silent':
+        print("flash: this unit's loader does not hand its login keys to the system, so nothing can log in\n"
+              '       but its paperclip key. Flash the loader too (init/flash --loader)')
+    elif count == 0 and login_key is not None:
+        named = steps.add_login_key(session, login_key)
+        print(f'flash: the unit had no login key in its list; yours is in it now, as "{named}"')
 
 
 def update_loader(session, state):

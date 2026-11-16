@@ -61,15 +61,17 @@ installation, the first loader and the kernel image.
 
 ### A unit in someone else's hands
 
-- **One root for every unit.** A unit's ssh host key is now its own, in its
-  durable storage, handed to the system by the loader (`w1700k-hostkey`), so
-  a host that did not install a unit needs only the public half
-  (`init/provision --host-key`). Two things are still built into each unit's
-  root on the host: the login key (unless `--no-login-key`) and the unit's
-  `network.conf`. Until they leave it too, beside the host key and the
-  paperclip key's slot, a unit cannot check its root against a release's
-  manifest, and takes it on the host's word (shown on a unit: a changed root
-  offered as "built from this release" was staged).
+- **Network settings out of the root.** Every unit is sent the same root and
+  checks it against a release's manifest: its login keys (`w1700k-login`, a
+  list of up to 32) and its ssh host key (`w1700k-hostkey`) are in its
+  durable storage, handed to the system by the loader. One thing can still
+  make a root a unit's own: a `network.conf` in its directory on the host. A
+  keyed unit takes such a root only as the owner's build (`--unsigned`) and
+  keeps no release number for it. The settings belong in durable storage
+  too, beside the keys.
+- **Login keys from the host.** The list is changed on the unit, over ssh
+  (`w1700k-login add`, `drop`). A host tool for it, and a signed request that
+  adds or drops a key, are not built.
 - **Signed releases, the rest.** A keyed unit holds a list of keys with
   scopes, takes only a release a release key of it sealed, and takes a new
   list only from a root or keys key of the one it holds (`init/sign`,
