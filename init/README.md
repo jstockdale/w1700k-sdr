@@ -453,15 +453,47 @@ Whitehat Hardware's keys sign this way. [`seal/development/`](../seal/developmen
 holds its development lists of keys as they were sealed; units that ship hold
 other keys.
 
+#### What is current
+
+Whoever delivers to a unit can hold back a list or a newer release, and a
+unit, with no clock and no network, would not know. A statement of what is
+current says what there is: the list, the newest release, when it was sealed
+and until when it is good. A `timestamp` key of the list seals it.
+
+```sh
+init/flash --bundle RELEASE.tar --current https://example.org/w1700k/current.wms2
+```
+
+(`--current` also takes a file, and `"current"` in the settings file sets it
+for good. Getting it sends nothing about the unit or its owner.)
+
+- The tool checks the statement by a `timestamp` key of the unit's own list
+  and by this host's clock, and shows it to the unit, which keeps the newest.
+- A unit shown that a newer list than its own exists takes no release until
+  it holds that list. The lists a release carries bring it there.
+- An archive older than the newest release is not sent.
+- No statement, one that cannot be fetched or one out of date is said in
+  capitals and the update goes on.
+
+Sealing one, with the key here or held elsewhere (`seal/README.md` has the
+form):
+
+```sh
+init/sign current --key KEYFILE --domain D --number N --list LIST --good-for 30d --archive RELEASE.tar
+init/sign current-request --domain D --number N --list LIST --good-for 30d --archive RELEASE.tar
+init/sign current-attach --request REQUEST --signature SIG --keys LIST
+```
+
+The sealed file is then put at the address the hosts ask.
+
 #### What it does not do
 
 - **Firmware is root.** A unit that has installed a thief's release is the
   thief's, whatever list it held. The list protects the units that have not.
 - **A stolen root key** can start the next epoch with a list of its own, and a
   unit takes whichever it is given first.
-- **Nothing tells a unit or its host what it has not been given.** Whoever
-  delivers can hold back a rotation or a newer release. A dated statement of
-  what is current, sealed by a `timestamp` key, is what would; it is not built.
+- **A unit that never meets an honest host** stays where it is. What is
+  current (below) reaches a unit through whoever updates it.
 - **Whoever is root on a unit** can do by hand everything the bench does. The
   mark and the console are there so that nothing asked over the network does.
 

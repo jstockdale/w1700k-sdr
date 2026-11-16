@@ -51,6 +51,9 @@ DEFAULTS = {
     'transfer_port': 7070,
     # The public key allowed to log in as root over SSH.
     'authorized_key': None,
+    # Where the statement of what is current is found, for holding an update to it: a file, or
+    # an http(s) address. One for the domain of the units this host updates.
+    'current': None,
     'data_dir': str(DATA_DIR),
 }
 

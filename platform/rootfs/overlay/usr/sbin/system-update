@@ -12,6 +12,8 @@
 #   system-update rotate ENVELOPE       take a new list of keys, sealed by a key of the list held
 #   system-update first ENVELOPE        at the bench: give a marked unit that holds no list its first
 #   system-update unkey                 at the bench: forget the list
+#   system-update current ENVELOPE      keep a statement of what is current: the newest list
+#                                       and release there are, sealed by a timestamp key
 #   system-update stage IMAGE SHA256 [--unsigned]
 #                                       leave IMAGE (a SquashFS root, e.g. in /work) for the
 #                                       loader, with the running root beside it to go back to
@@ -65,6 +67,8 @@ STATE=/run/w1700k-release	# the release it verified this boot (in RAM)
 FLOOR=/durable/release		# the number of the newest release this unit settled on
 KEYS=/durable/keys		# the list of keys this unit trusts
 HELD=/run/w1700k-keys.$$	# this run's copy of it (in RAM)
+CURRENT=/durable/current	# the newest statement of what is current this unit was shown, sealed
+SEEN=$HELD.current		# this run's copy of that
 LOCK=/run/w1700k-update.lock	# one run at a time changes anything
 MARKED=uenv			# the partition of the stock environment, where the mark of a keyed unit is
 CONSOLE=/dev/console		# where the bench is
@@ -72,7 +76,7 @@ CONSOLE=/dev/console		# where the bench is
 fail() { echo "system-update: $*" >&2; exit 1; }
 
 # Whatever this run leaves in RAM goes with it, and so does its hold on the unit.
-trap 'rm -f "$HELD" "$HELD.new" "$HELD.new.part"; [ -z "${LOCKED:-}" ] || rm -rf "$LOCK"' EXIT
+trap 'rm -f "$HELD" "$HELD.new" "$HELD.new.part" "$SEEN" "$SEEN.new" "$SEEN.new.part"; [ -z "${LOCKED:-}" ] || rm -rf "$LOCK"' EXIT
 trap 'exit 130' INT TERM HUP
 
 alone()		# nothing else changes this unit's update state or its keys while this run does
@@ -153,6 +157,7 @@ look()	# LIST: is the list held good, none or damaged? MARK. REGIME: unkeyed, ke
 	# lists and marks. A unit on such a root was never keyed, unless it carries a list or
 	# the mark all the same: then it is a keyed unit on a root that can judge nothing, and
 	# takes nothing sealed.
+	NOW=none NOW_statement= NOW_list= NOW_release= NOW_until=
 	if [ ! -x "$RELEASE" ] || ! "$RELEASE" mark --environment /dev/null 2>&1 | grep -q 'stock environment'; then
 		LIST=none MARK=no
 		/usr/sbin/durable-run sh -c '[ ! -e "$1" ]' sh "$KEYS" > /dev/null 2>&1 || LIST=damaged
@@ -162,8 +167,9 @@ look()	# LIST: is the list held good, none or damaged? MARK. REGIME: unkeyed, ke
 		return 0
 	fi
 	MARK=$(mark)
-	rm -f "$HELD" "$HELD.new"
-	/usr/sbin/durable-run sh -c '[ ! -e "$1" ] || cat "$1" > "$2"' sh "$KEYS" "$HELD" > /dev/null ||
+	rm -f "$HELD" "$HELD.new" "$SEEN" "$SEEN.new"
+	/usr/sbin/durable-run sh -c '[ ! -e "$1" ] || cat "$1" > "$2"; [ ! -e "$3" ] || cat "$3" > "$4"' \
+		sh "$KEYS" "$HELD" "$CURRENT" "$SEEN" > /dev/null ||
 		fail "durable storage could not be read for the key list"
 	if [ ! -e "$HELD" ]; then
 		LIST=none
@@ -177,6 +183,56 @@ look()	# LIST: is the list held good, none or damaged? MARK. REGIME: unkeyed, ke
 	none) [ "$MARK" = no ] && REGIME=unkeyed || REGIME=lost ;;
 	*) REGIME=lost ;;
 	esac
+	told
+}
+
+# NOW: what this unit keeps of what is current, read by its seal: none (it was shown no
+# statement, or only ones that name lists it has moved past), current (the list it holds is the
+# one named), behind (a newer list is named), another (the list named has this unit's stamp and
+# is not its list), damaged. NOW_* are the statement's lines. A unit told of a newer list than
+# its own takes no release until it holds that list: withholding a list stops working the
+# first time a unit meets a host that does not withhold.
+told()
+{
+	NOW=none NOW_statement= NOW_list= NOW_release= NOW_until=
+	[ "$LIST" = good ] && [ -e "$SEEN" ] || return 0
+	if said=$("$RELEASE" statement --keys "$HELD" "$SEEN" 2>/dev/null); then
+		for line in $said; do
+			case $line in
+			statement=* | list=* | release=* | until=* | standing=* | list_sha256=*) eval "NOW_${line%%=*}=\${line#*=}" ;;
+			esac
+		done
+		NOW=$NOW_standing
+		if [ "$NOW" = current ] &&
+		   [ "$("$RELEASE" text --keys "$HELD" | sha256sum | cut -d' ' -f1)" != "$NOW_list_sha256" ]; then
+			NOW=another
+		fi
+	elif [ $? -ne 1 ]; then
+		NOW=damaged
+	fi
+}
+
+uninformed()	# may a release be judged, by what this unit was told is current? $1 ends the refusal
+{
+	case $NOW in
+	behind) fail "this unit has been shown that list $NOW_list is current (statement $NOW_statement), and" \
+		"holds list $(generation): it takes no release until it is given that list (a rotation)${1:-}" ;;
+	another) fail "this unit has been shown a statement that names ANOTHER list $NOW_list than the one it" \
+		"holds: two lists were sealed as one. It takes no release${1:-}" ;;
+	damaged) fail "what this unit keeps of what is current does not read: it takes no release until it is" \
+		"shown a statement again (system-update current)${1:-}" ;;
+	esac
+}
+
+keep_current()	# put $SEEN.new, which the verifier wrote, in the statement's place
+{
+	/usr/sbin/durable-run sh -eu -c '
+		cp "$2" "$1.part"
+		sync
+		mv "$1.part" "$1"
+		sync
+		[ "$(sha256sum < "$1" | cut -d" " -f1)" = "$(sha256sum < "$2" | cut -d" " -f1)" ]
+	' sh "$CURRENT" "$SEEN.new" > /dev/null
 }
 
 generation() { "$RELEASE" list --keys "$HELD" 2>/dev/null | sed -n 's/^generation=//p'; }
@@ -280,6 +336,11 @@ status)
 	set -- $(settled)
 	echo "release_manifest=${2:-}"
 	echo "release_verified=$(verified)"
+	echo "current=$NOW"
+	echo "current_statement=$NOW_statement"
+	echo "current_list=$NOW_list"
+	echo "current_release=$NOW_release"
+	echo "current_until=$NOW_until"
 	;;
 release)
 	envelope=${2:-}
@@ -290,6 +351,7 @@ release)
 	look
 	[ "$REGIME" != unkeyed ] || fail "this unit holds no list of keys; it takes any update"
 	[ "$REGIME" = keyed ] || lost
+	uninformed ", or pass --unsigned when staging for a build of your own"
 	number=$(floor) || exit 1
 	"$RELEASE" verify --keys "$HELD" --state "$STATE" --floor "$number" "$envelope" > /dev/null ||
 		fail "not a release this unit takes"
@@ -300,6 +362,21 @@ release)
 		fail "this is ANOTHER release $1 than the one this unit settled on: two were sealed under one number"
 	fi
 	echo "system-update: release $(verified) verified; its images can be staged"
+	;;
+current)
+	envelope=${2:-}
+	[ -f "$envelope" ] || fail "usage: system-update current ENVELOPE"
+	alone
+	look
+	[ "$REGIME" != unkeyed ] || fail "this unit holds no list of keys: nothing is current to it"
+	[ "$REGIME" = keyed ] || lost
+	said=$("$RELEASE" current --keys "$HELD" --statement "$SEEN" --out "$SEEN.new" "$envelope") ||
+		fail "not a statement this unit takes"
+	case $said in
+	*unchanged) echo "system-update: this is the statement kept ($said)"; exit 0 ;;
+	esac
+	keep_current || fail "the statement could not be kept; look at what is (system-update status)"
+	echo "system-update: what is current, as this unit was shown: $said"
 	;;
 keys)
 	look
@@ -341,7 +418,8 @@ first)
 	keep_list || fail "the unit is marked keyed and the list could not be kept: it takes nothing until" \
 		"this is done again"
 	# Release numbers start again with the keys that seal them.
-	/usr/sbin/durable-run sh -c 'rm -f "$1" && sync' sh "$FLOOR" > /dev/null ||
+	# and what was current under other keys says nothing under these.
+	/usr/sbin/durable-run sh -c 'rm -f "$1" "$2" "$2.part" && sync' sh "$FLOOR" "$CURRENT" > /dev/null ||
 		fail "the list is kept, but the old release number could not be forgotten"
 	echo "system-update: this unit is keyed; its list is $said"
 	"$RELEASE" list --keys "$HELD.new"
@@ -350,7 +428,7 @@ unkey)
 	at_the_bench "unkeying a unit"
 	alone
 	rm -rf "$STATE"
-	/usr/sbin/durable-run sh -c 'rm -f "$1" "$1.part" "$2" && sync' sh "$KEYS" "$FLOOR" > /dev/null ||
+	/usr/sbin/durable-run sh -c 'rm -f "$1" "$1.part" "$2" "$3" "$3.part" && sync' sh "$KEYS" "$FLOOR" "$CURRENT" > /dev/null ||
 		fail "the list could not be removed; nothing is changed"
 	look
 	echo "system-update: this unit holds no list of keys (mark $MARK). While it is marked it takes nothing" \
@@ -472,7 +550,7 @@ cancel)
 *)
 	echo "usage: system-update status | release ENVELOPE | stage IMAGE SHA256 [--unsigned] |" >&2
 	echo "       stage-loader IMAGE SHA256 [--unsigned] | confirm | cancel |" >&2
-	echo "       keys | rotate ENVELOPE | first ENVELOPE | unkey" >&2
+	echo "       keys | rotate ENVELOPE | first ENVELOPE | unkey | current ENVELOPE" >&2
 	exit 2
 	;;
 esac
