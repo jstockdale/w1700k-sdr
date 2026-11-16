@@ -271,25 +271,7 @@ static const char *parse_list(const uint8_t *text, size_t size, struct list *lis
 	return NULL;
 }
 
-/* The list in the file at `path`. HELD_NONE is no file at all. */
-static enum held read_list(const char *path, struct list *list, const char **why)
-{
-	static uint8_t text[LIST_MOST + 1];
-	size_t size;
-	FILE *file = fopen(path, "rb");
-
-	*why = "it cannot be read";
-	if (!file)
-		return errno == ENOENT ? HELD_NONE : HELD_DAMAGED;
-	size = fread(text, 1, sizeof text, file);
-	if (ferror(file)) {
-		fclose(file);
-		return HELD_DAMAGED;
-	}
-	fclose(file);
-	*why = parse_list(text, size, list);
-	return *why ? HELD_DAMAGED : HELD_GOOD;
-}
+static enum held read_list(const char *path, struct list *list, const char **why);
 
 /* The list a unit holds, or the exit status and the word for having none that reads. */
 static int held_list(const char *path, struct list *list)
@@ -519,11 +501,20 @@ static bool same_authorities(const struct list *held, const struct list *next)
 	return in_held == in_next;
 }
 
-static int rotate(const char *keys_path, bool first, const char *out, const char *path)
+enum judged { TAKEN, UNCHANGED, REFUSED };
+
+/* Why a list is refused, said only where there is someone to say it to: a list offered
+ * (`from` names its file) and not one of the lists a unit keeps, which it reads silently. */
+#define SAY(...) do { if (from) fprintf(stderr, __VA_ARGS__); } while (0)
+
+/* Is the envelope in `envelope`, `length` long, a list that follows `held`, or with no
+ * `held` a first list? The list goes to `next` and the key that sealed it to `by`. */
+static enum judged judge(const struct list *held, long length, struct list *next, const struct key **by,
+			 const char *from)
 {
-	static struct list held, next;
 	const struct key *signer = NULL;
-	const struct list *judges = first ? &next : &held;
+	const struct list *judges = held ? held : next;
+	bool first = !held;
 	size_t body_length, message;
 	const uint8_t *body;
 	const char *why;
@@ -534,42 +525,28 @@ static int rotate(const char *keys_path, bool first, const char *out, const char
 	wms2_hdr header;
 	wms2_rc rc;
 	uint64_t counter;
-	char mark[17];
-	long length;
 
-	if (!first) {
-		int status = held_list(keys_path, &held);
-
-		if (status)
-			return status;
-	}
-	length = read_envelope(path, "a list of keys");
-	if (length < 0)
-		return length == -1 ? 2 : 1;
 	if (length < WMS2_HDR_LEN + WMS2_SIG_LEN + 1 || memcmp(envelope, "WMS2", 4) != 0 || !plain_header()) {
-		fprintf(stderr, "w1700k-release: %s is not a list of keys sealed for %s\n", path, RELEASE_PRODUCT);
-		return 1;
+		SAY("w1700k-release: %s is not a list of keys sealed for %s\n", from, RELEASE_PRODUCT);
+		return REFUSED;
 	}
-	why = parse_list(envelope + WMS2_HDR_LEN, (size_t)length - WMS2_HDR_LEN - WMS2_SIG_LEN, &next);
+	why = parse_list(envelope + WMS2_HDR_LEN, (size_t)length - WMS2_HDR_LEN - WMS2_SIG_LEN, next);
 	if (why) {
-		fprintf(stderr, "w1700k-release: what %s seals is not a key list: %s\n", path, why);
-		return 1;
+		SAY("w1700k-release: what %s seals is not a key list: %s\n", from, why);
+		return REFUSED;
 	}
 	counter = 0;
 	for (int i = 7; i >= 0; i--)
 		counter = counter << 8 | envelope[22 + i];
-	if (counter != next.generation) {
-		fprintf(stderr, "w1700k-release: not a list this unit takes: the envelope's counter is %llu and "
-			"the list says generation %llu\n", (unsigned long long)counter,
-			(unsigned long long)next.generation);
-		return 1;
+	if (counter != next->generation) {
+		SAY("w1700k-release: not a list this unit takes: the envelope's counter is %llu and "
+		    "the list says generation %llu\n", (unsigned long long)counter,
+		    (unsigned long long)next->generation);
+		return REFUSED;
 	}
 	/* The list held, whoever hands it over and however it is sealed, changes nothing. */
-	if (!first && next.size == held.size && memcmp(next.text, held.text, held.size) == 0) {
-		printf("generation=%llu.%llu unchanged\n", (unsigned long long)held.epoch,
-		       (unsigned long long)held.generation);
-		return 0;
-	}
+	if (!first && next->size == held->size && memcmp(next->text, held->text, held->size) == 0)
+		return UNCHANGED;
 	/* Sealed by a key that may seal a list: of the list held, or, for a first list,
 	 * a root key the list names itself. Only of what is so sealed is anything more said. */
 	message = signed_bytes(ROTATE_TOPIC, (size_t)length);
@@ -581,57 +558,201 @@ static int rotate(const char *keys_path, bool first, const char *out, const char
 			signer = key;
 	}
 	if (!signer) {
-		fprintf(stderr, first ? "w1700k-release: a first list is sealed by a root key it names itself; "
-					"this one is not\n"
-				      : "w1700k-release: not sealed by a root or keys key of the list this unit "
-					"holds (%llu.%llu)\n", (unsigned long long)held.epoch,
-			(unsigned long long)held.generation);
-		return 1;
+		if (first)
+			SAY("w1700k-release: a first list is sealed by a root key it names itself; this one is not\n");
+		else
+			SAY("w1700k-release: not sealed by a root or keys key of the list this unit "
+			    "holds (%llu.%llu)\n", (unsigned long long)held->epoch,
+			    (unsigned long long)held->generation);
+		return REFUSED;
 	}
 	rc = wms2_verify(envelope, (size_t)length, ROTATE_TOPIC, NULL, signer->public, scratch, sizeof scratch,
 			 0, &replay, &policy, &header, &body, &body_length);
-	if (rc != WMS2_OK || header.ctr != next.generation) {
-		fprintf(stderr, "w1700k-release: not a list this unit takes (%s)\n", wms2_rc_str(rc));
-		return 1;
+	if (rc != WMS2_OK || header.ctr != next->generation) {
+		SAY("w1700k-release: not a list this unit takes (%s)\n", wms2_rc_str(rc));
+		return REFUSED;
 	}
-	if (!first && next.epoch == held.epoch && next.generation == held.generation) {
-		fprintf(stderr, "w1700k-release: this is ANOTHER list %llu.%llu than the one this unit holds, and "
-			"%s sealed it: two lists were sealed as one. Nothing is changed\n",
-			(unsigned long long)held.epoch, (unsigned long long)held.generation, signer->name);
-		return 1;
+	*by = signer;
+	if (first)
+		return TAKEN;
+	if (next->epoch == held->epoch && next->generation == held->generation) {
+		SAY("w1700k-release: this is ANOTHER list %llu.%llu than the one this unit holds, and "
+		    "%s sealed it: two lists were sealed as one. Nothing is changed\n",
+		    (unsigned long long)held->epoch, (unsigned long long)held->generation, signer->name);
+		return REFUSED;
 	}
-	if (!first && (next.epoch < held.epoch || (next.epoch == held.epoch && next.generation < held.generation))) {
-		fprintf(stderr, "w1700k-release: list %llu.%llu is older than %llu.%llu, which this unit holds\n",
-			(unsigned long long)next.epoch, (unsigned long long)next.generation,
-			(unsigned long long)held.epoch, (unsigned long long)held.generation);
-		return 1;
+	if (next->epoch < held->epoch || (next->epoch == held->epoch && next->generation < held->generation)) {
+		SAY("w1700k-release: list %llu.%llu is older than %llu.%llu, which this unit holds\n",
+		    (unsigned long long)next->epoch, (unsigned long long)next->generation,
+		    (unsigned long long)held->epoch, (unsigned long long)held->generation);
+		return REFUSED;
 	}
-	if (!first && next.epoch == held.epoch && !same_authorities(&held, &next)) {
-		fprintf(stderr, "w1700k-release: this list changes a root or keys line and stays in epoch %llu: "
-			"only the first list of the next epoch, sealed by a root key, may change one\n",
-			(unsigned long long)held.epoch);
-		return 1;
+	if (next->epoch == held->epoch && !same_authorities(held, next)) {
+		SAY("w1700k-release: this list changes a root or keys line and stays in epoch %llu: "
+		    "only the first list of the next epoch, sealed by a root key, may change one\n",
+		    (unsigned long long)held->epoch);
+		return REFUSED;
 	}
-	if (!first && next.epoch != held.epoch) {
+	if (next->epoch != held->epoch) {
 		if (signer->scope != SCOPE_ROOT) {
-			fprintf(stderr, "w1700k-release: %s is a keys key, and this list is of another epoch: "
-				"only a root key of the list held starts one\n", signer->name);
-			return 1;
+			SAY("w1700k-release: %s is a keys key, and this list is of another epoch: "
+			    "only a root key of the list held starts one\n", signer->name);
+			return REFUSED;
 		}
-		if (next.epoch != held.epoch + 1 || next.generation != 1) {
-			fprintf(stderr, "w1700k-release: after epoch %llu comes list %llu.1 and no other; this is "
-				"%llu.%llu\n", (unsigned long long)held.epoch, (unsigned long long)held.epoch + 1,
-				(unsigned long long)next.epoch, (unsigned long long)next.generation);
-			return 1;
+		if (next->epoch != held->epoch + 1 || next->generation != 1) {
+			SAY("w1700k-release: after epoch %llu comes list %llu.1 and no other; this is "
+			    "%llu.%llu\n", (unsigned long long)held->epoch, (unsigned long long)held->epoch + 1,
+			    (unsigned long long)next->epoch, (unsigned long long)next->generation);
+			return REFUSED;
 		}
 	}
-	if (write_file(out, next.text, next.size) != 0) {
+	return TAKEN;
+}
+
+/* A unit keeps its list as the sealed envelopes that bear it out, not as text it would have
+ * to believe: the first list it was given, which a root key it names sealed; the list that
+ * began each epoch since, which a root key of the epoch before sealed; and the list it holds
+ * now, if that is a later one of its epoch, which a root or keys key of that epoch sealed.
+ * (A list within an epoch cannot change a root or keys line, so the one that began the epoch
+ * vouches for every later one of it, and the ones between need not be kept.) Every read
+ * walks them all, by the rules a rotation is held to. So what is on flash is a list this
+ * unit was once shown the seals of, or it is no list: nothing altered there reads as one.
+ *
+ * The file: CHAIN_MAGIC, then each envelope behind its length, four bytes, low byte first. */
+#define CHAIN_MAGIC "w1700k-sdr key chain 1\n"
+#define CHAIN_MOST (2u << 20)
+
+static long chain_keep;		/* how much of the file last read a list that follows it keeps */
+
+/* The list the chain in the file at `path` bears out. HELD_NONE is no file at all. */
+static enum held read_list(const char *path, struct list *list, const char **why)
+{
+	static struct list lists[2];
+	const struct list *held = NULL;
+	const struct key *by;
+	char magic[sizeof CHAIN_MAGIC - 1];
+	uint8_t prefix[4];
+	long at, length, links = 0;
+	size_t got;
+	FILE *file = fopen(path, "rb");
+
+	*why = "it cannot be read";
+	if (!file)
+		return errno == ENOENT ? HELD_NONE : HELD_DAMAGED;
+	if (fread(magic, 1, sizeof magic, file) != sizeof magic || memcmp(magic, CHAIN_MAGIC, sizeof magic) != 0) {
+		*why = "it is not a list kept with its seals (a list from before they were kept is given "
+		       "again at the bench)";
+		goto damaged;
+	}
+	for (;;) {
+		struct list *next = &lists[links & 1];
+
+		at = ftell(file);
+		got = fread(prefix, 1, sizeof prefix, file);
+		if (got == 0 && feof(file))
+			break;
+		length = (long)prefix[0] | (long)prefix[1] << 8 | (long)prefix[2] << 16 | (long)prefix[3] << 24;
+		*why = "it is cut short";
+		if (got != sizeof prefix || prefix[3] || length > RELEASE_ENVELOPE_MOST ||
+		    fread(envelope, 1, (size_t)length, file) != (size_t)length)
+			goto damaged;
+		*why = "a list in it is not borne out by its seal and the list before it";
+		if (judge(held, length, next, &by, NULL) != TAKEN)
+			goto damaged;
+		/* What a later list keeps of this file: all of it, but not a list that
+		 * neither began its epoch nor is the first, which the later one replaces. */
+		chain_keep = held && next->epoch == held->epoch ? at : at + (long)sizeof prefix + length;
+		held = next;
+		links++;
+	}
+	*why = "it holds no list";
+	if (!held || ferror(file) || at > (long)CHAIN_MOST)
+		goto damaged;
+	fclose(file);
+	*list = *held;
+	return HELD_GOOD;
+damaged:
+	fclose(file);
+	return HELD_DAMAGED;
+}
+
+static int rotate(const char *keys_path, bool first, const char *out, const char *path)
+{
+	static struct list held, next;
+	const struct key *signer = NULL;
+	uint8_t *chain;
+	size_t kept = sizeof CHAIN_MAGIC - 1, size;
+	char mark[17];
+	long length;
+	int status = 2;
+
+	if (!first) {
+		status = held_list(keys_path, &held);
+		if (status)
+			return status;
+		kept = (size_t)chain_keep;
+	}
+	length = read_envelope(path, "a list of keys");
+	if (length < 0)
+		return length == -1 ? 2 : 1;
+	switch (judge(first ? NULL : &held, length, &next, &signer, path)) {
+	case UNCHANGED:
+		printf("generation=%llu.%llu unchanged\n", (unsigned long long)held.epoch,
+		       (unsigned long long)held.generation);
+		return 0;
+	case REFUSED:
+		return 1;
+	default:
+		break;
+	}
+	/* What is kept: the envelopes that still bear the new list out, and its own. */
+	size = kept + 4 + (size_t)length;
+	chain = malloc(size);
+	if (!chain || size > CHAIN_MOST) {
+		fprintf(stderr, "w1700k-release: the lists this unit keeps would be too long with this one\n");
+		free(chain);
+		return 2;
+	}
+	if (first) {
+		memcpy(chain, CHAIN_MAGIC, kept);
+	} else {
+		FILE *file = fopen(keys_path, "rb");
+
+		if (!file || fread(chain, 1, kept, file) != kept) {
+			fprintf(stderr, "w1700k-release: cannot read %s again\n", keys_path);
+			if (file)
+				fclose(file);
+			free(chain);
+			return 2;
+		}
+		fclose(file);
+	}
+	chain[kept] = (uint8_t)length;
+	chain[kept + 1] = (uint8_t)(length >> 8);
+	chain[kept + 2] = (uint8_t)(length >> 16);
+	chain[kept + 3] = 0;
+	memcpy(chain + kept + 4, envelope, (size_t)length);
+	status = write_file(out, chain, size);
+	free(chain);
+	if (status != 0) {
 		fprintf(stderr, "w1700k-release: cannot write %s\n", out);
 		return 2;
 	}
 	fingerprint(signer->public, mark);
 	printf("generation=%llu.%llu sealed_by=%s scope=%s key=%s\n", (unsigned long long)next.epoch,
 	       (unsigned long long)next.generation, signer->name, scope_names[signer->scope], mark);
+	return 0;
+}
+
+/* The list held, as the text that was sealed. */
+static int text_of(const char *keys_path)
+{
+	static struct list list;
+	int status = held_list(keys_path, &list);
+
+	if (status)
+		return status;
+	fwrite(list.text, 1, list.size, stdout);
 	return 0;
 }
 
@@ -759,6 +880,8 @@ int main(int argc, char **argv)
 		return rotate(keys, first, out, operand);
 	if (!strcmp(verb, "list") && !operand)
 		return show(keys);
+	if (!strcmp(verb, "text") && !operand)
+		return text_of(keys);
 	if (!strcmp(verb, "mark") && !operand && environment)
 		return marked(environment);
 	if (!strcmp(verb, "allows") && operand)
@@ -773,6 +896,7 @@ usage:
 	fprintf(stderr, "usage: w1700k-release verify [--keys FILE] [--state DIR] [--floor N] ENVELOPE\n"
 			"       w1700k-release rotate [--keys FILE] [--first] --out FILE ENVELOPE\n"
 			"       w1700k-release list [--keys FILE]\n"
+			"       w1700k-release text [--keys FILE]\n"
 			"       w1700k-release mark --environment FILE\n"
 			"       w1700k-release allows [--state DIR] SHA256\n"
 			"       w1700k-release number [--state DIR]\n");

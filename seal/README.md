@@ -54,7 +54,9 @@ signed.
 ## A list of keys
 
 What a unit trusts is a list, kept in its durable storage (`/durable/keys`),
-where no update reaches it:
+where no update reaches it. It is kept sealed: not as text the unit would have
+to believe, but as the envelopes that bear it out, which every read checks
+again (below, "What a unit keeps"). A list reads:
 
 ```
 w1700k-sdr keys 2.3
@@ -98,6 +100,38 @@ gives both the same lists):
 
 A list with no `release` key is a list: a unit that holds it takes no release
 until a later list gives it one.
+
+### What a unit keeps
+
+A unit does not keep its list as text. It keeps the sealed envelopes that bear
+the list out, and reads the list from them every time, by the rules a rotation
+is held to (`read_list` in `release.c`):
+
+- the first list it was given, which a `root` key it names sealed;
+- the list that began each epoch since, which a `root` key of the epoch before
+  sealed;
+- the list it holds now, if that is a later one of its epoch, which a `root`
+  or `keys` key of that epoch sealed.
+
+A list within an epoch cannot change a `root` or `keys` line, so the list that
+began the epoch vouches for every later one of it, and the ones between are
+not kept: within an epoch the file does not grow, however many lists come.
+
+So what is on flash is a list this unit was once shown the seals of, or it is
+no list. One bit wrong anywhere in it, a list altered into another that still
+reads, lists out of order or one left out: each leaves the unit with no list,
+which is a unit that takes nothing sealed until the bench gives it one again
+(tests: every bit, and every length it can be cut to). The file is the line
+`w1700k-sdr key chain 1`, then each envelope behind its length, four bytes,
+low byte first.
+
+Two things this does not do. Somebody else's lists, whole and well sealed, are
+a list too: the first one is believed because a root key it names sealed it,
+which is all a first list ever has, so whoever can write a unit's storage can
+still give it a list of their own. That is what the keyed mark and the bench
+are for. And a file cut back to where an earlier list ended reads as that
+earlier list, one this unit did hold; nothing on the unit says which was the
+last.
 
 ## What a unit takes
 
