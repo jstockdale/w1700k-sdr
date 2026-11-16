@@ -1,4 +1,7 @@
 # SPDX-License-Identifier: MIT
-# Key-only root login. A provisioned unit carries its host key in the image;
-# without one, Dropbear generates a key per boot in /var/run/dropbear.
-DROPBEAR_ARGS="-s -r /etc/dropbear/dropbear_ed25519_host_key"
+# Key-only root login, with the host keys w1700k-hostkey put in place at start-up: the unit's own
+# as its loader handed them over, or one made for this boot. They are in RAM; no root holds one.
+DROPBEAR_ARGS="-s"
+for key in /etc/dropbear/dropbear_*_host_key; do
+	[ ! -r "$key" ] || DROPBEAR_ARGS="$DROPBEAR_ARGS -r $key"
+done

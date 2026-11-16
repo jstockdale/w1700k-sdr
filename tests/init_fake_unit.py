@@ -501,3 +501,16 @@ class FakeUnit:
 
     def linux__usr_sbin_verify_storage(self, line, words):
         return 'W1700K_STORAGE_READY', 0
+
+    # The unit's ssh host key (w1700k-hostkey): one for this boot until it is kept; `host_loader`
+    # is what the loader said of host keys, `silent` for one from before them.
+    HOST_KEY = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGEgZmFrZSB1bml0IGhvc3Qga2V5LCAzMiBieXRlcyEh'
+    host_loader, host_kept = 'none', False
+
+    def linux__usr_sbin_w1700k_hostkey(self, line, words):
+        if words[1] == 'status':
+            return (f'hostkey={"lasting" if self.host_kept else "temporary"}\nloader={self.host_loader}\n'
+                    f'hostkey {self.HOST_KEY}'), 0
+        assert words[1:] == ['keep'], line
+        self.host_kept = True
+        return f'durable-open: /durable mounted from mtd6\nhostkey {self.HOST_KEY}\ndurable-close: /durable closed', 0
