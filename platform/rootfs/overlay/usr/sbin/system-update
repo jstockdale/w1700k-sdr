@@ -40,10 +40,9 @@
 # that; a unit has no clock, so the number is all it can hold a release to. One thing passes
 # without being in a manifest, and says so:
 #   --unsigned       the owner's own build. Whoever can run this as root owns the unit.
-# A release's root goes to every unit as it is: nothing of a unit is in its root (its login keys
-# and its ssh host key are in durable storage), so the root is checked here like the loader. A
-# root the host made for one unit, with network settings of its own in it, is a build of the
-# owner's and goes as one.
+# A release's root goes to every unit as it is: nothing of a unit is in its root (its login
+# keys, its ssh host key and its network settings are in durable storage), so the root is
+# checked here like the loader.
 #
 # The list changes in one way: `rotate`, with a list of a higher generation sealed by a root
 # or keys key of the list held. No update carries a list, so a key that seals releases cannot
@@ -341,7 +340,8 @@ release)
 keys)
 	look
 	[ "$LIST" = good ] || fail "this unit holds no list of keys that reads ($LIST)"
-	cat "$HELD"
+	# (An older verifier, as a unit not yet updated has, keeps the list as its text.)
+	"$RELEASE" text --keys "$HELD" 2>/dev/null || cat "$HELD"
 	;;
 rotate)
 	envelope=${2:-}
