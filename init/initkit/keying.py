@@ -27,6 +27,11 @@ MARK = 'w1700k_keyed'
 CHUNK = 40      # bytes to a line: the console's line discipline holds a line of 4096 characters
 
 
+def in_order(envelopes):
+    """Sealed lists as a unit is given them: by epoch, and in an epoch by generation."""
+    return sorted(envelopes, key=lambda envelope: seal.parse_list(seal.body_of(envelope)).stamp)
+
+
 def put(console, path, data):
     """Write `data` to `path` on the unit through its console, and check what arrived."""
     command(console, f': > {path}', limit=20, strict=False)
