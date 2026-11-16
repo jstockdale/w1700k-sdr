@@ -35,7 +35,8 @@ saveenv() {
     for name in update_tried update_failed loader_tried loader_failed loader_booted; do
         eval "[ -z \"\${$name+x}\" ]" || eval "echo \"$name=\$$name\""
     done > "$M/saved"
-    for name in update_new update_old update_file update_want update_got loader_new loader_kind key_line key_on gps_v serial_number efr32_v efr32_keep efr32_port gps_keep gps_port; do
+    for name in update_new update_old update_file update_want update_got loader_new loader_kind key_line key_on gps_v serial_number efr32_v efr32_keep efr32_port gps_keep gps_port \
+            host_ed25519 host_ecdsa; do
         eval "[ -z \"\${$name+x}\" ]" || { echo "saved a scratch variable: $name" >> "$M/log"; }
     done
 }
@@ -180,7 +181,7 @@ bootm() {
     prep) [ "$stage" = fdt ] || return 1; stage=prep; prepared=$bootargs; return 0 ;;
     go)
         [ "$stage" = prep ] || return 1
-        for name in key_line key_on gps_v serial_number efr32_v efr32_keep efr32_port gps_keep gps_port; do
+        for name in key_line key_on gps_v serial_number efr32_v efr32_keep efr32_port gps_keep gps_port host_ed25519 host_ecdsa; do
             eval "[ -z \"\${$name+x}\" ]" || note "left a scratch variable: $name"
         done
         echo "$prepared" >> "$M/bootargs"
@@ -288,8 +289,8 @@ class LoaderUpdate(Model):
         self.assertTrue(bootcmd.endswith('iminfo ${loadaddr} && run system_start'))
         start = (self.model / 'env' / 'system_start').read_text()
         self.assertEqual(start, 'if bootm start ${loadaddr}#${bootconf} && bootm loados && bootm ramdisk && bootm fdt; '
-                                'then run board_pass; run efr32_give; run gps_give; bootm prep && bootm go; fi',
-                         "the same boot, a stage at a time, with the board's name put in, and the low-power "
+                                'then run host_pass; run board_pass; run efr32_give; run gps_give; bootm prep && bootm go; fi',
+                         "the same boot, a stage at a time, with the host keys and the board's name put in, and the low-power "
                          "radio's port and the GPS receiver's where each is kept on, before the last two")
 
     def test_nothing_staged_nothing_written(self):
@@ -1026,6 +1027,7 @@ class KeySlot(Model):
     storage to find it."""
     KEY = 'ssh-ed25519:AAAAC3NzaC1lZDI1NTE5AAAAIHRoaXMgaXMgbm90IGEgcmVhbCBrZXksIGJ1dCBvaw=='
     PLAIN = 'console=ttyS0,115200 earlycon panic=5 ro rdinit=/init ubi.mtd=system ubi.block=0,rootfs'
+    NO_HOST = ' w1700k.hostkey=none'
 
     def slot(self, on, key=KEY):
         directory = self.model / 'durable' / 'key'
@@ -1045,27 +1047,27 @@ class KeySlot(Model):
         return rest
 
     def test_no_slot_is_said_to_be_empty(self):
-        self.assertEqual(self.bootargs(), self.PLAIN + ' w1700k.keyslot=empty')
+        self.assertEqual(self.bootargs(), self.PLAIN + ' w1700k.keyslot=empty' + self.NO_HOST)
         (self.model / 'durable' / 'key').mkdir()
-        self.assertEqual(self.bootargs(), self.PLAIN + ' w1700k.keyslot=empty', 'a directory without the file')
+        self.assertEqual(self.bootargs(), self.PLAIN + ' w1700k.keyslot=empty' + self.NO_HOST, 'a directory without the file')
 
     def test_a_key_that_is_on_is_handed_over(self):
         self.slot(1)
-        self.assertEqual(self.bootargs(), f'{self.PLAIN} w1700k.keyslot=on w1700k.key={self.KEY}')
+        self.assertEqual(self.bootargs(), f'{self.PLAIN} w1700k.keyslot=on w1700k.key={self.KEY}{self.NO_HOST}')
 
     def test_a_key_that_is_off_stays_in_the_slot(self):
         self.slot(0)
         args = self.bootargs()
-        self.assertEqual(args, self.PLAIN + ' w1700k.keyslot=off')
+        self.assertEqual(args, self.PLAIN + ' w1700k.keyslot=off' + self.NO_HOST)
         self.assertNotIn('AAAA', args)
 
     def test_every_boot_reads_the_slot_anew(self):
         self.slot(1)
         self.assertIn('w1700k.keyslot=on', self.bootargs())
         self.slot(0)
-        self.assertEqual(self.bootargs(), self.PLAIN + ' w1700k.keyslot=off')
+        self.assertEqual(self.bootargs(), self.PLAIN + ' w1700k.keyslot=off' + self.NO_HOST)
         shutil.rmtree(self.model / 'durable' / 'key')
-        self.assertEqual(self.bootargs(), self.PLAIN + ' w1700k.keyslot=empty')
+        self.assertEqual(self.bootargs(), self.PLAIN + ' w1700k.keyslot=empty' + self.NO_HOST)
 
     def test_the_key_is_handed_over_beside_an_update_and_never_saved(self):
         self.slot(1)
@@ -1073,22 +1075,111 @@ class KeySlot(Model):
         args = self.bootargs()
         self.assertIn('write rootfs', self.lines)
         self.assertIn('saveenv', self.lines)
-        self.assertEqual(args, f'{self.PLAIN} w1700k.keyslot=on w1700k.key={self.KEY}')
+        self.assertEqual(args, f'{self.PLAIN} w1700k.keyslot=on w1700k.key={self.KEY}{self.NO_HOST}')
         self.assertNotIn('key', ' '.join(self.saved()))
         self.settle()
-        self.assertEqual(self.bootargs(), f'{self.PLAIN} w1700k.keyslot=on w1700k.key={self.KEY}')
+        self.assertEqual(self.bootargs(), f'{self.PLAIN} w1700k.keyslot=on w1700k.key={self.KEY}{self.NO_HOST}')
 
     def test_storage_that_cannot_be_read_hands_over_no_key(self):
         self.slot(1)
         (self.model / 'durable').rename(self.model / 'durable.gone')
-        self.assertEqual(self.bootargs(), self.PLAIN + ' w1700k.keyslot=empty')
+        self.assertEqual(self.bootargs(), self.PLAIN + ' w1700k.keyslot=empty' + self.NO_HOST)
 
     def test_the_second_loader_hands_it_over_when_it_boots_the_system(self):
         self.slot(1)
         (self.model / 'loaderb').write_bytes(b'FIT:W1700K SDR second ARM loader\nthe second loader\nEND\n')
         args = self.bootargs()
         self.assertIn('the second loader starts', self.lines)
-        self.assertEqual(args, f'{self.PLAIN} w1700k.keyslot=on w1700k.key={self.KEY}')
+        self.assertEqual(args, f'{self.PLAIN} w1700k.keyslot=on w1700k.key={self.KEY}{self.NO_HOST}')
+
+
+class HostKeys(KeySlot):
+    """The unit's ssh host keys (durable `ssh/host`, written by w1700k-hostkey): the loader reads
+    them at every boot and puts them into the device tree it hands to Linux, under names only
+    root can read there. They are private keys: nothing of them goes on the kernel command line,
+    which the kernel logs."""
+    ED25519 = '0000000b7373682d6564323535313900000040' + 'a1' * 64
+    ECDSA = '0000001365636473612d736861322d6e69737470323536' + 'b2' * 110
+    HANDED = ' w1700k.hostkey=handed'
+    test_no_slot_is_said_to_be_empty = test_a_key_that_is_on_is_handed_over = None
+    test_a_key_that_is_off_stays_in_the_slot = test_every_boot_reads_the_slot_anew = None
+    test_the_key_is_handed_over_beside_an_update_and_never_saved = None
+    test_storage_that_cannot_be_read_hands_over_no_key = None
+    test_the_second_loader_hands_it_over_when_it_boots_the_system = None
+
+    def keys(self, text):
+        directory = self.model / 'durable' / 'ssh'
+        directory.mkdir(exist_ok=True)
+        (directory / 'host').write_text(text)
+
+    def chosen(self):
+        path = self.model / 'chosen'
+        handed = dict(line.split('=', 1) for line in path.read_text().splitlines()) if path.exists() else {}
+        self.assertEqual(handed.pop('w1700k,board'), self.board, 'the board, named the same in both places')
+        return handed
+
+    def test_a_unit_without_keys_is_told_so(self):
+        self.assertEqual(self.bootargs(), self.PLAIN + ' w1700k.keyslot=empty' + self.NO_HOST)
+        self.assertEqual(self.chosen(), {})
+        (self.model / 'durable' / 'ssh').mkdir()
+        self.assertTrue(self.bootargs().endswith(self.NO_HOST), 'a directory without the file')
+        self.keys('')
+        self.assertTrue(self.bootargs().endswith(self.NO_HOST), 'an empty file')
+        self.assertEqual(self.chosen(), {})
+
+    def test_a_key_goes_into_the_tree_and_not_onto_the_command_line(self):
+        self.keys(f'host_ed25519={self.ED25519}\n')
+        args = self.bootargs()
+        self.assertEqual(args, self.PLAIN + ' w1700k.keyslot=empty' + self.HANDED)
+        self.assertEqual(self.chosen(), {'security-w1700k-host-ed25519': self.ED25519})
+        self.assertNotIn('a1a1', args)
+
+    def test_a_key_of_each_kind_goes_in_under_its_own_name(self):
+        self.keys(f'host_ecdsa={self.ECDSA}\nhost_ed25519={self.ED25519}\n')
+        self.assertTrue(self.bootargs().endswith(self.HANDED))
+        self.assertEqual(self.chosen(), {'security-w1700k-host-ed25519': self.ED25519,
+                                         'security-w1700k-host-ecdsa': self.ECDSA})
+        self.keys(f'host_ecdsa={self.ECDSA}\n')
+        self.assertTrue(self.bootargs().endswith(self.HANDED))
+        self.assertEqual(self.chosen(), {'security-w1700k-host-ecdsa': self.ECDSA})
+
+    def test_nothing_else_in_the_file_reaches_the_loader(self):
+        self.keys(f'bootargs=init=/bin/sh\nbootconf=conf-other\nloadaddr=0\nkey_line=ssh-ed25519:AAAA\nkey_on=1\n'
+                  f'host_rsa=00\nhost_ed25519={self.ED25519}\n')
+        self.assertEqual(self.bootargs(), self.PLAIN + ' w1700k.keyslot=empty' + self.HANDED)
+        self.assertEqual(self.chosen(), {'security-w1700k-host-ed25519': self.ED25519})
+
+    def test_every_boot_reads_them_anew_and_none_is_saved(self):
+        self.keys(f'host_ed25519={self.ED25519}\n')
+        self.stage(self.NEW, self.OLD)
+        self.assertTrue(self.bootargs().endswith(self.HANDED))
+        self.assertIn('write rootfs', self.lines)
+        self.assertIn('saveenv', self.lines)
+        self.assertEqual(self.chosen(), {'security-w1700k-host-ed25519': self.ED25519})
+        self.assertNotIn('host', ' '.join(self.saved()))
+        self.settle()
+        (self.model / 'durable' / 'ssh' / 'host').unlink()
+        self.assertTrue(self.bootargs().endswith(self.NO_HOST))
+        self.assertEqual(self.chosen(), {})
+
+    def test_the_keys_and_the_login_slot_are_handed_over_together(self):
+        self.slot(1)
+        self.keys(f'host_ed25519={self.ED25519}\n')
+        self.assertEqual(self.bootargs(), f'{self.PLAIN} w1700k.keyslot=on w1700k.key={self.KEY}{self.HANDED}')
+        self.assertEqual(self.chosen(), {'security-w1700k-host-ed25519': self.ED25519})
+
+    def test_storage_that_cannot_be_read_hands_over_none(self):
+        self.keys(f'host_ed25519={self.ED25519}\n')
+        (self.model / 'durable').rename(self.model / 'durable.gone')
+        self.assertTrue(self.bootargs().endswith(self.NO_HOST))
+        self.assertEqual(self.chosen(), {})
+
+    def test_the_second_loader_hands_them_over_when_it_boots_the_system(self):
+        self.keys(f'host_ed25519={self.ED25519}\n')
+        (self.model / 'loaderb').write_bytes(b'FIT:W1700K SDR second ARM loader\nthe second loader\nEND\n')
+        self.assertTrue(self.bootargs().endswith(self.HANDED))
+        self.assertIn('the second loader starts', self.lines)
+        self.assertEqual(self.chosen(), {'security-w1700k-host-ed25519': self.ED25519})
 
 
 if __name__ == '__main__':

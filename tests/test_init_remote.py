@@ -27,6 +27,23 @@ def proc_mtd(geometry=None):
         f'mtd{n}: {size:08x} 00020000 "{name}"\n' for n, (name, (_, size)) in enumerate(geometry.items()))
 
 
+HOST_KEY_CALLS = ('sh -s -- keep', 'cat /proc/cmdline')
+
+
+def host_key_answer(unit, command, data):
+    """What a unit answers about its ssh host key, or None for another command. `hostkey_kept`:
+    (status, output) of `w1700k-hostkey keep`, run from this tree's copy; `hostkey_said`: what
+    its loader says on the kernel command line, None for a loader from before host keys."""
+    if command == 'sh -s -- keep':
+        assert data == remote.HOSTKEY.read_bytes(), 'the host-key program is sent as this tree has it'
+        return getattr(unit, 'hostkey_kept', (0, 'durable-open: /durable mounted from mtd6\n'
+                                                 'hostkey ssh-ed25519 AAAAHOST\ndurable-close: /durable closed\n'))
+    if command == 'cat /proc/cmdline':
+        said = getattr(unit, 'hostkey_said', 'handed')
+        return 0, 'console=ttyS0,115200 ro w1700k.keyslot=empty' + (f' w1700k.hostkey={said}' if said else '') + '\n'
+    return None
+
+
 class Unit:
     """A unit as remote.Link reaches it. `takes`: the loader writes a staged root; `boots`: the
     new root comes up; a root that does not is undone when the operator power-cycles, which the
@@ -54,6 +71,8 @@ class Unit:
             if self.down:
                 return 255, ''
         self.calls.append(command)
+        if host_key_answer(self, command, data):
+            return host_key_answer(self, command, data)
         if command == '/usr/sbin/w1700k-keyslot status':
             keyslot = getattr(self, 'keyslot', None)
             return (0, keyslot) if keyslot else (127, 'sh: /usr/sbin/w1700k-keyslot: not found\n')
@@ -117,7 +136,7 @@ class Remote(unittest.TestCase):
         self.now = 0.0
         for patcher in (mock.patch.object(config, 'require_images'),
                         mock.patch.object(config, 'pick_unit', return_value='SERIAL'),
-                        mock.patch.object(provision, 'provision', return_value=(self.image, 'key')),
+                        mock.patch.object(provision, 'provision', return_value=self.image),
                         mock.patch('builtins.print')):
             self.printed = patcher.start()
             self.addCleanup(patcher.stop)
@@ -132,7 +151,7 @@ class Remote(unittest.TestCase):
 
     def verbs(self, unit):
         return [c.split()[3] if c.startswith('sh -s') else c.split()[0] for c in unit.calls
-                if c not in ('true', 'cat /proc/mtd')]
+                if c not in ('true', 'cat /proc/mtd') + HOST_KEY_CALLS]
 
     def test_the_new_root_is_staged_written_by_the_loader_checked_and_confirmed(self):
         unit = Unit()
@@ -144,6 +163,35 @@ class Remote(unittest.TestCase):
         self.assertIn('runs and is confirmed', self.said())
         unit.reboot()
         self.assertEqual((unit.running, unit.tried), (self.new, ''), 'and it stays')
+
+    def test_the_units_host_key_is_kept_on_the_unit_before_a_root_without_one_is_staged(self):
+        unit = Unit()
+        self.assertEqual(self.run_update(unit), 0)
+        calls = [c for c in unit.calls if c != 'true']
+        self.assertLess(calls.index('sh -s -- keep'), calls.index('sh -s -- stage /work/system-update.squashfs ' + self.new))
+        self.assertLess(calls.index('cat /proc/cmdline'), calls.index('sh -s -- stage /work/system-update.squashfs ' + self.new))
+
+    def test_a_root_is_not_sent_to_a_unit_whose_key_could_not_be_kept(self):
+        for kept in ((1, 'w1700k-hostkey: the host keys could not be written\n'),
+                     (0, 'durable-open: /durable mounted from mtd6\ndurable-close: /durable closed\n')):
+            unit = Unit()
+            unit.hostkey_kept = kept
+            with self.subTest(kept=kept), self.assertRaisesRegex(StepFailed, 'host key'):
+                self.run_update(unit)
+            self.assertEqual((unit.staged, unit.running), ('', OLD))
+            self.assertNotIn('stage', self.verbs(unit))
+
+    def test_a_root_alone_is_not_sent_under_a_loader_that_hands_no_host_key_over(self):
+        unit = Unit()
+        unit.hostkey_said = None                # a loader from before host keys left the root
+        with self.assertRaisesRegex(StepFailed, 'does not hand the unit.s ssh host key to the system.*init/flash --ssh'):
+            self.run_update(unit)
+        self.assertEqual((unit.staged, unit.running), ('', OLD), 'it would come up as another unit, and be undone')
+        self.assertNotIn('stage', self.verbs(unit))
+        for said in ('handed', 'none'):
+            unit = Unit()
+            unit.hostkey_said = said
+            self.assertEqual(self.run_update(unit), 0)
 
     def test_a_root_with_no_login_key_goes_to_a_unit_that_has_its_own_key(self):
         unit = Unit()
@@ -250,6 +298,8 @@ class LoaderUnit:
             if self.down:
                 return 255, ''
         self.calls.append(command)
+        if host_key_answer(self, command, data):
+            return host_key_answer(self, command, data)
         if command == '/usr/sbin/w1700k-keyslot status':
             keyslot = getattr(self, 'keyslot', None)
             return (0, keyslot) if keyslot else (127, 'sh: /usr/sbin/w1700k-keyslot: not found\n')
@@ -332,7 +382,7 @@ class RemoteLoader(unittest.TestCase):
 
     def verbs(self, unit):
         return [c.split()[3] if c.startswith('sh -s') else c.split()[0] for c in unit.calls
-                if c not in ('true', 'cat /proc/mtd')]
+                if c not in ('true', 'cat /proc/mtd') + HOST_KEY_CALLS]
 
     def test_the_new_loader_is_staged_started_checked_and_confirmed(self):
         unit = LoaderUnit()
@@ -405,6 +455,8 @@ class JointUnit:
             else:
                 return 255, ''
         self.calls.append(command)
+        if host_key_answer(self, command, data):
+            return host_key_answer(self, command, data)
         if command == '/usr/sbin/w1700k-keyslot status':
             keyslot = getattr(self, 'keyslot', None)
             return (0, keyslot) if keyslot else (127, 'sh: /usr/sbin/w1700k-keyslot: not found\n')
@@ -483,7 +535,7 @@ class RemoteJoint(unittest.TestCase):
         def provisioned(directory, key, address=None, generic=None, no_login_key=False):
             self.provisioned.append(Path(generic).read_bytes() if generic else None)
             self.no_login_key = no_login_key
-            return self.root_image, 'key'
+            return self.root_image
         for patcher in (mock.patch.object(config, 'require_images'),
                         mock.patch.object(config, 'pick_unit', return_value='SERIAL'),
                         mock.patch.object(config, 'LOADER_B', self.loader_image),
@@ -503,7 +555,7 @@ class RemoteJoint(unittest.TestCase):
 
     def verbs(self, unit):
         return [c.split()[3] if c.startswith('sh -s') else c.split()[0] for c in unit.calls
-                if c not in ('true', 'cat /proc/mtd')]
+                if c not in ('true', 'cat /proc/mtd') + HOST_KEY_CALLS]
 
     def test_both_are_staged_and_one_reboot_brings_up_both(self):
         unit = JointUnit()
@@ -514,6 +566,31 @@ class RemoteJoint(unittest.TestCase):
         self.assertEqual((unit.staged, unit.lstaged), ('', ''))
         self.assertIn(f'loader {self.loader[:12]} and root {self.root[:12]} run and are confirmed', self.said())
         self.assertEqual(self.provisioned, [None], "this build's root, with the unit's keys")
+
+    def test_a_root_goes_with_the_loader_that_will_hand_its_host_key_over(self):
+        unit = JointUnit()
+        unit.hostkey_said = None                # the loader it runs now knows nothing of host keys
+        self.assertEqual(self.run_update(unit), 0)
+        calls = [c for c in unit.calls if c != 'true']
+        self.assertLess(calls.index('sh -s -- keep'), calls.index('cat > /work/system-update.loader.part && mv '
+                                                                  '/work/system-update.loader.part /work/system-update.loader'),
+                        'the key is in durable storage before anything is staged')
+        self.assertEqual((unit.running, unit.second), (self.root, self.loader))
+
+    def test_a_root_without_its_loader_needs_one_that_hands_the_key_over(self):
+        unit = JointUnit()
+        unit.second, unit.lbooted = self.loader, self.loader      # the loader is this build's already,
+        unit.hostkey_said = None                                    # yet says nothing: it cannot be
+        with self.assertRaisesRegex(StepFailed, 'does not hand'):
+            self.run_update(unit)
+        self.assertEqual((unit.staged, unit.lstaged, unit.running), ('', '', OLD))
+
+    def test_a_loader_alone_asks_nothing_of_host_keys(self):
+        unit = JointUnit()
+        unit.running = self.root
+        unit.hostkey_kept = (1, 'must not be asked\n')
+        self.assertEqual(self.run_update(unit), 0)
+        self.assertNotIn('sh -s -- keep', unit.calls)
 
     def test_both_with_no_login_key_only_where_the_unit_has_its_own(self):
         unit = JointUnit()

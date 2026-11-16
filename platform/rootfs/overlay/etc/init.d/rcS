@@ -28,6 +28,9 @@ insmod /lib/modules/w1700k_sdr.ko || {
 }
 # The front LED says what the unit is doing from here on (it needs the driver).
 [ -c /dev/w1700k-sdr ] && /usr/sbin/w1700k-led /dev/w1700k-sdr < /dev/null > /dev/null 2>&1 &
+# Who the unit is to a host that logs in: its ssh host keys as the loader handed them over from
+# durable storage, or a key for this boot when it handed over none.
+/usr/sbin/w1700k-hostkey boot || status=W1700K_BOOT_DEGRADED
 # Root's login keys: the one built into this root, if any, and the paperclip key's slot as the
 # loader handed it over. The reset button is watched from inittab (w1700k-keyslot serve).
 /usr/sbin/w1700k-keyslot boot || status=W1700K_BOOT_DEGRADED

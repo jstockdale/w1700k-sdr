@@ -31,6 +31,7 @@ BUILT_IN=${W1700K_KEYSLOT_BUILT_IN:-/.lower/root/.ssh/authorized_keys}
 CMDLINE=${W1700K_KEYSLOT_CMDLINE:-/proc/cmdline}
 HOST_KEY=${W1700K_KEYSLOT_HOST_KEY:-/etc/dropbear/dropbear_ed25519_host_key.pub}
 DURABLE_RUN=${W1700K_KEYSLOT_DURABLE_RUN:-/usr/sbin/durable-run}
+HOSTKEY=${W1700K_KEYSLOT_HOSTKEY:-/usr/sbin/w1700k-hostkey}
 SLOT_DIR=${W1700K_KEYSLOT_DIR:-/durable/key}
 
 fail() { echo "w1700k-keyslot: $*" >&2; exit 1; }
@@ -96,6 +97,9 @@ program)
 		echo "slot: written"' "$key")
 	[ "$written" = written ] || fail "the slot could not be written"
 	apply on "$(persist)" "$key"
+	# A unit that has only a key for this boot keeps it from here on: the host is about to be
+	# told this key, and a hand is on the unit. One that has its own is left as it is.
+	[ ! -x "$HOSTKEY" ] || "$HOSTKEY" keep > /dev/null 2>&1 || :
 	host=
 	[ ! -r "$HOST_KEY" ] || host=$(cut -d' ' -f1,2 "$HOST_KEY" | tr ' ' ':')
 	echo "persist=$(persist) hostkey=$host"
