@@ -54,14 +54,14 @@ def main():
     parser.add_argument('--no-boot', action='store_true',
                         help='stay at the loader prompt afterwards')
     parser.add_argument('--unit', metavar='SERIAL',
-                        help='the unit whose keys go into the root (default: the only '
-                             'known unit)')
+                        help='the unit to update (default: the only known unit)')
     parser.add_argument('--authorized-key', metavar='FILE',
                         default=settings['authorized_key'],
-                        help='SSH public key for root logins')
+                        help='SSH public key to log in with; over the console, the key given to a '
+                             'unit whose list of login keys is empty')
     parser.add_argument('--no-login-key', action='store_true',
-                        help='build no login key into the root: the unit takes its key from its '
-                             'reset button alone (init/key)')
+                        help='give the unit no login key and carry none across from a root that '
+                             'had one built in: it takes one from its reset button alone (init/key)')
     args = parser.parse_args()
     targets = (args.system, args.fit, args.rootfs, args.loader, args.durable)
     if args.bundle and (args.ssh or args.recovery or args.detect_only or args.no_boot or any(targets)):
