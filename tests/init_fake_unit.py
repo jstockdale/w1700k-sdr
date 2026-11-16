@@ -511,6 +511,19 @@ class FakeUnit:
     HOST_KEY = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGEgZmFrZSB1bml0IGhvc3Qga2V5LCAzMiBieXRlcyEh'
     host_loader, host_kept = 'none', False
 
+    # The unit's login keys (w1700k-login): `logins` is the list, `login_loader` what the loader
+    # said of it, and `put_files` what the host wrote into the unit's RAM over the console.
+    login_loader = 'none'
+
+    def linux__usr_sbin_w1700k_login(self, line, words):
+        logins = self.__dict__.setdefault('logins', [])
+        if words[1] == 'status':
+            return f'login={len(logins)}\nloader={self.login_loader}', 0
+        assert words[1:3] == ['add', '<'], line
+        kind, body, *comment = self.__dict__.get('put_files', {})[words[3]].decode().split()
+        logins.append(((comment or ['key'])[0].lower(), kind, body))
+        return '\n'.join(f'login {name} {kind} {body}' for name, kind, body in logins), 0
+
     def linux__usr_sbin_w1700k_hostkey(self, line, words):
         if words[1] == 'status':
             return (f'hostkey={"lasting" if self.host_kept else "temporary"}\nloader={self.host_loader}\n'

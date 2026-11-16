@@ -1,19 +1,20 @@
 # SPDX-License-Identifier: MIT
-"""The unit's own root filesystem: the built root plus its login key and network.
+"""The root filesystem a unit is sent, and what this host knows a unit by.
 
-The built rootfs.squashfs is the same for every unit and lets nobody log in.
-This adds, for one unit, the public key allowed to log in as root and, if
-present, the unit's own network.conf. The result is written to UBI volume
-`rootfs` in place of the generic image.
+The built rootfs.squashfs is the same for every unit, and a unit is sent it as
+it is. Only a unit whose directory holds a network.conf of its own gets a root
+made for it, the built one with that file in it.
 
-The unit's ssh host key is not in its root. The unit makes it and keeps it in
-its durable storage (w1700k-hostkey on the unit); the host knows only its
-public half, as the unit told it over the serial console when it was installed.
+Who may log in and who the unit is are not in its root. The login keys are a
+list in the unit's durable storage (w1700k-login on the unit), to which the
+installer adds one. The unit's ssh host key is made on the unit and kept there
+too (w1700k-hostkey); this host knows only its public half, as the unit said
+it over the serial console when it was installed.
 
     unit directory (see config.py)
       known_hosts                 the unit's host key, public half
       network.conf                optional; replaces /etc/w1700k/network.conf
-      rootfs.squashfs             the unit's root, rebuilt by every install/update
+      rootfs.squashfs             only with a network.conf: the root made for the unit
       dropbear_ed25519_host_key   only from before host keys left the root: the
                                   key an older root of this unit carried
 """
@@ -28,7 +29,6 @@ import tempfile
 from . import config, paperclip
 
 HOST_KEY = 'dropbear_ed25519_host_key'
-LOGIN_KEY = 'login-key'         # in the unit directory: the fingerprint of the key in its root, or `none'
 KNOWN_HOSTS = 'known_hosts'
 NETWORK = 'network.conf'
 IMAGE = 'rootfs.squashfs'
@@ -127,11 +127,9 @@ def authorized_key(path=None):
                          'or create ~/.ssh/id_ed25519.pub')
 
 
-def private_files(unit_directory, public_key):
-    """{path in the root: (bytes, mode)} for one unit."""
+def private_files(unit_directory):
+    """{path in the root: (bytes, mode)} for one unit: its own network settings, if it has any."""
     files = {}
-    if public_key is not None:              # None: no login key in the root (--no-login-key)
-        files['root/.ssh/authorized_keys'] = (public_key, 0o600)
     network = Path(unit_directory) / NETWORK
     if network.is_file():
         files['etc/w1700k/network.conf'] = (network.read_bytes(), 0o644)
@@ -157,7 +155,7 @@ def _write(tree, name, data, mode):
         parent.chmod(saved)
 
 
-def build(unit_directory, public_key, generic=config.ROOTFS,
+def build(unit_directory, files, generic=config.ROOTFS,
           tools=config.SQUASHFS_TOOLS):
     """Write the unit's rootfs.squashfs into its directory and return the path."""
     unsquashfs, mksquashfs = tools / 'unsquashfs', tools / 'mksquashfs'
@@ -170,7 +168,7 @@ def build(unit_directory, public_key, generic=config.ROOTFS,
         tree = Path(temporary) / 'root'
         subprocess.run([str(unsquashfs), '-no-xattrs', '-quiet', '-no-progress', '-d',
                         str(tree), str(generic)], check=True, stdout=subprocess.DEVNULL)
-        for name, (data, mode) in private_files(unit_directory, public_key).items():
+        for name, (data, mode) in files.items():
             _write(tree, name, data, mode)
         env = dict(os.environ, TZ='UTC', LC_ALL='C')
         env.pop('SOURCE_DATE_EPOCH', None)
@@ -186,23 +184,20 @@ def build(unit_directory, public_key, generic=config.ROOTFS,
     return output
 
 
-def provision(unit_directory, authorized_key_path=None, address='192.168.1.1',
-              generic=None, no_login_key=False, say=print):
-    """Build the unit's root (from `generic`, default this build's); returns the image's path.
+def provision(unit_directory, address='192.168.1.1', generic=None):
+    """The root for one unit, from `generic` (default this build's); returns its path.
 
-    With `no_login_key` the root has no login key built in: the unit takes its key from its reset
-    button alone (init/key). What the root carries is noted in the unit's directory, and a root
-    with a key made for a unit whose last one had none is said, since that is easily done by
-    leaving the option out."""
+    Nothing of a unit is in its root but its own network settings, if its directory holds a
+    `network.conf`. Without one the unit's root is the generic root itself, byte for byte, and
+    that is what is returned: the root a release's manifest names, which the unit can check.
+    The login keys and the unit's ssh host key are in the unit's durable storage."""
     unit_directory = Path(unit_directory)
     unit_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     legacy_known_host(unit_directory, address)
-    key = None if no_login_key else authorized_key(authorized_key_path)
-    image = build(unit_directory, key, **({'generic': generic} if generic else {}))
-    carries = 'none' if key is None else paperclip.fingerprint(key.split()[1].decode())
-    note = unit_directory / LOGIN_KEY
-    if key is not None and note.is_file() and note.read_text().strip() == 'none':
-        say(f'note: this root has a login key built in ({carries}); the last one made for this unit '
-            'had none (--no-login-key)')
-    note.write_text(carries + '\n')
-    return image
+    generic = Path(generic) if generic else config.ROOTFS
+    files = private_files(unit_directory)
+    if not files:
+        if not generic.exists():
+            raise ProvisionError(f'{generic} is missing; run `make`')
+        return generic
+    return build(unit_directory, files, generic=generic)

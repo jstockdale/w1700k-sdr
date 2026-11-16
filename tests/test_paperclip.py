@@ -581,7 +581,7 @@ class Slot(unittest.TestCase):
                        'echo "durable-close: /durable closed"\nexit $status\n')
         run.chmod(0o755)
         self.env = dict(os.environ, W1700K_KEYSLOT_RUN=str(self.dir / 'run'), W1700K_KEYSLOT_KEYS=str(self.dir / 'root/.ssh/authorized_keys'),
-                        W1700K_KEYSLOT_BUILT_IN=str(self.dir / 'built-in'), W1700K_KEYSLOT_CMDLINE=str(self.dir / 'cmdline'),
+                        W1700K_KEYSLOT_LIST=str(self.dir / 'built-in'), W1700K_KEYSLOT_CMDLINE=str(self.dir / 'cmdline'),
                         W1700K_KEYSLOT_HOST_KEY=str(self.dir / 'host.pub'), W1700K_KEYSLOT_DURABLE_RUN=str(run),
                         W1700K_KEYSLOT_DIR=str(self.dir / 'durable/key'),
                         W1700K_KEYSLOT_HOSTKEY=str(self.dir / 'w1700k-hostkey'))
@@ -777,47 +777,40 @@ class AcrossAReboot(test_loader_update.Model):
 
 @unittest.skipUnless((config.SQUASHFS_TOOLS / 'unsquashfs').exists() and config.ROOTFS.exists(),
                      'needs the built root and squashfs tools (make)')
-class NoLoginKey(unittest.TestCase):
-    """init/install, init/flash and init/provision --no-login-key: a unit's root with no key
-    built in, for a unit that takes its key from its reset button alone. Not the default."""
+class OneRoot(unittest.TestCase):
+    """The root a unit is sent (init/provision): the built one as it is, the same for every unit.
+    Who may log in and who the unit is are in the unit's durable storage, not in its root."""
     def setUp(self):
         self.dir = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.dir)
-        (self.dir / 'k.pub').write_text(ed25519(4) + ' installer\n')
-        self.said = []
 
-    def root(self, **options):
-        image = provision.provision(self.dir / 'unit', self.dir / 'k.pub', say=self.said.append, **options)
+    def listing(self, image):
         listing = subprocess.run([str(config.SQUASHFS_TOOLS / 'unsquashfs'), '-l', str(image)],
                                  capture_output=True, text=True, check=True).stdout
         return {line.split('squashfs-root/', 1)[1] for line in listing.splitlines() if 'squashfs-root/' in line}
 
-    def test_by_default_the_installers_key_is_built_in(self):
-        self.assertIn('root/.ssh/authorized_keys', self.root())
-        self.assertEqual((self.dir / 'unit/login-key').read_text().strip(), paperclip.fingerprint(ed25519(4).split()[1]))
+    def test_a_unit_is_sent_the_built_root_itself(self):
+        image = provision.provision(self.dir / 'unit')
+        self.assertEqual(Path(image), config.ROOTFS, 'not a copy and not a rebuild: the file a release names')
+        self.assertFalse((self.dir / 'unit' / provision.IMAGE).exists())
+        other = self.dir / 'another-build.squashfs'
+        other.write_bytes(config.ROOTFS.read_bytes())
+        self.assertEqual(Path(provision.provision(self.dir / 'unit', generic=other)), other)
 
-    def test_with_the_option_the_root_has_no_login_key_and_everything_else(self):
-        with_key, without = self.root(), self.root(no_login_key=True)
-        self.assertEqual(with_key - without, {'root/.ssh/authorized_keys', 'root/.ssh'})
-        self.assertFalse({name for name in with_key if 'host_key' in name}, 'no root holds a host key')
-        self.assertIn('usr/sbin/w1700k-hostkey', without, 'the unit has its own, from its durable storage')
-        self.assertIn('usr/sbin/w1700k-key', without, 'and the button that gives it a login key')
-        self.assertEqual((self.dir / 'unit/login-key').read_text().strip(), 'none')
-        self.assertEqual(self.said, [])
+    def test_the_built_root_holds_nobodys_keys_and_the_programs_that_take_them_from_storage(self):
+        names = self.listing(config.ROOTFS)
+        self.assertFalse({name for name in names if 'authorized_keys' in name or 'host_key' in name})
+        for program in ('usr/sbin/w1700k-login', 'usr/sbin/w1700k-hostkey', 'usr/sbin/w1700k-keyslot', 'usr/sbin/w1700k-key'):
+            self.assertIn(program, names)
 
-    def test_no_key_file_is_needed_for_it(self):
-        (self.dir / 'k.pub').unlink()
-        self.assertNotIn('root/.ssh/authorized_keys', self.root(no_login_key=True))
-
-    def test_a_key_built_in_after_a_root_without_one_is_said(self):
-        self.root(no_login_key=True)
-        self.root(no_login_key=True)
-        self.assertEqual(self.said, [])
-        self.root()
-        self.assertEqual(len(self.said), 1)
-        self.assertIn('the last one made for this unit had none', self.said[0])
-        self.root()
-        self.assertEqual(len(self.said), 1, 'said once, when it changes')
+    def test_only_network_settings_of_its_own_get_a_unit_a_root_made_for_it(self):
+        directory = self.dir / 'unit'
+        directory.mkdir()
+        (directory / provision.NETWORK).write_text('MGMT_IF=lan4\nMGMT_ADDRESS=10.0.0.1/24\n')
+        image = provision.provision(directory)
+        self.assertEqual(Path(image), directory / provision.IMAGE)
+        self.assertNotEqual(Path(image).read_bytes(), config.ROOTFS.read_bytes())
+        self.assertEqual(self.listing(image), self.listing(config.ROOTFS), 'the same files; one of them is the unit\'s')
 
 
 class Unit:

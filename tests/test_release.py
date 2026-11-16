@@ -1012,7 +1012,7 @@ class UpdateScript(Scripted):
                 damage()
                 self.assertEqual(self.kinds()[:2], ('lost', kind))
                 for refused in (self.release(7), self.stage('stage-loader', LOADER_IMAGE),
-                                self.stage('stage', NEW_ROOT), self.stage('stage', NEW_ROOT, '--from-release'),
+                                self.stage('stage', NEW_ROOT),
                                 self.give('rotate', rotation(a_list(2), ROOT_KEY))):
                     self.assertEqual(refused.returncode, 1)
                     self.assertIn('was given a list of keys and holds none that reads', refused.stderr)
@@ -1091,17 +1091,19 @@ class UpdateScript(Scripted):
         self.assertIn('release 7', self.update('confirm').stdout)
         self.assertEqual(self.state_of()['release'], '7')
 
-    def test_a_units_own_root_is_taken_from_a_release_and_says_it_is_not_checked(self):
-        refused = self.stage('stage', UNIT_ROOT, '--from-release')
-        self.assertEqual(refused.returncode, 1, 'no release was verified')
+    def test_a_root_no_release_names_is_taken_on_nobodys_word_but_the_owners(self):
+        """A root went to a unit "as built by the host from the release" once, unchecked, while
+        each unit's root had its own keys in it. Nothing of a unit is in its root now."""
         self.release(7)
-        self.assertEqual(self.stage('stage', UNIT_ROOT).returncode, 1, 'not in the manifest, and no word')
-        result = self.stage('stage', UNIT_ROOT, '--from-release')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('built by the host from release 7; it is not checked here', result.stderr)
-        self.assertRegex((self.dir / 'durable/update/release').read_text(), r'^7 [0-9a-f]{64}\n$')
-        loader = self.stage('stage-loader', LOADER_IMAGE, '--from-release')
-        self.assertEqual(loader.returncode, 1, 'a loader is the same for every unit: it is in the manifest or not')
+        self.assertEqual(self.stage('stage', UNIT_ROOT).returncode, 1, 'not in the manifest')
+        for word in ('--from-release', '--trust-me'):
+            refused = self.stage('stage', UNIT_ROOT, word)
+            self.assertEqual(refused.returncode, 1)
+            self.assertIn('takes releases', refused.stderr)
+        self.assertFalse((self.dir / 'durable/update').exists(), 'nothing was staged')
+        owned = self.stage('stage', UNIT_ROOT, '--unsigned')
+        self.assertEqual(owned.returncode, 0, owned.stderr)
+        self.assertIn("on the owner's word", owned.stderr)
 
     # -- the list itself ------------------------------------------------------------------
 
@@ -1288,7 +1290,7 @@ class UpdateScript(Scripted):
         self.assertEqual(self.give('rotate', rotation(new, KEYS_KEY)).returncode, 0)
         self.assertEqual(self.state_of()['release_verified'], '', 'the key that sealed it is no longer one')
         self.assertEqual(self.stage('stage-loader', LOADER_IMAGE).returncode, 1)
-        self.assertEqual(self.stage('stage', UNIT_ROOT, '--from-release').returncode, 1)
+        self.assertEqual(self.stage('stage', UNIT_ROOT).returncode, 1)
         self.assertEqual(self.release(7, signing(STRANGER)[1]).returncode, 0)
         self.assertEqual(self.release(8).returncode, 1, 'sealed by the key that was replaced')
         self.assertEqual(self.state_of()['release_verified'], '', 'a refusal leaves nothing verified')

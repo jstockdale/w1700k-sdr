@@ -57,7 +57,7 @@ def run(settings, expect_serial=None, authorized_key=None,
         config.require_images(config.LOADER, config.DUMPER, config.SYSTEM_FIT,
                               config.ROOTFS, *config.DURABLES)
         if not no_login_key:
-            provision.authorized_key(authorized_key)   # fail before touching the unit
+            login_key = provision.authorized_key(authorized_key)   # fail before touching the unit
     with open_session(settings, 'install', write=not backup_only) as session:
         console, log = session.console, session.log
         # Stock's own boot is seen, for the vendor pool it reports.
@@ -94,8 +94,7 @@ def run(settings, expect_serial=None, authorized_key=None,
             print(f'install: backup {existing}; stopping as asked (--backup-only)')
             return 0
 
-        rootfs = provision.provision(directory, authorized_key, address=settings.device_ip,
-                                     no_login_key=no_login_key)
+        rootfs = provision.provision(directory, address=settings.device_ip)
 
         print('install: writing our loader')
         unit.to_stock(console, log, 'dumper')
@@ -114,6 +113,10 @@ def run(settings, expect_serial=None, authorized_key=None,
         # comes to know it.
         print('install: the unit keeps the ssh host key it made')
         host_keys = provision.known_host(directory, settings.device_ip, steps.host_keys(session) or [])
+        if not no_login_key:
+            # Who may log in is a list the unit keeps; this installer's key is the first in it.
+            named = steps.add_login_key(session, login_key)
+            print(f'install: your key is in the unit\'s login keys, as "{named}"')
     login = (f'Log in with: ssh root@{settings.device_ip}' if not no_login_key else
              'It has no login key: give it one with its reset button (init/key)')
     print(f'install: done; {status}. {login}\n'
