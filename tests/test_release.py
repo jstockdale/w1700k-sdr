@@ -1856,7 +1856,11 @@ class Issued(unittest.TestCase):
     SINCE = (('1.2', 'w1700k-sdr-authority-dev-primary', 'keys',
               {'w1700k-sdr-release-dev-primary-2': ('2329d353dd0bdf1e', '9b4bb84c85625393',
                                                     '171ad9a8413e4b0ab70072dba9398c76500767b9dade4c5a251f1b02c4ec1d5a'
-                                                    '9b21bd4f44da629586b49ec2541ddf615f85e179ec3ef5e6167512228d757909')}),)
+                                                    '9b21bd4f44da629586b49ec2541ddf615f85e179ec3ef5e6167512228d757909')}),
+             ('2.1', 'w1700k-sdr-authority-dev-backup', 'root',
+              {'w1700k-sdr-authority-dev-primary-2': ('14c5025409ff981f', 'dfa58a73a9d764e9',
+                                                      '4a4ce35bda324daaf0f717dbaa5b0c2768caa0484d9be6a6c297d003f5805694'
+                                                      '4611df442a9f32f29d1beda8dbefef87016fc6912637d01bf3793aa1971a0104')}))
 
     def chain(self):
         sealed = [path.read_bytes() for path in self.CHAIN.glob('*.wms2')]
@@ -1892,6 +1896,10 @@ class Issued(unittest.TestCase):
                                      (unit_print, registry))
                     self.assertTrue(seal.verifies(key.public, message, bytes.fromhex(proof)), name)
                 held = following
+        self.assertEqual([(key.name, key.scope) for key in held.keys],
+                         [('w1700k-sdr-authority-dev-backup', 'root'), ('w1700k-sdr-authority-dev-primary-2', 'keys'),
+                          ('w1700k-sdr-release-dev-primary-2', 'release'), ('w1700k-sdr-release-dev-spare', 'release')],
+                         'what a development unit holds today')
 
     def test_each_release_key_proved_it_is_held_twice(self):
         self.assertEqual(hashlib.sha256(self.PROOF).hexdigest(),
