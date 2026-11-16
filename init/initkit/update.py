@@ -37,6 +37,7 @@ def run(settings, serial=None, fit=False, rootfs=False, durable=False, loader=Fa
         if not no_login_key:
             login_key = provision.authorized_key(authorized_key)       # fail before touching the unit
         image = provision.provision(config.unit_dir(settings.data_dir, serial), address=settings.device_ip)
+        network = provision.network_settings(config.unit_dir(settings.data_dir, serial))
     with open_session(settings, 'flash', write=not recovery) as session:
         console, log = session.console, session.log
         state = unit.identify(console, log)
@@ -84,6 +85,10 @@ def run(settings, serial=None, fit=False, rootfs=False, durable=False, loader=Fa
         if rootfs:
             host_keys(session, config.unit_dir(settings.data_dir, serial), settings.device_ip)
             login_keys(session, login_key)
+            if network and steps.network_settings(session, network):
+                print(f'flash: the unit has its own network settings ({" ".join(network)}); starting it on them')
+                unit.to_installed_loader(console, log, 'linux')
+                status = steps.boot_installed(session)
     print(f'flash: done; {status}')
     return 0
 

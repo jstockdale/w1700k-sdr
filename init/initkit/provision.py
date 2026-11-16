@@ -1,41 +1,36 @@
 # SPDX-License-Identifier: MIT
 """The root filesystem a unit is sent, and what this host knows a unit by.
 
-The built rootfs.squashfs is the same for every unit, and a unit is sent it as
-it is. Only a unit whose directory holds a network.conf of its own gets a root
-made for it, the built one with that file in it.
+The built rootfs.squashfs is the same for every unit, and every unit is sent it
+as it is. Nothing of a unit is in its root:
 
-Who may log in and who the unit is are not in its root. The login keys are a
-list in the unit's durable storage (w1700k-login on the unit), to which the
-installer adds one. The unit's ssh host key is made on the unit and kept there
-too (w1700k-hostkey); this host knows only its public half, as the unit said
-it over the serial console when it was installed.
+- Who may log in is a list in the unit's durable storage (w1700k-login on the
+  unit), to which the installer adds one key.
+- Who the unit is, its ssh host key, is made on the unit and kept there
+  (w1700k-hostkey). This host knows only the public half, as the unit said it
+  over the serial console when it was installed.
+- A unit's own network settings are kept there too (w1700k-network). They come
+  from a `network.conf` in the unit's directory here, which the tools send.
 
     unit directory (see config.py)
       known_hosts                 the unit's host key, public half
-      network.conf                optional; replaces /etc/w1700k/network.conf
-      rootfs.squashfs             only with a network.conf: the root made for the unit
+      network.conf                optional: the unit's own network settings
       dropbear_ed25519_host_key   only from before host keys left the root: the
                                   key an older root of this unit carried
 """
 import base64
 import hashlib
-import os
 from pathlib import Path
+import re
 import struct
-import subprocess
-import tempfile
 
 from . import config, paperclip
 
 HOST_KEY = 'dropbear_ed25519_host_key'
 KNOWN_HOSTS = 'known_hosts'
 NETWORK = 'network.conf'
-IMAGE = 'rootfs.squashfs'
-# The options Buildroot uses for the generic image (128 KiB blocks, zstd).
-MKSQUASHFS_OPTIONS = ['-noappend', '-processors', '1', '-b', '128K', '-comp', 'zstd',
-                      '-Xcompression-level', '22', '-all-root', '-repro-time', '0',
-                      '-no-progress', '-exit-on-error']
+NETWORK_NAMES = ('MGMT_IF', 'MGMT_ADDRESS', 'EXPORT_IF', 'EXPORT_ADDRESS', 'EXPORT_MTU')
+NETWORK_VALUE = re.compile(r'[A-Za-z0-9._/-]{1,32}')        # one word; the unit holds it to more
 KEY_TYPES = (b'ssh-ed25519', b'ecdsa-sha2-nistp256', b'ecdsa-sha2-nistp384',
              b'ecdsa-sha2-nistp521', b'ssh-rsa')
 
@@ -127,77 +122,35 @@ def authorized_key(path=None):
                          'or create ~/.ssh/id_ed25519.pub')
 
 
-def private_files(unit_directory):
-    """{path in the root: (bytes, mode)} for one unit: its own network settings, if it has any."""
-    files = {}
-    network = Path(unit_directory) / NETWORK
-    if network.is_file():
-        files['etc/w1700k/network.conf'] = (network.read_bytes(), 0o644)
-    return files
-
-
-def _write(tree, name, data, mode):
-    """Write one file into the unpacked root, keeping its directories' modes."""
-    path = tree / name
-    missing = [parent for parent in reversed(path.relative_to(tree).parents)
-               if not (tree / parent).exists()]
-    for parent in missing:
-        (tree / parent).mkdir(mode=0o700 if parent.name in ('.ssh', 'dropbear') else 0o755)
-    parent = path.parent
-    saved = parent.stat().st_mode & 0o7777
-    parent.chmod(saved | 0o700)
-    try:
-        if path.is_symlink() or path.exists():
-            path.unlink()
-        path.write_bytes(data)
-        path.chmod(mode)
-    finally:
-        parent.chmod(saved)
-
-
-def build(unit_directory, files, generic=config.ROOTFS,
-          tools=config.SQUASHFS_TOOLS):
-    """Write the unit's rootfs.squashfs into its directory and return the path."""
-    unsquashfs, mksquashfs = tools / 'unsquashfs', tools / 'mksquashfs'
-    for path in (generic, unsquashfs, mksquashfs):
-        if not Path(path).exists():
-            raise ProvisionError(f'{path} is missing; run `make`')
-    unit_directory = Path(unit_directory)
-    output = unit_directory / IMAGE
-    with tempfile.TemporaryDirectory(prefix='w1700k-root-', dir=unit_directory) as temporary:
-        tree = Path(temporary) / 'root'
-        subprocess.run([str(unsquashfs), '-no-xattrs', '-quiet', '-no-progress', '-d',
-                        str(tree), str(generic)], check=True, stdout=subprocess.DEVNULL)
-        for name, (data, mode) in files.items():
-            _write(tree, name, data, mode)
-        env = dict(os.environ, TZ='UTC', LC_ALL='C')
-        env.pop('SOURCE_DATE_EPOCH', None)
-        partial = Path(temporary) / IMAGE
-        subprocess.run([str(mksquashfs), str(tree), str(partial), *MKSQUASHFS_OPTIONS],
-                       env=env, check=True, stdout=subprocess.DEVNULL)
-        if partial.read_bytes()[:4] != b'hsqs':
-            raise ProvisionError('mksquashfs did not produce a SquashFS image')
-        if partial.stat().st_size > config.partitions.ROOTFS_VOLUME_BYTES:
-            raise ProvisionError('the unit root does not fit its volume')
-        partial.chmod(0o600)
-        partial.replace(output)
-    return output
+def network_settings(unit_directory):
+    """The unit's own network settings as its directory states them: the NAME=VALUE words of its
+    `network.conf`, or [] when it has none and runs on the defaults."""
+    path = Path(unit_directory) / NETWORK
+    if not path.is_file():
+        return []
+    words = []
+    for line in path.read_text().splitlines():
+        line = line.split('#', 1)[0].strip()
+        if not line:
+            continue
+        name, equals, value = line.partition('=')
+        if not equals or name not in NETWORK_NAMES or not NETWORK_VALUE.fullmatch(value):
+            raise ProvisionError(f'{path}: not a setting ({", ".join(NETWORK_NAMES)}) and its value: {line[:60]!r}')
+        words.append(f'{name}={value}')
+    return words
 
 
 def provision(unit_directory, address='192.168.1.1', generic=None):
-    """The root for one unit, from `generic` (default this build's); returns its path.
+    """The root a unit is sent: the built one (`generic`, default this build's), as it is. Returns
+    its path.
 
-    Nothing of a unit is in its root but its own network settings, if its directory holds a
-    `network.conf`. Without one the unit's root is the generic root itself, byte for byte, and
-    that is what is returned: the root a release's manifest names, which the unit can check.
-    The login keys and the unit's ssh host key are in the unit's durable storage."""
+    Nothing of a unit is in its root: its login keys, its ssh host key and its network settings
+    are in its durable storage. So this is the root a release's manifest names, the same for
+    every unit, and the unit can check it. What is done here is for the unit's directory."""
     unit_directory = Path(unit_directory)
     unit_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     legacy_known_host(unit_directory, address)
     generic = Path(generic) if generic else config.ROOTFS
-    files = private_files(unit_directory)
-    if not files:
-        if not generic.exists():
-            raise ProvisionError(f'{generic} is missing; run `make`')
-        return generic
-    return build(unit_directory, files, generic=generic)
+    if not generic.exists():
+        raise ProvisionError(f'{generic} is missing; run `make`')
+    return generic
