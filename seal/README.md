@@ -14,7 +14,8 @@ as `/usr/sbin/w1700k-release`.
 `development/` is not code: it is Whitehat Hardware's development lists of keys,
 each as it was sealed, oldest first. The first, 1.1 of 2026-11-15, names the
 development root, the development keys key and two development release keys;
-1.2 replaces the first release key, sealed by the keys key.
+1.2 replaces the first release key, sealed by the keys key; 2.1 replaces the
+keys key, sealed by the root, and starts the second epoch.
 A test holds the chain to what was issued: the keys, their fingerprints, and
 who sealed each list. These keys seal development releases; no unit that ships
 holds them. `init/bench key --carry seal/development` keys a development unit
