@@ -756,6 +756,281 @@ static int text_of(const char *keys_path)
 	return 0;
 }
 
+/* ---- what is current ---------------------------------------------------------------
+ *
+ * A unit has no clock and no network: it takes the newest list and release it has been
+ * given, so whoever delivers to it decides where its keys stop. A statement says what is
+ * current, for one domain: the list, the newest release, when it was sealed and until when
+ * it is good. A timestamp key seals it, which seals nothing a unit installs. The host, which
+ * has a clock, holds it to its dates. A unit cannot; what it does is keep the newest
+ * statement it was shown, sealed, and read it by its seal as it reads its list. Once that
+ * names a newer list than the unit holds, the unit takes no release until it holds it
+ * (system-update does the refusing). So keeping a list from a unit stops working the first
+ * time the unit meets a host that does not.
+ *
+ * One form, byte for byte, as init/initkit/seal.py has it:
+ *
+ *   w1700k-sdr current 7
+ *   domain development
+ *   list 2.2 <64 hex>
+ *   release 5 <64 hex>
+ *   sealed 1794816426827
+ *   until 1794902826827
+ */
+struct statement {
+	uint64_t number, epoch, generation, release, sealed, until;
+	char domain[17], list[65], manifest[65];
+};
+
+static bool literal(const uint8_t **at, const uint8_t *end, const char *text)
+{
+	size_t size = strlen(text);
+
+	if ((size_t)(end - *at) < size || memcmp(*at, text, size) != 0)
+		return false;
+	*at += size;
+	return true;
+}
+
+/* A number written plainly: no sign, no zero before it, 0 itself only where `zero`. */
+static bool plain_number(const uint8_t **at, const uint8_t *end, int digits, bool zero, uint64_t *value)
+{
+	const uint8_t *from = *at;
+
+	*value = 0;
+	while (*at < end && **at >= '0' && **at <= '9' && *at - from < digits)
+		*value = *value * 10 + (uint64_t)(*(*at)++ - '0');
+	if (*at == from || (*at < end && **at >= '0' && **at <= '9'))
+		return false;
+	return from[0] != '0' || (zero && *at - from == 1);
+}
+
+static bool hex64(const uint8_t **at, const uint8_t *end, char out[65])
+{
+	if (end - *at < 64)
+		return false;
+	for (int i = 0; i < 64; i++) {
+		uint8_t c = (*at)[i];
+
+		if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+			return false;
+		out[i] = (char)c;
+	}
+	out[64] = '\0';
+	*at += 64;
+	return true;
+}
+
+static const char *parse_statement(const uint8_t *text, size_t size, struct statement *out)
+{
+	static const char zeros[] = "0000000000000000000000000000000000000000000000000000000000000000";
+	const uint8_t *at = text, *end = text + size;
+	size_t letters = 0;
+
+	if (!literal(&at, end, RELEASE_PRODUCT " current ") || !plain_number(&at, end, 16, false, &out->number) ||
+	    !literal(&at, end, "\ndomain "))
+		return "it is not a statement of what is current, in its one form";
+	while (at < end && *at >= 'a' && *at <= 'z' && letters < sizeof out->domain - 1)
+		out->domain[letters++] = (char)*at++;
+	out->domain[letters] = '\0';
+	if (!literal(&at, end, "\nlist ") || !plain_number(&at, end, 11, false, &out->epoch) ||
+	    !literal(&at, end, ".") || !plain_number(&at, end, 11, false, &out->generation) ||
+	    !literal(&at, end, " ") || !hex64(&at, end, out->list) ||
+	    !literal(&at, end, "\nrelease ") || !plain_number(&at, end, 16, true, &out->release) ||
+	    !literal(&at, end, " ") || !hex64(&at, end, out->manifest) ||
+	    !literal(&at, end, "\nsealed ") || !plain_number(&at, end, 16, false, &out->sealed) ||
+	    !literal(&at, end, "\nuntil ") || !plain_number(&at, end, 16, false, &out->until) ||
+	    !literal(&at, end, "\n") || at != end)
+		return "it is not a statement of what is current, in its one form";
+	if (out->number > RELEASE_NUMBER_MOST || out->release > RELEASE_NUMBER_MOST)
+		return "a number in it is past the last there can be";
+	if (strcmp(out->domain, "development") != 0 && strcmp(out->domain, "production") != 0)
+		return "its domain is neither development nor production";
+	if (out->epoch > EPOCH_MOST || out->generation > GENERATION_MOST)
+		return "the list it names is past the last there can be";
+	if ((out->release == 0) != (strcmp(out->manifest, zeros) == 0))
+		return "release 0 and a manifest of zeros go together";
+	if (out->until <= out->sealed)
+		return "it stops being good before it was sealed";
+	return NULL;
+}
+
+/* -1, 0 or 1: the list a statement names is older than `held`, it, or newer. */
+static int names(const struct statement *statement, const struct list *held)
+{
+	if (statement->epoch != held->epoch)
+		return statement->epoch < held->epoch ? -1 : 1;
+	if (statement->generation != held->generation)
+		return statement->generation < held->generation ? -1 : 1;
+	return 0;
+}
+
+enum sealed { SEALED, UNSEALED, NO_STATEMENT };
+
+/* The statement in `envelope`, `length` long, for a holder of `held`: NO_STATEMENT when what is
+ * there is not one at all (`why` says), UNSEALED when it reads and no timestamp key of the list
+ * held sealed it, as its envelope's counter and time have it. */
+static enum sealed open_statement(long length, const struct list *held, struct statement *statement,
+				  const struct key **by, const char **why)
+{
+	const uint8_t *body;
+	size_t body_length, message;
+	wms2_replay replay = { 0 };
+	wms2_policy policy = { true, 0, 0, 0 };
+	wms2_hdr header;
+	uint64_t counter = 0, when = 0;
+
+	*why = "it is not a statement sealed for " RELEASE_PRODUCT;
+	if (length < WMS2_HDR_LEN + WMS2_SIG_LEN + 1 || memcmp(envelope, "WMS2", 4) != 0 || !plain_header())
+		return NO_STATEMENT;
+	*why = parse_statement(envelope + WMS2_HDR_LEN, (size_t)length - WMS2_HDR_LEN - WMS2_SIG_LEN, statement);
+	if (*why)
+		return NO_STATEMENT;
+	for (int i = 7; i >= 0; i--) {
+		counter = counter << 8 | envelope[22 + i];
+		when = when << 8 | envelope[30 + i];
+	}
+	*why = "its envelope's counter and time are not the statement's number and when it was sealed";
+	if (counter != statement->number || when != statement->sealed)
+		return NO_STATEMENT;
+	*why = "no timestamp key of the list held sealed it";
+	message = signed_bytes(CURRENT_TOPIC, (size_t)length);
+	for (int i = 0; one_encoding(envelope + length - WMS2_SIG_LEN) && i < held->count; i++) {
+		const struct key *key = &held->keys[i];
+
+		if (key->scope != SCOPE_TIMESTAMP ||
+		    crypto_ed25519_check(envelope + length - WMS2_SIG_LEN, key->public, scratch, message) != 0)
+			continue;
+		if (wms2_verify(envelope, (size_t)length, CURRENT_TOPIC, NULL, key->public, scratch, sizeof scratch,
+				0, &replay, &policy, &header, &body, &body_length) != WMS2_OK)
+			continue;
+		*by = key;
+		*why = NULL;
+		return SEALED;
+	}
+	return UNSEALED;
+}
+
+/* The statement a unit keeps, in the file at `path`: 0 and `statement` when it is there and a
+ * timestamp key of the list held sealed it; 1 when the unit has none that says anything to it
+ * (no file, or one that names a list the unit has moved past, or that names its own and whose
+ * key the list no longer has); 2 when what is there cannot be believed and names a newer list,
+ * or is no statement at all. The last is the side to fall on: a unit told of a newer list, or
+ * unable to say that it was not, takes no release until it is shown what is current again. */
+static int kept_statement(const char *path, const struct list *held, struct statement *statement, const char **why)
+{
+	const struct key *by;
+	long length;
+	FILE *file = fopen(path, "rb");
+
+	*why = "it cannot be read";
+	if (!file)
+		return errno == ENOENT ? 1 : 2;
+	length = (long)fread(envelope, 1, sizeof envelope, file);
+	fclose(file);
+	*why = "it is too long to be a statement";
+	if (length > RELEASE_ENVELOPE_MOST)
+		return 2;
+	switch (open_statement(length, held, statement, &by, why)) {
+	case SEALED:
+		return names(statement, held) < 0 ? 1 : 0;
+	case UNSEALED:
+		return names(statement, held) <= 0 ? 1 : 2;
+	default:
+		return 2;
+	}
+}
+
+static void print_statement(const struct statement *statement, const struct list *held)
+{
+	printf("statement=%llu\ndomain=%s\nlist=%llu.%llu\nlist_sha256=%s\nrelease=%llu\nmanifest=%s\n"
+	       "sealed=%llu\nuntil=%llu\nstanding=%s\n", (unsigned long long)statement->number, statement->domain,
+	       (unsigned long long)statement->epoch, (unsigned long long)statement->generation, statement->list,
+	       (unsigned long long)statement->release, statement->manifest, (unsigned long long)statement->sealed,
+	       (unsigned long long)statement->until, names(statement, held) > 0 ? "behind" : "current");
+}
+
+/* What the unit keeps of what is current, said: exit 0 with it, 1 with none, 2 damaged. */
+static int statement_of(const char *keys_path, const char *path)
+{
+	static struct list held;
+	struct statement statement;
+	const char *why;
+	int status = held_list(keys_path, &held);
+
+	if (status)
+		return status;
+	status = kept_statement(path, &held, &statement, &why);
+	if (status == 0)
+		print_statement(&statement, &held);
+	else if (status == 2)
+		fprintf(stderr, "w1700k-release: %s is not a statement this unit can read: %s\n", path, why);
+	return status;
+}
+
+/* Take the statement in the file at `path`, for a unit that holds the list at `keys_path` and
+ * keeps the statement at `kept_path`: write it to `out` when it is one this unit keeps. */
+static int current(const char *keys_path, const char *kept_path, const char *out, const char *path)
+{
+	static struct list held;
+	static uint8_t kept[RELEASE_ENVELOPE_MOST + 1];
+	struct statement before, offered;
+	const struct key *by = NULL;
+	const char *why;
+	long kept_length = 0, length;
+	int have, status = held_list(keys_path, &held);
+
+	if (status)
+		return status;
+	have = kept_path ? kept_statement(kept_path, &held, &before, &why) : 1;
+	if (have == 0) {	/* `envelope` holds it: set it aside before the offered one is read */
+		FILE *file = fopen(kept_path, "rb");
+
+		kept_length = file ? (long)fread(kept, 1, sizeof kept, file) : 0;
+		if (file)
+			fclose(file);
+	}
+	length = read_envelope(path, "a statement");
+	if (length < 0)
+		return length == -1 ? 2 : 1;
+	if (open_statement(length, &held, &offered, &by, &why) != SEALED) {
+		fprintf(stderr, "w1700k-release: not a statement this unit takes: %s (it holds list %llu.%llu)\n", why,
+			(unsigned long long)held.epoch, (unsigned long long)held.generation);
+		return 1;
+	}
+	if (names(&offered, &held) < 0) {
+		fprintf(stderr, "w1700k-release: this statement names list %llu.%llu, older than %llu.%llu, which this "
+			"unit holds: it says nothing to it\n", (unsigned long long)offered.epoch,
+			(unsigned long long)offered.generation, (unsigned long long)held.epoch,
+			(unsigned long long)held.generation);
+		return 1;
+	}
+	if (have == 0 && offered.number == before.number) {
+		if (kept_length == length && memcmp(kept, envelope, (size_t)length) == 0) {
+			printf("statement=%llu unchanged\n", (unsigned long long)offered.number);
+			return 0;
+		}
+		fprintf(stderr, "w1700k-release: this is ANOTHER statement %llu than the one this unit keeps, and %s "
+			"sealed it: two were sealed under one number. Nothing is changed\n",
+			(unsigned long long)offered.number, by->name);
+		return 1;
+	}
+	if (have == 0 && offered.number < before.number) {
+		fprintf(stderr, "w1700k-release: statement %llu is older than statement %llu, which this unit keeps\n",
+			(unsigned long long)offered.number, (unsigned long long)before.number);
+		return 1;
+	}
+	if (write_file(out, envelope, (size_t)length) != 0) {
+		fprintf(stderr, "w1700k-release: cannot write %s\n", out);
+		return 2;
+	}
+	printf("statement=%llu list=%llu.%llu release=%llu until=%llu sealed_by=%s standing=%s\n",
+	       (unsigned long long)offered.number, (unsigned long long)offered.epoch,
+	       (unsigned long long)offered.generation, (unsigned long long)offered.release,
+	       (unsigned long long)offered.until, by->name, names(&offered, &held) > 0 ? "behind" : "current");
+	return 0;
+}
+
 static int show(const char *keys_path)
 {
 	static struct list list;
@@ -842,7 +1117,7 @@ static int allows(const char *state, const char *digest)
 int main(int argc, char **argv)
 {
 	const char *keys = KEYS_FILE, *state = STATE_DIR, *verb = argc > 1 ? argv[1] : "";
-	const char *operand = NULL, *out = NULL, *environment = NULL;
+	const char *operand = NULL, *out = NULL, *environment = NULL, *kept = NULL;
 	unsigned long long floor = 0;
 	bool first = false;
 	char text[32], *end;
@@ -856,6 +1131,8 @@ int main(int argc, char **argv)
 			out = argv[++i];
 		} else if (!strcmp(argv[i], "--environment") && i + 1 < argc) {
 			environment = argv[++i];
+		} else if (!strcmp(argv[i], "--statement") && i + 1 < argc) {
+			kept = argv[++i];
 		} else if (!strcmp(argv[i], "--first")) {
 			first = true;
 		} else if (!strcmp(argv[i], "--floor") && i + 1 < argc) {
@@ -882,6 +1159,10 @@ int main(int argc, char **argv)
 		return show(keys);
 	if (!strcmp(verb, "text") && !operand)
 		return text_of(keys);
+	if (!strcmp(verb, "current") && operand && out)
+		return current(keys, kept, out, operand);
+	if (!strcmp(verb, "statement") && operand && !out)
+		return statement_of(keys, operand);
 	if (!strcmp(verb, "mark") && !operand && environment)
 		return marked(environment);
 	if (!strcmp(verb, "allows") && operand)
@@ -897,6 +1178,8 @@ usage:
 			"       w1700k-release rotate [--keys FILE] [--first] --out FILE ENVELOPE\n"
 			"       w1700k-release list [--keys FILE]\n"
 			"       w1700k-release text [--keys FILE]\n"
+			"       w1700k-release current [--keys FILE] [--statement KEPT] --out FILE ENVELOPE\n"
+			"       w1700k-release statement [--keys FILE] KEPT\n"
 			"       w1700k-release mark --environment FILE\n"
 			"       w1700k-release allows [--state DIR] SHA256\n"
 			"       w1700k-release number [--state DIR]\n");

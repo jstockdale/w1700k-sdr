@@ -18,6 +18,8 @@ import shlex
 import subprocess
 import tempfile
 import time
+import urllib.error
+import urllib.request
 
 from . import bundle, config, layout, provision, seal
 from .console import StepFailed
@@ -29,6 +31,9 @@ NETWORK = config.ROOT / 'platform/rootfs/overlay/usr/sbin/w1700k-network'
 STAGING = '/work/system-update.squashfs'      # in RAM on the unit
 LOADER_STAGING = '/work/system-update.loader'
 RELEASE_STAGING = '/work/system-update.release'
+STATEMENT_STAGING = '/work/system-update.current'
+STATEMENT_MOST = 4096           # bytes: a statement is a few hundred
+CLOCK_SLACK_MS = 10 * 60 * 1000     # how far ahead of this host's clock a statement may be sealed
 ROTATION_STAGING = '/work/system-update.keys'
 DOWN_SECONDS = 90           # for a rebooting unit to stop answering
 UP_SECONDS = 240            # for it to answer again: the loader's write, then the boot
@@ -201,6 +206,94 @@ def catch_up(link, state, rotations):
     return state
 
 
+def fetch_statement(where, opener=urllib.request.urlopen):
+    """(the sealed statement found at `where`, None), or (None, why not). `where` is a file's
+    path or an http(s) address; nothing of the unit or its owner is sent to get it."""
+    try:
+        if re.match(r'https?://', str(where)):
+            request = urllib.request.Request(str(where), headers={'User-Agent': 'w1700k-sdr'})
+            with opener(request, timeout=15) as answer:
+                data = answer.read(STATEMENT_MOST + 1)
+        else:
+            data = Path(where).expanduser().read_bytes()
+    except (OSError, ValueError, urllib.error.URLError) as error:
+        return None, str(error)
+    if not 0 < len(data) <= STATEMENT_MOST:
+        return None, f'{len(data)} bytes are not a statement'
+    return data, None
+
+
+def consult(link, state, where, terms, archive_release=None, now_ms=None, fetch=fetch_statement):
+    """Hold a keyed unit and its update to the statement of what is current found at `where`.
+
+    A unit takes the newest list and release it is given, so somebody who keeps a list from it
+    decides where its keys stop. The statement says what there is: a timestamp key of the unit's
+    own list sealed it, and this host has the clock to hold it to its dates. Whatever its dates,
+    the unit is shown it and keeps the newest: a unit that has been shown a newer list than its
+    own exists takes no release until it holds it.
+
+    Nothing here locks an owner out. No statement, one that cannot be had, or one out of date
+    is said, loudly, and the update goes on. Only a statement that is good stops an update: when
+    it says the unit's list is superseded and this update does not bring the newer one, or that
+    the archive (release `archive_release`) is older than the newest release."""
+    def say(text):
+        print('  CURRENT: ' + text)
+
+    if state.get('keys') != 'keyed':
+        return
+    if not where:
+        say('NOTHING WAS ASKED about what is current (no address: --current, or "current" in the settings). A list '
+            'or a release this unit was never given would go unnoticed')
+        return
+    data, why = fetch(where)
+    if data is None:
+        say(f'the statement of what is current COULD NOT BE HAD from {where} ({why}). Going on without it')
+        return
+    held = held_list(link)
+    try:
+        statement, by = seal.read_statement(held, data)
+        standing = seal.standing(held, statement)
+    except seal.Refused as error:
+        say(f'the statement at {where} SAYS NOTHING TO THIS UNIT: {error}. Going on without it')
+        return
+    if standing == 'older':
+        say(f'the statement at {where} names list {statement.label}, older than the {held.label} this unit holds: '
+            'it is OUT OF DATE and says nothing. Going on without it')
+        return
+    stamp = lambda ms: time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(ms / 1000))
+    print(f'  current: list {statement.label}' + (f', release {statement.release}' if statement.release else ', no release')
+          + f' (statement {statement.number}, sealed {stamp(statement.sealed_ms)} by {by.name}, good until '
+          f'{stamp(statement.until_ms)})')
+    # The unit keeps the newest it is shown, whatever its dates: it has no clock to hold them to.
+    if 'current' in state and int(state.get('current_statement') or 0) < statement.number:
+        code, text = link.call(f'cat > {STATEMENT_STAGING}', data=data)
+        if code == 0:
+            code, text = tool(link, 'current', STATEMENT_STAGING)
+        if code:
+            say(f'the unit did not keep the statement: {text.strip()[-200:]}')
+    now = int(time.time() * 1000) if now_ms is None else now_ms
+    if now >= statement.until_ms:
+        say(f'THE STATEMENT IS OUT OF DATE: it was good until {stamp(statement.until_ms)}. What it says is not '
+            'held against this update')
+        return
+    if statement.sealed_ms > now + CLOCK_SLACK_MS:
+        say(f'the statement says it was sealed {stamp(statement.sealed_ms)}, which this host\'s clock has not '
+            'reached: THE CLOCK OR THE STATEMENT IS WRONG. What it says is not held against this update')
+        return
+    if terms != 'release':
+        if standing == 'behind':
+            say(f'list {statement.label} is current and this unit holds {held.label}; this is a build of your own, '
+                'which the unit takes on your word')
+        return
+    if standing == 'behind':
+        raise StepFailed(f'list {statement.label} is current, and this unit holds list {held.label}: the keys it '
+                         'trusts have been superseded, and this archive does not bring the newer list. Use a '
+                         'release that carries it')
+    if archive_release is not None and archive_release < statement.release:
+        raise StepFailed(f'the archive is release {archive_release}, and release {statement.release} is current. '
+                         'Use the current release')
+
+
 def admit(link, state, sealed=None, unsigned=False):
     """On what terms this unit takes the update: 'any', 'unsigned' or 'release'. Nothing is
     sent here, and it is asked before anything else is decided, so that an archive the unit
@@ -369,7 +462,7 @@ def check_layout(link, expected=None):
 
 
 def run_joint(settings, serial=None, authorized_key=None, bundle_path=None, link=None,
-              clock=time.monotonic, sleep=time.sleep, no_login_key=False, unsigned=False):
+              clock=time.monotonic, sleep=time.sleep, no_login_key=False, unsigned=False, current=None):
     """The loader and the root in one go, with one reboot: from the update archive at
     `bundle_path` (init/flash --bundle), or from this build's images. Both are staged, the
     first loader writes and starts the second, which writes the root, and once the system is
@@ -407,6 +500,7 @@ def run_joint(settings, serial=None, authorized_key=None, bundle_path=None, link
           f'{state["second_loader"][:12] or "absent"}')
     state = catch_up(link, state, rotations)
     terms = admit(link, state, sealed, unsigned)
+    consult(link, state, current, terms, int.from_bytes(sealed[22:30], 'little') if sealed else None)
     need_root, need_loader = state['running'] != root, state['second_loader'] != loader
     if no_login_key and need_root:
         check_paperclip_key(link)
