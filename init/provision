@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""Set up this host's directory for a unit, and make its root if it needs one.
+"""Set up this host's directory for a unit.
 
 init/install and init/flash do this themselves. Run it directly for a unit
-installed elsewhere. A unit's root is the built one, unless its directory
-holds a network.conf of its own. Its login keys are a list on the unit
-(`w1700k-login` there). Its ssh host key is the unit's own and stays on it;
-this host needs the public half, to know the unit by:
+installed elsewhere. Every unit's root is the built one; what is a unit's own
+is on the unit: its login keys (`w1700k-login` there), its network settings
+(`w1700k-network`; a network.conf in its directory here is sent by the tools)
+and its ssh host key, which stays on it. This host needs that key's public
+half, to know the unit by:
 
     init/provision --unit SERIAL --host-key FILE
 

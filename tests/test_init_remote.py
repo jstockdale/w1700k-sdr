@@ -27,7 +27,7 @@ def proc_mtd(geometry=None):
         f'mtd{n}: {size:08x} 00020000 "{name}"\n' for n, (name, (_, size)) in enumerate(geometry.items()))
 
 
-HOST_KEY_CALLS = ('sh -s -- keep', 'sh -s -- list', 'cat /proc/cmdline')
+HOST_KEY_CALLS = ('sh -s -- keep', 'sh -s -- list', 'cat /proc/cmdline')    # and `sh -s -- set ...`
 
 
 def host_key_answer(unit, command, data):
@@ -37,8 +37,19 @@ def host_key_answer(unit, command, data):
     keep`; `login_listed`: of `w1700k-login list`, which a root from before the list left the
     root cannot answer (the default); `hostkey_said`, `login_said`: what its loader says on the
     kernel command line, None for a loader from before."""
-    if command in ('sh -s -- keep', 'sh -s -- list'):
-        which = {remote.HOSTKEY.read_bytes(): 'hostkey', remote.LOGIN.read_bytes(): 'login'}[data]
+    if command in ('sh -s -- keep', 'sh -s -- list') or command.startswith('sh -s -- set '):
+        which = {remote.HOSTKEY.read_bytes(): 'hostkey', remote.LOGIN.read_bytes(): 'login',
+                 remote.NETWORK.read_bytes(): 'network'}[data]
+        if which == 'network':
+            # `network_own`: the settings the unit has of its own (from an old root, or stored).
+            words = command.split()[4:]
+            unit.__dict__.setdefault('network_calls', []).append(words or 'keep')
+            if words:
+                unit.network_own = words
+            if getattr(unit, 'network_fails', False):
+                return 1, 'w1700k-network: the settings could not be stored\n'
+            own = getattr(unit, 'network_own', [])
+            return 0, ''.join(f'own {word}\n' for word in own) + f'own={len(own)}\nchanged=no\n'
         unit.__dict__.setdefault('key_calls', []).append((which, command.split()[-1]))
         if which == 'hostkey':
             return getattr(unit, 'hostkey_kept', (0, 'durable-open: /durable mounted from mtd6\n'
@@ -48,9 +59,9 @@ def host_key_answer(unit, command, data):
         return getattr(unit, 'login_kept', (0, 'durable-open: /durable mounted from mtd6\ndurable-close: /durable closed\n'
                                                'login installer ssh-ed25519 AAAALOGIN\n'))
     if command == 'cat /proc/cmdline':
-        said, login = getattr(unit, 'hostkey_said', 'handed'), getattr(unit, 'login_said', 'handed')
+        said, login, net = (getattr(unit, name, 'handed') for name in ('hostkey_said', 'login_said', 'net_said'))
         return 0, ('console=ttyS0,115200 ro w1700k.keyslot=empty' + (f' w1700k.hostkey={said}' if said else '')
-                   + (f' w1700k.login={login}' if login else '') + '\n')
+                   + (f' w1700k.login={login}' if login else '') + (f' w1700k.net={net}' if net else '') + '\n')
     return None
 
 
@@ -162,7 +173,7 @@ class Remote(unittest.TestCase):
 
     def verbs(self, unit):
         return [c.split()[3] if c.startswith('sh -s') else c.split()[0] for c in unit.calls
-                if c not in ('true', 'cat /proc/mtd') + HOST_KEY_CALLS]
+                if c not in ('true', 'cat /proc/mtd') + HOST_KEY_CALLS and not c.startswith('sh -s -- set ')]
 
     def test_the_new_root_is_staged_written_by_the_loader_checked_and_confirmed(self):
         unit = Unit()
@@ -256,6 +267,46 @@ class Remote(unittest.TestCase):
         unit = Unit()
         unit.login_kept = (1, 'w1700k-login: the list could not be written\n')
         with self.assertRaisesRegex(StepFailed, 'login keys could not be kept'):
+            self.run_update(unit)
+        self.assertEqual((unit.staged, unit.running), ('', OLD))
+
+    def test_a_unit_on_the_defaults_is_asked_what_an_old_root_set_and_needs_nothing_handed_over(self):
+        unit = Unit()
+        unit.net_said = None                    # a loader from before settings left the root
+        self.assertEqual(self.run_update(unit), 0)
+        self.assertEqual(unit.network_calls, ['keep'])
+
+    def test_settings_an_old_root_had_are_carried_and_need_a_loader_that_hands_them_over(self):
+        unit = Unit()
+        unit.network_own, unit.net_said = ['MGMT_IF=lan4'], None
+        with self.assertRaisesRegex(StepFailed, 'does not hand the unit.s network settings to the system'):
+            self.run_update(unit)
+        self.assertEqual((unit.staged, unit.running), ('', OLD), 'it would come up at another address')
+        unit = Unit()
+        unit.network_own = ['MGMT_IF=lan4']
+        self.assertEqual(self.run_update(unit), 0)
+
+    def test_a_network_conf_in_the_units_directory_is_sent_to_the_unit(self):
+        directory = config.unit_dir(self.settings.data_dir, 'SERIAL')
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / provision.NETWORK).write_text('# bench\nMGMT_IF=lan4\nMGMT_ADDRESS=10.0.0.1/24\n')
+        unit = Unit()
+        self.assertEqual(self.run_update(unit), 0)
+        self.assertEqual(unit.network_calls, [['MGMT_IF=lan4', 'MGMT_ADDRESS=10.0.0.1/24']])
+        calls = [c for c in unit.calls if c != 'true']
+        self.assertLess(calls.index('sh -s -- set MGMT_IF=lan4 MGMT_ADDRESS=10.0.0.1/24'),
+                        calls.index('sh -s -- stage /work/system-update.squashfs ' + self.new))
+        for text in ('MGMT_IF=lan4; reboot\n', 'DNS=1.1.1.1\n', 'MGMT_IF\n', 'MGMT_IF=$(reboot)\n'):
+            (directory / provision.NETWORK).write_text(text)
+            unit = Unit()
+            with self.subTest(text=text), self.assertRaises(provision.ProvisionError):
+                self.run_update(unit)
+            self.assertFalse(getattr(unit, 'network_calls', []), 'nothing of it reaches a shell on the unit')
+
+    def test_a_root_is_not_sent_to_a_unit_whose_settings_could_not_be_kept(self):
+        unit = Unit()
+        unit.network_fails = True
+        with self.assertRaisesRegex(StepFailed, 'network settings could not be kept'):
             self.run_update(unit)
         self.assertEqual((unit.staged, unit.running), ('', OLD))
 
@@ -431,7 +482,7 @@ class RemoteLoader(unittest.TestCase):
 
     def verbs(self, unit):
         return [c.split()[3] if c.startswith('sh -s') else c.split()[0] for c in unit.calls
-                if c not in ('true', 'cat /proc/mtd') + HOST_KEY_CALLS]
+                if c not in ('true', 'cat /proc/mtd') + HOST_KEY_CALLS and not c.startswith('sh -s -- set ')]
 
     def test_the_new_loader_is_staged_started_checked_and_confirmed(self):
         unit = LoaderUnit()
@@ -582,15 +633,9 @@ class RemoteJoint(unittest.TestCase):
         self.now = 0.0
         self.provisioned = []
 
-        self.network_conf = False               # the unit has network settings of its own
-
         def provisioned(directory, address=None, generic=None):
-            """As provision.provision: the root as built, or one made for the unit from it."""
+            """As provision.provision: the root as built, whichever unit it is for."""
             self.provisioned.append(Path(generic).read_bytes() if generic else None)
-            if self.network_conf:
-                made = self.work / 'made-for-the-unit.squashfs'
-                made.write_bytes(b'hsqs a root with the unit\'s network settings' * 500)
-                return made
             return generic or self.root_image
         for patcher in (mock.patch.object(config, 'require_images'),
                         mock.patch.object(config, 'pick_unit', return_value='SERIAL'),
@@ -611,7 +656,7 @@ class RemoteJoint(unittest.TestCase):
 
     def verbs(self, unit):
         return [c.split()[3] if c.startswith('sh -s') else c.split()[0] for c in unit.calls
-                if c not in ('true', 'cat /proc/mtd') + HOST_KEY_CALLS]
+                if c not in ('true', 'cat /proc/mtd') + HOST_KEY_CALLS and not c.startswith('sh -s -- set ')]
 
     def test_both_are_staged_and_one_reboot_brings_up_both(self):
         unit = JointUnit()
@@ -839,16 +884,15 @@ class Releases(RemoteJoint):
         self.assertEqual((unit.running, unit.second, unit.floor), (self.root, self.loader, 4))
         self.assertIn('release 4, sealed by ' + seal.fingerprint(self.primary), self.said())
 
-    def test_a_root_made_for_a_unit_with_network_settings_of_its_own_is_the_owners_build(self):
-        self.network_conf = True
+    def test_a_unit_with_network_settings_of_its_own_takes_the_same_release_and_checks_it(self):
+        directory = config.unit_dir(self.settings.data_dir, 'SERIAL')
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / provision.NETWORK).write_text('MGMT_ADDRESS=10.0.0.1/24   # mine\nEXPORT_MTU=9000\n')
         unit = ReleaseUnit(self.held)
-        with self.assertRaisesRegex(StepFailed, 'network.conf.*in no release.*--unsigned'):
-            self.run_update(unit, self.release(4))
-        self.assertEqual((unit.staged, unit.lstaged, unit.running), ('', '', OLD), 'nothing was sent')
-        self.assertEqual(self.run_update(unit, self.release(4), unsigned=True), 0)
-        self.assertEqual(unit.flags, {'stage-loader': ['--unsigned'], 'stage': ['--unsigned']})
-        self.assertNotEqual(unit.running, self.root)
-        self.assertEqual(unit.floor, 0, 'and it is no release to the unit')
+        self.assertEqual(self.run_update(unit, self.release(4)), 0)
+        self.assertEqual(unit.network_calls, [['MGMT_ADDRESS=10.0.0.1/24', 'EXPORT_MTU=9000']], 'sent to the unit, not put in a root')
+        self.assertEqual(unit.flags, {'stage-loader': [], 'stage': []})
+        self.assertEqual((unit.running, unit.second, unit.floor), (self.root, self.loader, 4))
 
     def test_a_release_whose_root_was_changed_on_its_way_is_refused_by_the_unit_itself(self):
         """What the test on a unit showed staged, before roots went to units untouched: a root

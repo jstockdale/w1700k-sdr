@@ -124,8 +124,7 @@ It stops stock U-Boot at power-on and then:
    `calibration` partition in the backup) as `eeprom.bin` beside the backup,
    where the host tools find it; `init/eeprom --unit SERIAL` does the same for
    an existing backup;
-3. takes the built root filesystem as it is, the same for every unit (a unit
-   whose directory holds a `network.conf` of its own gets one made with it);
+3. takes the built root filesystem as it is, the same for every unit;
 4. writes our U-Boot into the `loader` partition through stock U-Boot, reads it
    back and boots that copy;
 5. from our U-Boot, erases `system` and `durable`, creates their UBI volumes,
@@ -137,7 +136,9 @@ It stops stock U-Boot at power-on and then:
    storage, and writes `known_hosts` beside the backup from the public half
    the unit says over the console;
 9. adds your SSH public key to the unit's login keys, the first in its list
-   (not with `--no-login-key`).
+   (not with `--no-login-key`);
+10. if the unit's directory holds a `network.conf`, stores those settings on
+    the unit and starts it again on them.
 
 The unit is then reachable with `ssh root@192.168.1.1`. A full run takes about
 five minutes. Every step is checked before the next one starts; if a run is
@@ -465,14 +466,6 @@ other keys.
 
 - **Firmware is root.** A unit that has installed a thief's release is the
   thief's, whatever list it held. The list protects the units that have not.
-- **A unit with network settings of its own takes no release as one.**
-  Every unit is sent the release's root as it is, and checks it against the
-  manifest like the loader: its login keys and its ssh host key are in its
-  durable storage, not in its root. The exception is a unit whose directory
-  holds a `network.conf`. Its root is made on the host with that file in it
-  and is in no manifest, so a keyed unit takes it only as a build of your own
-  (`--unsigned`), and keeps no release number for it
-  ([the roadmap](../docs/roadmap.md)).
 - **A stolen root key** can start the next epoch with a list of its own, and a
   unit takes whichever it is given first.
 - **Nothing tells a unit or its host what it has not been given.** Whoever
@@ -703,12 +696,18 @@ most of it rewriting what changed (about ten blocks a second).
 
 | Path | Contents |
 | --- | --- |
-| `~/.local/share/w1700k/units/SERIAL/` | `nand.bin` (the backup), `known_hosts` (the unit's ssh host key, public half), `rootfs.squashfs` (the unit's root), optional `network.conf`, `nand-raw.bin` and `nand-raw.json` after `init/rawdump` |
+| `~/.local/share/w1700k/units/SERIAL/` | `nand.bin` (the backup), `known_hosts` (the unit's ssh host key, public half), optional `network.conf` (the unit's own network settings), `nand-raw.bin` and `nand-raw.json` after `init/rawdump` |
 | `~/.local/share/w1700k/runs/` | one directory per run: the raw console transcript (`rx.bin`), an event log and saved command output |
 
-A `network.conf` in the unit directory replaces the unit's
-`/etc/w1700k/network.conf` (management and IQ port addresses, MTU) on the next
-install or `init/flash --rootfs`.
+A `network.conf` in the unit directory states the unit's own network settings
+(management and IQ port addresses, interfaces, MTU; the names are those of
+`platform/rootfs/overlay/etc/w1700k/network.conf`, which holds the defaults
+every unit comes up on). It is not built into anything: the next install or
+`init/flash` stores the settings in the unit's durable storage, and the unit
+uses them from its next start. On the unit, `w1700k-network status` shows what
+is in force, `w1700k-network set NAME=VALUE...` changes it and `w1700k-network
+clear` goes back to the defaults. Give `--device-ip` the unit's new address
+afterwards.
 
 While a tool runs, writing to `RUN/tx.fifo` sends bytes to the console and hands
 the console to you for the rest of the run.

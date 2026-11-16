@@ -152,7 +152,8 @@ status)
 	echo "persist=$persist"
 	;;
 serve)
-	. /etc/w1700k/network.conf
+	# The addresses in force: the unit's own where it has some (w1700k-network).
+	if [ -r /run/w1700k-network.conf ]; then . /run/w1700k-network.conf; else . /etc/w1700k/network.conf; fi
 	/usr/sbin/w1700k-key --listen "${MGMT_ADDRESS%/*}" || :
 	sleep 5		# init starts it again; not in a tight loop if it cannot run
 	;;
