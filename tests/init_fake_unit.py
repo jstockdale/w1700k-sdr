@@ -520,6 +520,14 @@ class FakeUnit:
         logins.append(((comment or ['key'])[0].lower(), kind, body))
         return '\n'.join(f'login {name} {kind} {body}' for name, kind, body in logins), 0
 
+    # The unit's own network settings (w1700k-network): `network` is what it has stored.
+    def linux__usr_sbin_w1700k_network(self, line, words):
+        assert words[1] == 'set' and len(words) > 2, line
+        before = self.__dict__.get('network')
+        self.network = words[2:]
+        return ''.join(f'own {word}\n' for word in self.network) + \
+            f'own={len(self.network)}\nchanged={"no" if before == self.network else "yes"}', 0
+
     def linux__usr_sbin_w1700k_hostkey(self, line, words):
         if words[1] == 'status':
             return (f'hostkey={"lasting" if self.host_kept else "temporary"}\nloader={self.host_loader}\n'
