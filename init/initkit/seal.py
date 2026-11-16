@@ -395,3 +395,134 @@ def rotated(held, envelope):
         raise Refused(f'after epoch {held.epoch} comes list {held.epoch + 1}.1 and no other; this is '
                       f'{following.label}')
     return following, sealed_by
+
+
+# ---- what is current ----------------------------------------------------------------------
+#
+# A unit has no clock and no network, and takes the newest list and release it has been given.
+# So whoever delivers to it decides where its keys stop: a list that drops a stolen key does
+# nothing for a unit it never reaches. A statement says what is current, for one domain: the
+# list, the newest release, when it was sealed and until when it is good. A `timestamp` key
+# seals it, which seals nothing a unit installs and so can be used often. The host, which has
+# a clock, checks it; the unit keeps the newest it was shown and, once shown that a newer list
+# than its own exists, takes no release until it holds that list.
+#
+# A statement is text in one form, byte for byte, as a list is:
+#
+#   w1700k-sdr current 7
+#   domain development
+#   list 2.2 <64 hex: SHA-256 of that list's text>
+#   release 5 <64 hex: SHA-256 of that release's manifest>
+#   sealed 1794816426827
+#   until 1794902826827
+#
+# `release 0` and 64 zeros say that no release has been sealed. The times are milliseconds
+# since 1970, UTC. Its envelope's counter is its number and the envelope's time is `sealed`.
+# It is sealed under the list it names: a timestamp key of that list, or of the list a
+# holder still has if it is behind. One that names a list older than the holder's says nothing
+# to that holder, whatever key sealed it.
+
+CURRENT_TOPIC = 'w1700k-sdr/current'
+DOMAINS = ('development', 'production')
+STATEMENT_MOST = 9007199254740991
+NO_RELEASE = '0' * 64
+
+
+class Statement(NamedTuple):
+    number: int
+    domain: str
+    epoch: int
+    generation: int
+    list_sha256: str
+    release: int
+    manifest_sha256: str
+    sealed_ms: int
+    until_ms: int
+    text: bytes
+
+    @property
+    def stamp(self):
+        return self.epoch, self.generation
+
+    @property
+    def label(self):
+        return f'{self.epoch}.{self.generation}'
+
+
+_NUMBER = rb'(0|[1-9][0-9]{0,15})'
+_STATEMENT = re.compile(rb'%s current ([1-9][0-9]{0,15})\ndomain ([a-z]{1,16})\n'
+                        rb'list ([1-9][0-9]{0,10})\.([1-9][0-9]{0,10}) ([0-9a-f]{64})\n'
+                        rb'release %s ([0-9a-f]{64})\nsealed ([1-9][0-9]{0,15})\nuntil ([1-9][0-9]{0,15})\n'
+                        % (PRODUCT.encode(), _NUMBER))
+
+
+def parse_statement(text):
+    """The statement in `text`, which is in its one form or Refused."""
+    found = _STATEMENT.fullmatch(text)
+    if not found:
+        raise Refused('it is not a statement of what is current, in its one form')
+    number, domain, epoch, generation, listed, release, manifest, sealed, until = found.groups()
+    statement = Statement(int(number), domain.decode(), int(epoch), int(generation), listed.decode(), int(release),
+                          manifest.decode(), int(sealed), int(until), bytes(text))
+    if statement.number > STATEMENT_MOST or statement.release > RELEASE_MOST:
+        raise Refused('a number in it is past the last there can be')
+    if statement.domain not in DOMAINS:
+        raise Refused(f'its domain is {statement.domain}, which is neither of ' + ' and '.join(DOMAINS))
+    if not 0 < statement.epoch <= EPOCH_MOST or not 0 < statement.generation <= GENERATION_MOST:
+        raise Refused('the list it names is past the last there can be')
+    if (statement.release == 0) != (statement.manifest_sha256 == NO_RELEASE):
+        raise Refused('release 0 and a manifest of zeros go together: no release, or one with its manifest')
+    if statement.until_ms <= statement.sealed_ms:
+        raise Refused('it stops being good before it was sealed')
+    return statement
+
+
+def format_statement(number, domain, keys, release, manifest_sha256, sealed_ms, until_ms):
+    """A statement's text: `keys` is the list that is current (a KeyList), `release` its newest
+    release's number with `manifest_sha256`, or 0 and None for none yet."""
+    text = (f'{PRODUCT} current {number}\ndomain {domain}\n'
+            f'list {keys.label} {hashlib.sha256(keys.text).hexdigest()}\n'
+            f'release {release} {manifest_sha256 or NO_RELEASE}\nsealed {sealed_ms}\nuntil {until_ms}\n').encode()
+    return parse_statement(text).text
+
+
+def unsigned_statement(text):
+    """(header, the bytes a key signs) to seal the statement `text`."""
+    statement = parse_statement(text)
+    return unsigned(text, statement.number, statement.sealed_ms, CURRENT_TOPIC)
+
+
+def seal_statement(text, sign):
+    """The statement `text`, signed with `sign(message) -> 64 bytes`."""
+    header, message = unsigned_statement(text)
+    return signed(header, text, sign(message))
+
+
+def read_statement(held, envelope):
+    """(the statement `envelope` seals, the key that sealed it), for a holder of the list `held`:
+    sealed by a timestamp key of that list, with its number and time on the envelope as in the
+    text. Everything else is Refused. What it says to the holder is `standing`."""
+    counter, body, signature, message = _open(envelope, CURRENT_TOPIC)
+    try:
+        statement = parse_statement(body)
+    except Refused as error:
+        raise Refused(f'what it seals is not a statement: {error}') from None
+    if statement.number != counter or struct.unpack_from('<Q', envelope, 30)[0] != statement.sealed_ms:
+        raise Refused("the envelope's counter and time are not the statement's number and when it was sealed")
+    judges = held.scoped('timestamp')
+    sealed_by = next((key for key in judges if verifies(key.public, message, signature)), None)
+    if sealed_by is None:
+        raise Refused(f'it is not sealed by a timestamp key of the list held ({held.label}: '
+                      + (', '.join(key.name for key in judges) or 'it has none') + ')')
+    return statement, sealed_by
+
+
+def standing(held, statement):
+    """What a statement its holder could read says of the list `held`: 'current' (it is the list
+    named), 'behind' (a newer one is named) or 'older' (the statement names a list the holder
+    has moved past, and says nothing to it). Two lists under one stamp are Refused."""
+    if statement.stamp == held.stamp:
+        if statement.list_sha256 != hashlib.sha256(held.text).hexdigest():
+            raise Refused(f'it names ANOTHER list {held.label} than the one held: two lists were sealed as one')
+        return 'current'
+    return 'behind' if statement.stamp > held.stamp else 'older'

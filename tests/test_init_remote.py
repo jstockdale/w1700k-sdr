@@ -9,7 +9,9 @@ import tarfile
 from pathlib import Path
 import sys
 import tempfile
+import time
 import unittest
+import urllib.error
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -789,6 +791,8 @@ class ReleaseUnit(JointUnit):
         self.kind = kind or ('keyed' if held else 'unkeyed')
         self.verified = self.noted = None
         self.flags = {}
+        self.statement = None               # the newest statement of what is current it was shown
+        self.knows_statements = True        # False: a root from before there were any
 
     def call(self, command, data=None, timeout=120):
         if not command.startswith('sh -s -- ') or self.down:
@@ -800,7 +804,19 @@ class ReleaseUnit(JointUnit):
             return code, text + (f'keys={self.kind}\nkey_list={"good" if self.held else "none"}\n'
                                  f'key_generation={self.held.label if self.held else ""}\n'
                                  f'release_keys={len(self.held.release_keys()) if self.held else 0}\n'
-                                 f'release={self.floor}\nrelease_manifest={self.settled}\n')
+                                 f'release={self.floor}\nrelease_manifest={self.settled}\n'
+                                 + (f'current={self.now()}\ncurrent_statement={self.statement.number if self.statement else ""}\n'
+                                    if self.knows_statements else ''))
+        if verb == 'current':
+            self.calls.append(command)
+            try:
+                offered, _ = seal.read_statement(self.held, self.files[arguments[0]])
+                if seal.standing(self.held, offered) == 'older' or (self.statement and offered.number < self.statement.number):
+                    raise seal.Refused('it is older than what this unit holds or keeps')
+            except seal.Refused as error:
+                return 1, f'w1700k-release: {error}\nsystem-update: not a statement this unit takes\n'
+            self.statement = offered
+            return 0, f'system-update: what is current, as this unit was shown: statement={offered.number}\n'
         if verb == 'keys':
             self.calls.append(command)
             return (0, self.held.text.decode()) if self.held else (1, 'system-update: this unit holds no list\n')
@@ -817,6 +833,8 @@ class ReleaseUnit(JointUnit):
             self.calls.append(command)
             if self.kind != 'keyed':
                 return 1, lost
+            if self.now() == 'behind':
+                return 1, f'system-update: this unit has been shown that list {self.statement.label} is current\n'
             try:
                 number, body, _ = seal.unseal(self.files[arguments[0]], self.held.release_keys())
             except seal.Refused:
@@ -842,6 +860,13 @@ class ReleaseUnit(JointUnit):
         if verb in ('confirm', 'cancel'):
             self.noted = None
         return code, text
+
+    def now(self):
+        """What the unit makes of the statement it keeps, with the list it holds now."""
+        if not self.statement or not self.held:
+            return 'none'
+        standing = seal.standing(self.held, self.statement)
+        return 'none' if standing == 'older' else standing
 
     def reboot(self):
         super().reboot()
@@ -1097,6 +1122,155 @@ class Releases(RemoteJoint):
                 self.assertEqual(run(self.settings, link=unit, clock=lambda: self.now, sleep=sleep,
                                      unsigned=True), 0)
                 self.assertEqual(unit.flags[verb], ['--unsigned'])
+
+
+
+class WhatIsCurrent(Releases):
+    """A keyed unit and its update are held to the statement of what is current (remote.consult):
+    the newest list and release there are, sealed by a timestamp key of the unit's own list.
+    Nothing about it locks an owner out; only a statement that is good stops an update."""
+    NOW = (11, 'timestamp', 'now')
+
+    def setUp(self):
+        super().setUp()
+        self.signers[11] = seal.signer(bytes((11,)) * 32)[1]
+        self.held = keys_list(1, *USUAL, self.NOW)
+        self.clock = int(time.time() * 1000)
+
+    def statement(self, number, keys=None, release=4, manifest='ab' * 32, sealed=-60_000, good_for=86_400_000, by=11):
+        """A statement in a file: `keys` is current (default: the unit's list), sealed `sealed` ms
+        from now and good for `good_for` ms from then."""
+        text = seal.format_statement(number, 'development', keys or self.held, release, manifest if release else None,
+                                     self.clock + sealed, self.clock + sealed + good_for)
+        path = self.work / f'current-{number}.wms2'
+        path.write_bytes(seal.seal_statement(text, self.signers[by]))
+        return path
+
+    def test_a_good_statement_is_said_shown_to_the_unit_and_the_update_goes_on(self):
+        unit = ReleaseUnit(self.held)
+        self.assertEqual(self.run_update(unit, self.release(4), current=self.statement(7)), 0)
+        self.assertIn('current: list 1.1, release 4 (statement 7', self.said())
+        self.assertNotIn('CURRENT:', self.said())
+        self.assertEqual(unit.statement.number, 7, 'the unit keeps it')
+        self.assertEqual((unit.running, unit.floor), (self.root, 4))
+        self.assertLess(self.verbs(unit).index('current'), self.verbs(unit).index('release'), 'before the release is judged')
+
+    def test_a_unit_that_keeps_this_statement_or_a_newer_one_is_not_shown_it_again(self):
+        unit = ReleaseUnit(self.held)
+        unit.statement = seal.read_statement(self.held, self.statement(9).read_bytes())[0]
+        self.assertEqual(self.run_update(unit, self.release(4), current=self.statement(7)), 0)
+        self.assertNotIn('current', self.verbs(unit))
+        self.assertEqual(unit.statement.number, 9)
+
+    def test_an_archive_older_than_the_current_release_is_not_sent(self):
+        unit = ReleaseUnit(self.held)
+        with self.assertRaisesRegex(StepFailed, 'the archive is release 4, and release 6 is current'):
+            self.run_update(unit, self.release(4), current=self.statement(7, release=6))
+        self.assertEqual((unit.staged, unit.lstaged, unit.running), ('', '', OLD))
+        self.assertEqual(self.run_update(unit, self.release(6), current=self.statement(8, release=6)), 0)
+        unit = ReleaseUnit(self.held)
+        self.assertEqual(self.run_update(unit, self.release(9), current=self.statement(7, release=6)), 0,
+                         'a release newer than the statement knows of is no older than current')
+
+    def test_a_unit_whose_list_is_superseded_is_given_the_list_or_nothing(self):
+        newer = keys_list(2, *USUAL[:2], (3, 'release', 'stranger'), self.NOW)     # the primary key is dropped
+        unit = ReleaseUnit(self.held)
+        with self.assertRaisesRegex(StepFailed, 'list 1.2 is current, and this unit holds list 1.1.*superseded'):
+            self.run_update(unit, self.release(4), current=self.statement(7, newer))
+        self.assertEqual((unit.staged, unit.lstaged, unit.running), ('', '', OLD), 'nothing sealed by the dropped key is sent')
+        self.assertEqual(unit.statement.number, 7, 'and the unit has been shown: it now refuses by itself')
+        code, said = remote.tool(unit, 'release', remote.RELEASE_STAGING)
+        self.assertEqual(code, 1)
+        # A release that carries the list brings the unit up to it, and is judged by the new keys.
+        turn = self.turn(newer, 6)
+        self.assertEqual(self.run_update(unit, self.release(5, self.sign_stranger, [turn]),
+                                         current=self.statement(8, newer, release=5)), 0)
+        self.assertEqual((unit.held.label, unit.floor, unit.now()), ('1.2', 5, 'current'))
+
+    def test_a_build_of_the_owners_goes_to_a_superseded_unit_on_the_owners_word(self):
+        newer = keys_list(2, *USUAL, self.NOW)
+        unit = ReleaseUnit(self.held)
+        self.assertEqual(self.run_update(unit, unsigned=True, current=self.statement(7, newer)), 0)
+        self.assertIn('CURRENT: list 1.2 is current and this unit holds 1.1; this is a build of your own', self.said())
+        self.assertEqual(unit.running, self.root)
+
+    def test_a_statement_out_of_date_is_said_loudly_and_stops_nothing(self):
+        newer = keys_list(2, *USUAL, self.NOW)
+        for name, options, word in (('expired', {'sealed': -2 * 86_400_000}, 'THE STATEMENT IS OUT OF DATE'),
+                                    ('from the future', {'sealed': 3_600_000}, 'THE CLOCK OR THE STATEMENT IS WRONG')):
+            with self.subTest(name):
+                unit = ReleaseUnit(self.held)
+                unit.knows_statements = False           # so that only the host's own judgement is seen here
+                self.printed.reset_mock()
+                self.assertEqual(self.run_update(unit, self.release(4), current=self.statement(7, newer, release=9, **options)), 0)
+                self.assertIn('CURRENT: ', self.said())
+                self.assertIn(word, self.said())
+                self.assertEqual((unit.running, unit.floor), (self.root, 4))
+
+    def test_an_out_of_date_statement_is_still_shown_to_the_unit_which_has_no_clock(self):
+        newer = keys_list(2, *USUAL, self.NOW)
+        unit = ReleaseUnit(self.held)
+        with self.assertRaisesRegex(StepFailed, 'does not take this release'):
+            self.run_update(unit, self.release(4), current=self.statement(7, newer, sealed=-2 * 86_400_000))
+        self.assertEqual(unit.now(), 'behind', 'that a newer list exists does not stop being true')
+
+    def test_no_statement_or_one_that_says_nothing_to_this_unit_is_said_and_stops_nothing(self):
+        other = keys_list(1, *USUAL, (12, 'timestamp', 'someone-elses'))
+        self.signers[12] = seal.signer(bytes((12,)) * 32)[1]
+        missing, garbage = self.work / 'absent.wms2', self.work / 'garbage.wms2'
+        garbage.write_bytes(b'not a statement')
+        older = keys_list((2, 1), *USUAL, self.NOW)
+        cases = (('none asked for', None, 'NOTHING WAS ASKED', self.held),
+                 ('not there', missing, 'COULD NOT BE HAD', self.held),
+                 ('not one', garbage, 'SAYS NOTHING TO THIS UNIT', self.held),
+                 ("another key's", self.statement(7, other, by=12), 'SAYS NOTHING TO THIS UNIT', self.held),
+                 ('a release key sealed it', self.statement(8, by=1), 'SAYS NOTHING TO THIS UNIT', self.held),
+                 ('of a list the unit has moved past', self.statement(9), 'OUT OF DATE and says nothing', older))
+        for name, where, word, held in cases:
+            with self.subTest(name):
+                unit = ReleaseUnit(held)
+                self.printed.reset_mock()
+                self.assertEqual(self.run_update(unit, self.release(4), current=where), 0)
+                self.assertIn('CURRENT: ', self.said())
+                self.assertIn(word, self.said())
+                self.assertIsNone(unit.statement)
+                self.assertEqual(unit.floor, 4)
+
+    def test_a_unit_that_was_never_keyed_is_asked_nothing_about_what_is_current(self):
+        unit = ReleaseUnit(None)
+        self.assertEqual(self.run_update(unit, self.plain, current=self.statement(7)), 0)
+        self.assertNotIn('urrent', self.said().replace('already current', ''))
+
+    def test_a_unit_on_a_root_from_before_statements_is_judged_by_the_host_alone(self):
+        unit = ReleaseUnit(self.held)
+        unit.knows_statements = False
+        with self.assertRaisesRegex(StepFailed, 'release 6 is current'):
+            self.run_update(unit, self.release(4), current=self.statement(7, release=6))
+        self.assertNotIn('current', self.verbs(unit))
+
+    def test_the_statement_comes_from_a_file_or_a_web_address_and_says_nothing_of_the_unit(self):
+        sealed = self.statement(7).read_bytes()
+        self.assertEqual(remote.fetch_statement(self.work / 'current-7.wms2'), (sealed, None))
+        asked = []
+
+        class Answer:
+            def __enter__(self): return self
+            def __exit__(self, *exc): return False
+            def read(self, most): return sealed[:most]
+
+        def opener(request, timeout):
+            asked.append((request.full_url, dict(request.header_items()), request.data, request.get_method()))
+            return Answer()
+        self.assertEqual(remote.fetch_statement('https://example.org/w1700k/current.wms2', opener=opener), (sealed, None))
+        self.assertEqual(asked, [('https://example.org/w1700k/current.wms2', {'User-agent': 'w1700k-sdr'}, None, 'GET')])
+
+        def refuses(request, timeout):
+            raise urllib.error.URLError('no route')
+        self.assertEqual(remote.fetch_statement('http://example.org/x', opener=refuses)[0], None)
+        big = self.work / 'big.wms2'
+        big.write_bytes(bytes(remote.STATEMENT_MOST + 1))
+        self.assertIn('not a statement', remote.fetch_statement(big)[1])
+        self.assertIsNone(remote.fetch_statement(self.work / 'nothing-here')[0])
 
 
 if __name__ == '__main__':

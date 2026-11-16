@@ -22,6 +22,8 @@
  * generation; the counter is the generation. Only a root key starts an epoch,
  * so whatever a lesser key has sealed, a root key's list comes after it. */
 #define ROTATE_TOPIC "w1700k-sdr/rotate-keys"
+/* What a statement of what is current is sealed under: see release.c. */
+#define CURRENT_TOPIC "w1700k-sdr/current"
 #define EPOCH_MOST 9999
 #define GENERATION_MOST 1000000000
 /* A list is its generation and at most this many keys, each a line of text. */

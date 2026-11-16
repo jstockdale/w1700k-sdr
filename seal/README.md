@@ -50,6 +50,7 @@ signed.
 | --- | --- | --- | --- |
 | A release | `w1700k-sdr/release` | an update archive's manifest: the SHA-256 of every image in it | the release number |
 | A rotation | `w1700k-sdr/rotate-keys` | the complete list of keys a unit is to trust from then on | the list's generation |
+| A statement | `w1700k-sdr/current` | what is current: the list there is and the newest release | the statement's number |
 
 ## A list of keys
 
@@ -132,6 +133,53 @@ still give it a list of their own. That is what the keyed mark and the bench
 are for. And a file cut back to where an earlier list ended reads as that
 earlier list, one this unit did hold; nothing on the unit says which was the
 last.
+
+## What is current
+
+A unit has no clock and no network. It takes the newest list and release it
+has been given, so whoever delivers to it decides where its keys stop: a list
+that drops a stolen key does nothing for a unit it never reaches. A statement
+says what there is, for one domain. It is text in one form, as a list is, read
+alike by the unit (`parse_statement` in `release.c`) and the host
+(`init/initkit/seal.py`; a test gives both the same cases):
+
+```
+w1700k-sdr current 7
+domain development
+list 2.2 <64 hex: SHA-256 of that list's text>
+release 5 <64 hex: SHA-256 of that release's manifest>
+sealed 1794816426827
+until 1794902826827
+```
+
+`release 0` and 64 zeros say no release has been sealed. The times are
+milliseconds since 1970, UTC, and the envelope's counter and time are the
+statement's number and `sealed`. A `timestamp` key seals it, which seals
+nothing a unit installs and so can be used often.
+
+- **It is read by the list its holder has.** A timestamp key of that list
+  sealed it, or it says nothing. One that names a list older than the
+  holder's says nothing either, whatever sealed it: so a list that drops a
+  timestamp key puts that key's statements out at once, not when they run out.
+- **The host holds it to its dates**, having a clock (`init/flash --current`).
+  Out of date, missing or unreadable, it is said loudly and the update goes
+  on: nothing here locks an owner out, and one key and one web address are
+  not made a thing every unit depends on. A statement that is good stops an
+  update in two cases: it names a newer list than the unit's and the update
+  does not bring that list, or the archive is older than the newest release.
+- **The unit keeps the newest it was shown**, whatever its dates, sealed, in
+  its durable storage, and reads it by its seal each time as it reads its
+  list. Once that names a newer list than the unit holds, the unit takes no
+  release until it holds that list. Keeping a list from a unit therefore
+  stops working the first time the unit meets a host that does not.
+- **What a unit keeps and cannot read** stops releases until it is shown a
+  statement that reads; an owner's own build (`--unsigned`) is taken as ever.
+  Written over to name a list the unit already has, a kept statement is as
+  good as gone, which is what deleting it gives too: nothing in a unit's
+  storage can be more than that.
+
+Statements are numbered and a unit takes only a higher number than it keeps;
+they need not follow on, since a unit is not shown every one.
 
 ## What a unit takes
 

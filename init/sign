@@ -36,6 +36,16 @@ A key that never leaves its keeper signs in two steps, for a release and for a r
     init/sign rotate-proof --request REQUEST --name KEYNAME (--signature SIG | --key KEYFILE)
     init/sign rotate-attach --request REQUEST --signature SIG [--held OLD] [-o OUT]
 
+And say what is current, for the hosts that update units to hold an update against and for a
+unit to remember: the list there is and the newest release, sealed by a timestamp key of that
+list and good for a while (`30d`, `1d`, `10m`). The release is named by its sealed archive, or
+by number and manifest digest, or there is none yet:
+
+    init/sign current --key KEYFILE --domain D --number N --list LIST --good-for TIME
+                      (--archive RELEASE | --release N --manifest SHA256 | --no-release) [-o OUT]
+    init/sign current-request --domain D --number N --list LIST --good-for TIME (...) [-o REQUEST]
+    init/sign current-attach --request REQUEST --signature SIG --keys LIST [-o OUT]
+
 `archive` writes ARCHIVE (default: this build's w1700k-update.tar) again as release N, with the
 number in its manifest and the manifest sealed, to OUT (default: w1700k-release-N.tar beside
 it). The manifest lists the SHA-256 of every image in the archive, so the one signature covers
@@ -185,6 +195,10 @@ def describe(keys):
 
 def show(path):
     data = path.read_bytes()
+    if data[:4] == seal.MAGIC and seal.body_of(data).startswith(f'{seal.PRODUCT} current '.encode()):
+        print(f'{path}: {said(seal.parse_statement(seal.body_of(data)))}\n  (sealed; a unit and a host read it by '
+              'a timestamp key of the list they hold)')
+        return
     if data[:4] == seal.MAGIC or not tarfile.is_tarfile(path):
         keys = read_list(path)
         sealed = ''
@@ -207,6 +221,82 @@ def show(path):
         if sealed:
             _, _, key = seal.unseal(sealed, keys.release_keys())
             print(f'and it is sealed by {seal.fingerprint(key)}, a release key of that list')
+
+
+def duration(text):
+    """Milliseconds of a time written as a number and s, m, h or d."""
+    units = {'s': 1000, 'm': 60000, 'h': 3600000, 'd': 86400000}
+    if len(text) < 2 or text[-1] not in units or not text[:-1].isdigit() or int(text[:-1]) < 1:
+        raise StepFailed(f'{text!r} is not a time: a whole number and s, m, h or d (30d, 1d, 10m)')
+    return int(text[:-1]) * units[text[-1]]
+
+
+def when(ms):
+    return time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(ms / 1000))
+
+
+def said(statement):
+    return (f'statement {statement.number} ({statement.domain}): list {statement.label} is current'
+            + (f', release {statement.release} the newest' if statement.release else ', no release yet')
+            + f'; sealed {when(statement.sealed_ms)}, good until {when(statement.until_ms)}')
+
+
+def current(args):
+    """What is current, sealed here (`current`), asked of a key held elsewhere (`current-request`),
+    or put together from what that key returned (`current-attach`)."""
+    if args.verb == 'current-attach':
+        counter, _, message, _ = read_request(args.request, seal.CURRENT_TOPIC)
+        text = message[2 + len(seal.CURRENT_TOPIC) + seal.HEADER:]
+        keys, beside = read_list(args.keys), args.request.parent
+        try:
+            statement = seal.parse_statement(text)
+        except seal.Refused as error:
+            raise StepFailed(f'{args.request} does not ask for a statement: {error}') from None
+        header, asked = seal.unsigned_statement(text)
+        if asked != message or counter != statement.number:
+            raise StepFailed(f'{args.request} does not ask for a statement as this tool seals one')
+        envelope = seal.signed(header, text, read_signature(args.signature))
+    else:
+        keys, beside = read_list(args.list), Path('.')
+        release, manifest = 0, None
+        if args.archive:
+            _, _, sealed = bundle.read_release(args.archive)
+            if not sealed:
+                raise StepFailed(f'{args.archive} is not a sealed release: there is no number and manifest to name')
+            release = int.from_bytes(sealed[22:30], 'little')
+            manifest = hashlib.sha256(seal.body_of(sealed)).hexdigest()
+        elif args.release is not None:
+            if not args.manifest:
+                raise StepFailed('a release is named by its number and its manifest\'s SHA-256 (--manifest), or by '
+                                 'its archive (--archive)')
+            release, manifest = args.release, args.manifest
+        elif not args.no_release:
+            raise StepFailed('say which release is the newest: --archive, --release with --manifest, or --no-release')
+        sealed_ms = int(time.time() * 1000)
+        text = seal.format_statement(args.number, args.domain, keys, release, manifest, sealed_ms,
+                                     sealed_ms + duration(args.good_for))
+        statement = seal.parse_statement(text)
+        header, asked = seal.unsigned_statement(text)
+        if args.verb == 'current-request':
+            if not keys.scoped('timestamp'):
+                raise StepFailed(f'list {keys.label} names no timestamp key: no statement sealed under it is read')
+            output = args.output or Path(f'w1700k-current-{args.domain}-{args.number}.request.json')
+            digest = write_request(output, seal.CURRENT_TOPIC, statement.number, statement.sealed_ms, asked,
+                                   domain=args.domain, statement=statement.number, list=keys.label,
+                                   list_sha256=statement.list_sha256, release=statement.release,
+                                   manifest_sha256=statement.manifest_sha256, sealed_ms=statement.sealed_ms,
+                                   until_ms=statement.until_ms, statement_at=len(asked) - len(text), needs='timestamp')
+            print(f'sign: {output} asks for {said(statement)}: {len(asked)} bytes to sign, SHA-256 {digest}; a '
+                  f'timestamp key of list {keys.label} seals it')
+            return
+        envelope = seal.signed(header, text, seal.signer(read_seed(args.key))[1](asked))
+    statement, by = seal.read_statement(keys, envelope)        # as a holder of that list reads it, or Refused
+    if seal.standing(keys, statement) != 'current':
+        raise StepFailed(f'the statement names list {statement.label} and the list given is {keys.label}')
+    output = unwritten(args.output or beside / f'w1700k-current-{statement.domain}-{statement.number}.wms2',
+                       'a sealed statement')
+    output.write_bytes(envelope)
+    print(f'sign: {output} is {said(statement)}; sealed by {by.name} ({seal.fingerprint(by.public)})')
 
 
 def release_keys(path):
@@ -267,9 +357,29 @@ def main():
             verb.add_argument('--domain', choices=DOMAINS, required=True)
         verb.add_argument('--held', type=Path, metavar='OLD')
         verb.add_argument('-o', '--output', type=Path, metavar='OUT')
+    for name in ('current', 'current-request', 'current-attach'):
+        verb = verbs.add_parser(name)
+        if name == 'current':
+            verb.add_argument('--key', type=Path, required=True, metavar='KEYFILE')
+        if name == 'current-attach':
+            verb.add_argument('--request', type=Path, required=True, metavar='REQUEST')
+            verb.add_argument('--signature', required=True, metavar='SIG')
+            verb.add_argument('--keys', type=Path, required=True, metavar='LIST')
+        else:
+            verb.add_argument('--domain', choices=DOMAINS, required=True)
+            verb.add_argument('--number', type=int, required=True, metavar='N')
+            verb.add_argument('--list', type=Path, required=True, metavar='LIST')
+            verb.add_argument('--good-for', required=True, metavar='TIME')
+            verb.add_argument('--archive', type=Path, metavar='RELEASE')
+            verb.add_argument('--release', type=int, metavar='N')
+            verb.add_argument('--manifest', metavar='SHA256')
+            verb.add_argument('--no-release', action='store_true')
+        verb.add_argument('-o', '--output', type=Path, metavar='OUT')
     args = parser.parse_args()
     try:
-        if args.verb == 'keygen':
+        if args.verb.startswith('current'):
+            current(args)
+        elif args.verb == 'keygen':
             seed = seal.new_seed()
             public, _ = seal.signer(seed)
             # Made new and for its owner alone, or not at all: a key is never overwritten.
