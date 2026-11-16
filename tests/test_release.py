@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import unittest
 from unittest import mock
 import zlib
@@ -45,6 +46,10 @@ ROOT_KEY, KEYS_KEY, PRIMARY, SPARE, STRANGER, NEW_ROOT_KEY, NEW_KEYS_KEY = 5, 6,
 NAMES = {ROOT_KEY: 'the-root', KEYS_KEY: 'the-keys', PRIMARY: 'primary', SPARE: 'spare', STRANGER: 'stranger',
          NEW_ROOT_KEY: 'new-root', NEW_KEYS_KEY: 'new-keys'}
 USUAL = ((ROOT_KEY, 'root'), (KEYS_KEY, 'keys'), (PRIMARY, 'release'), (SPARE, 'release'))
+# A list that also names a key for saying what is current.
+NOW_KEY, NEW_NOW_KEY = 11, 12
+NAMES.update({NOW_KEY: 'now', NEW_NOW_KEY: 'new-now'})
+WITH_NOW = USUAL + ((NOW_KEY, 'timestamp'),)
 
 
 def signing(number):
@@ -105,6 +110,65 @@ def a_list(stamp=1, rows=USUAL, names=NAMES):
 def rotation(text, by, **options):
     """The list `text` sealed by test key number `by`."""
     return seal.seal_list(text, signing(by)[1], **options)
+
+
+def statement(number, keys, release=5, manifest='ab' * 32, sealed=1000, until=2000, by=NOW_KEY, domain='development'):
+    """Statement `number`, sealed by test key `by`: the list whose text is `keys` is current."""
+    text = seal.format_statement(number, domain, seal.parse_list(keys), release, manifest if release else None, sealed, until)
+    return seal.seal_statement(text, signing(by)[1])
+
+
+def sealed_as(body, counter, when, by, topic=seal.CURRENT_TOPIC):
+    """Any `body` in an envelope with `counter` and `when`, signed by test key `by` under `topic`."""
+    header, message = seal.unsigned(body, counter, when, topic)
+    return seal.signed(header, body, signing(by)[1](message))
+
+
+def statement_cases():
+    """(name, text, whether it is a statement) for the unit's reader and the host's alike."""
+    good = seal.format_statement(7, 'development', seal.parse_list(a_list(2, WITH_NOW)), 5, 'ab' * 32, 1000, 2000).decode()
+    digest = good.splitlines()[2].split()[2]
+    yield 'the usual', good, True
+    yield 'no release yet', good.replace('release 5 ' + 'ab' * 32, 'release 0 ' + '0' * 64), True
+    yield 'production', good.replace('development', 'production'), True
+    yield ('the last numbers there can be', good.replace('current 7', f'current {seal.STATEMENT_MOST}')
+           .replace('release 5', f'release {seal.RELEASE_MOST}').replace('list 1.2', 'list 9999.1000000000'), True)
+    yield 'nothing', '', False
+    yield 'no line feed at the end', good[:-1], False
+    yield 'two line feeds at the end', good + '\n', False
+    yield 'carriage returns', good.replace('\n', '\r\n'), False
+    yield 'a line more', good + 'note hello\n', False
+    yield 'lines in another order', '\n'.join(good.splitlines()[:1] + good.splitlines()[2:3] + good.splitlines()[1:2]
+                                              + good.splitlines()[3:]) + '\n', False
+    yield 'a line left out', '\n'.join(good.splitlines()[:4] + good.splitlines()[5:]) + '\n', False
+    yield 'number 0', good.replace('current 7', 'current 0'), False
+    yield 'a zero before the number', good.replace('current 7', 'current 07'), False
+    yield 'a sign', good.replace('current 7', 'current +7'), False
+    yield 'a number past the last', good.replace('current 7', f'current {seal.STATEMENT_MOST + 1}'), False
+    yield 'a number of 17 digits', good.replace('current 7', 'current ' + '9' * 17), False
+    yield 'a release past the last', good.replace('release 5', f'release {seal.RELEASE_MOST + 1}'), False
+    yield 'release 0 with a manifest', good.replace('release 5', 'release 0'), False
+    yield 'a release with no manifest', good.replace('ab' * 32, '0' * 64), False
+    yield 'a zero before the release', good.replace('release 5', 'release 05'), False
+    yield 'another domain', good.replace('development', 'staging'), False
+    yield 'the domain in capitals', good.replace('development', 'Development'), False
+    yield 'no domain', good.replace('domain development', 'domain '), False
+    yield 'epoch 0', good.replace('list 1.2', 'list 0.2'), False
+    yield 'generation 0', good.replace('list 1.2', 'list 1.0'), False
+    yield 'an epoch past the last', good.replace('list 1.2', 'list 10000.2'), False
+    yield 'a generation past the last', good.replace('list 1.2', 'list 1.1000000001'), False
+    yield 'no generation', good.replace('list 1.2', 'list 1'), False
+    yield 'the digest in capitals', good.replace(digest, digest.upper()), False
+    yield 'a short digest', good.replace(digest, digest[:-2]), False
+    yield 'a long digest', good.replace(digest, digest + 'ab'), False
+    yield 'two spaces', good.replace('list 1.2 ', 'list 1.2  '), False
+    yield 'a tab', good.replace('list 1.2 ', 'list 1.2\t'), False
+    yield 'good until when it was sealed', good.replace('until 2000', 'until 1000'), False
+    yield 'good until before it was sealed', good.replace('until 2000', 'until 999'), False
+    yield 'sealed at 0', good.replace('sealed 1000', 'sealed 0'), False
+    yield 'a time with a fraction', good.replace('sealed 1000', 'sealed 1000.5'), False
+    yield 'another product', good.replace('w1700k-sdr current', 'w1700k-abc current'), False
+    yield 'a list of keys', a_list(2, WITH_NOW).decode(), False
 
 
 CHAIN_MAGIC = b'w1700k-sdr key chain 1\n'
@@ -1047,6 +1111,185 @@ class KeptLists(Built):
 
 
 @unittest.skipUnless(shutil.which(CC), 'no C compiler')
+class Statements(Built):
+    """What is current: a statement a timestamp key sealed, which a unit keeps the newest of and
+    reads by its seal. The host's reader (init/initkit/seal.py) has to say the same."""
+
+    def setUp(self):
+        super().setUp()
+        self.keys.write_bytes(a_list(2, WITH_NOW))
+        self.kept = self.dir / 'current'
+
+    def take(self, envelope):
+        """What the unit's verifier makes of a statement: ('taken' | 'unchanged' | 'refused', what it said);
+        one it takes is kept."""
+        path, out = self.dir / 'statement.wms2', self.dir / 'current.new'
+        path.write_bytes(envelope)
+        out.unlink(missing_ok=True)
+        result = subprocess.run([str(self.program), 'current', '--keys', str(self.keys), '--statement', str(self.kept),
+                                 '--out', str(out), str(path)], capture_output=True)
+        said = (result.stdout + result.stderr).decode(errors='replace')
+        if result.returncode:
+            self.assertEqual(result.returncode, 1, said)
+            self.assertFalse(out.exists(), 'nothing is written of what is refused')
+            return 'refused', said
+        if result.stdout.endswith(b'unchanged\n'):
+            self.assertFalse(out.exists())
+            return 'unchanged', said
+        self.assertEqual(out.read_bytes(), envelope, 'it is kept sealed, as it came')
+        out.replace(self.kept)
+        return 'taken', said
+
+    def host(self, envelope):
+        """The host's word on the same statement, for a unit that keeps none."""
+        held = seal.parse_list(self.keys.read_bytes())
+        try:
+            found, _ = seal.read_statement(held, envelope)
+            return 'refused' if seal.standing(held, found) == 'older' else 'taken'
+        except seal.Refused:
+            return 'refused'
+
+    def said(self):
+        """(exit status, {name: value}) of what the unit keeps."""
+        result = subprocess.run([str(self.program), 'statement', '--keys', str(self.keys), str(self.kept)], capture_output=True, text=True)
+        return result.returncode, dict(line.split('=', 1) for line in result.stdout.splitlines())
+
+    def test_the_unit_and_the_host_read_a_statement_alike(self):
+        for name, text, good in statement_cases():
+            with self.subTest(name):
+                self.kept.unlink(missing_ok=True)
+                body = text.encode('latin-1')
+                try:
+                    found = seal.parse_statement(body)
+                    self.assertTrue(good, 'the host reads it')
+                    envelope = sealed_as(body, found.number, found.sealed_ms, NOW_KEY)
+                except seal.Refused:
+                    self.assertFalse(good, 'the host refuses it')
+                    envelope = sealed_as(body, 7, 1000, NOW_KEY) if body else statement(7, a_list(2, WITH_NOW))[:40] + bytes(64)
+                self.assertEqual(self.take(envelope)[0], 'taken' if good else 'refused')
+                self.assertEqual(self.host(envelope), 'taken' if good else 'refused')
+
+    def test_a_statement_is_kept_sealed_and_said_as_it_reads(self):
+        self.assertEqual(self.said(), (1, {}), 'a unit that was shown none keeps none')
+        outcome, said = self.take(statement(7, a_list(2, WITH_NOW)))
+        self.assertEqual(outcome, 'taken')
+        self.assertIn('statement=7 list=1.2 release=5 until=2000 sealed_by=now standing=current', said)
+        status, kept = self.said()
+        self.assertEqual(status, 0)
+        self.assertEqual(kept, {'statement': '7', 'domain': 'development', 'list': '1.2',
+                                'list_sha256': hashlib.sha256(a_list(2, WITH_NOW)).hexdigest(), 'release': '5',
+                                'manifest': 'ab' * 32, 'sealed': '1000', 'until': '2000', 'standing': 'current'})
+
+    def test_only_a_newer_one_replaces_it_and_two_under_one_number_are_said(self):
+        self.assertEqual(self.take(statement(7, a_list(2, WITH_NOW)))[0], 'taken')
+        self.assertEqual(self.take(statement(7, a_list(2, WITH_NOW)))[0], 'unchanged')
+        outcome, said = self.take(statement(6, a_list(2, WITH_NOW)))
+        self.assertEqual(outcome, 'refused')
+        self.assertIn('statement 6 is older than statement 7', said)
+        outcome, said = self.take(statement(7, a_list(2, WITH_NOW), release=6, manifest='cd' * 32))
+        self.assertEqual(outcome, 'refused')
+        self.assertIn('ANOTHER statement 7', said)
+        self.assertIn('now sealed it', said)
+        self.assertEqual(self.said()[1]['release'], '5')
+        self.assertEqual(self.take(statement(9, a_list(2, WITH_NOW), release=6, manifest='cd' * 32))[0], 'taken')
+        self.assertEqual(self.said()[1]['statement'], '9', 'numbers need not follow on: a unit is not shown every one')
+
+    def test_only_a_timestamp_key_of_the_list_held_seals_one(self):
+        text = a_list(2, WITH_NOW)
+        for by in (STRANGER, NEW_NOW_KEY, ROOT_KEY, KEYS_KEY, PRIMARY):
+            with self.subTest(NAMES[by]):
+                envelope = statement(7, text, by=by)
+                outcome, said = self.take(envelope)
+                self.assertEqual(outcome, 'refused')
+                self.assertIn('no timestamp key of the list held sealed it', said)
+                self.assertEqual(self.host(envelope), 'refused')
+        self.keys.write_bytes(a_list(2, USUAL))     # a list with no such key takes none at all
+        self.assertEqual(self.take(statement(7, text))[0], 'refused')
+        self.assertEqual(self.host(statement(7, text)), 'refused')
+
+    def test_the_envelope_has_to_say_what_the_statement_says(self):
+        body = seal.body_of(statement(7, a_list(2, WITH_NOW)))
+        cases = {'another counter': sealed_as(body, 8, 1000, NOW_KEY), 'another time': sealed_as(body, 7, 1001, NOW_KEY),
+                 'sealed as a release': sealed_as(body, 7, 1000, NOW_KEY, seal.TOPIC),
+                 'sealed as a list': sealed_as(body, 7, 1000, NOW_KEY, seal.ROTATE_TOPIC),
+                 'a release': seal.seal(MANIFEST, 7, signing(NOW_KEY)[1]), 'a list of keys': rotation(a_list(2, WITH_NOW), NOW_KEY),
+                 'nothing': b'', 'cut short': statement(7, a_list(2, WITH_NOW))[:-1], 'a byte more': statement(7, a_list(2, WITH_NOW)) + b'\0'}
+        for name, envelope in cases.items():
+            with self.subTest(name):
+                self.assertEqual(self.take(envelope)[0], 'refused')
+                self.assertEqual(self.host(envelope), 'refused')
+        self.assertFalse(self.kept.exists())
+
+    def test_a_statement_that_names_a_newer_list_says_the_unit_is_behind(self):
+        newer = a_list(3, WITH_NOW)
+        outcome, said = self.take(statement(7, newer))
+        self.assertEqual(outcome, 'taken')
+        self.assertIn('list=1.3', said)
+        self.assertIn('standing=behind', said)
+        self.assertEqual(self.said()[1]['standing'], 'behind')
+        held = seal.parse_list(self.keys.read_bytes())
+        self.assertEqual(seal.standing(held, seal.read_statement(held, statement(7, newer))[0]), 'behind')
+        # Given the list, it is behind no more; and one of the next epoch is newer too.
+        self.keys.write_bytes(newer)
+        self.assertEqual(self.said(), (0, dict(self.said()[1], standing='current')))
+        self.assertEqual(self.take(statement(8, a_list((2, 1), WITH_NOW)))[0], 'taken')
+        self.assertEqual(self.said()[1]['standing'], 'behind')
+
+    def test_a_statement_that_names_an_older_list_says_nothing(self):
+        envelope = statement(7, a_list(1, WITH_NOW))
+        outcome, said = self.take(envelope)
+        self.assertEqual(outcome, 'refused')
+        self.assertIn('names list 1.1, older than 1.2', said)
+        self.assertEqual(self.host(envelope), 'refused')
+        # And one that was kept says nothing once the unit has moved past the list it names,
+        self.assertEqual(self.take(statement(7, a_list(2, WITH_NOW)))[0], 'taken')
+        self.keys.write_bytes(a_list(3, WITH_NOW))
+        self.assertEqual(self.said(), (1, {}))
+        self.assertEqual(self.take(statement(3, a_list(3, WITH_NOW)))[0], 'taken', 'so a lower number is no older to it')
+        # or holds the list it names, when that list has dropped the key that sealed it.
+        self.assertEqual(self.take(statement(8, a_list(4, WITH_NOW)))[0], 'taken')
+        self.assertEqual(self.said()[1]['standing'], 'behind')
+        self.keys.write_bytes(a_list(4, USUAL + ((NEW_NOW_KEY, 'timestamp'),)))
+        self.assertEqual(self.said(), (1, {}), 'the stolen key that says nothing is new is put out by the next list')
+        self.assertEqual(self.take(statement(2, a_list(4, USUAL + ((NEW_NOW_KEY, 'timestamp'),)), by=NEW_NOW_KEY))[0], 'taken')
+
+    def test_nothing_altered_in_what_is_kept_reads_as_a_statement(self):
+        """One bit wrong anywhere: the unit has no statement, or one it cannot believe, never another."""
+        whole = statement(7, a_list(3, WITH_NOW))        # it names a newer list: the unit is behind
+        self.assertEqual(self.take(whole)[0], 'taken')
+        outcomes = set()
+        for at in range(len(whole)):
+            damaged = bytearray(whole)
+            damaged[at] ^= 1 << (at % 8)
+            self.kept.write_bytes(bytes(damaged))
+            status, kept = self.said()
+            self.assertIn(status, (1, 2), f'byte {at}: {kept}')
+            self.assertEqual(kept, {})
+            outcomes.add(status)
+        self.assertIn(2, outcomes)
+        # Written over to name a list the unit has, it is as good as gone: no statement, which is
+        # what removing the file gives too. Nothing in a unit's storage can be more than that.
+        self.kept.write_bytes(whole.replace(b'list 1.3 ', b'list 1.2 '))
+        self.assertEqual(self.said(), (1, {}))
+        self.kept.write_bytes(whole.replace(b'list 1.3 ', b'list 1.9 '))
+        self.assertEqual(self.said(), (2, {}), 'and it cannot be made to name a newer one')
+        for length in range(len(whole)):
+            self.kept.write_bytes(whole[:length])
+            self.assertEqual(self.said(), (2, {}), f'cut to {length}')
+        # A unit that cannot say it was not told of a newer list takes any statement that reads.
+        self.kept.write_bytes(whole[:-1])
+        self.assertEqual(self.take(statement(2, a_list(2, WITH_NOW)))[0], 'taken')
+        self.assertEqual(self.said()[1]['statement'], '2')
+
+    def test_what_the_host_makes_of_two_lists_under_one_stamp(self):
+        held = seal.parse_list(self.keys.read_bytes())
+        other = a_list(2, WITH_NOW[:2] + ((STRANGER, 'release'), (NOW_KEY, 'timestamp')))
+        found, _ = seal.read_statement(held, statement(7, other))
+        with self.assertRaisesRegex(seal.Refused, 'ANOTHER list 1.2'):
+            seal.standing(held, found)
+
+
+@unittest.skipUnless(shutil.which(CC), 'no C compiler')
 class Scripted(Built):
     """The unit's own system-update, run as it is but for where it looks: the verifier is
     the real one, durable storage and the flash are directories. The unit is keyed: it holds
@@ -1075,6 +1318,7 @@ class Scripted(Built):
                          ('STAGED=/durable/update', f'STAGED={d}/durable/update'),
                          ('FLOOR=/durable/release', f'FLOOR={d}/durable/release'),
                          ('KEYS=/durable/keys', f'KEYS={self.keys}'),
+                         ('CURRENT=/durable/current', f'CURRENT={d}/durable/current'),
                          ('HELD=/run/w1700k-keys', f'HELD={d}/held'),
                          ('LOCK=/run/w1700k-update.lock', f'LOCK={d}/lock'),
                          ('df -k /durable', f'df -k {d}/durable'),
@@ -1597,6 +1841,122 @@ esac
         self.assertEqual(self.release(7).returncode, 0)
 
 
+@unittest.skipUnless(shutil.which(CC), 'no C compiler')
+class Current(Scripted):
+    """system-update and what is current: a unit keeps the newest statement it was shown, and once
+    that names a newer list than its own it takes no release until it holds that list."""
+
+    def setUp(self):
+        super().setUp()
+        self.keys.write_bytes(a_list(1, WITH_NOW))
+        self.current = self.dir / 'durable/current'
+
+    def show(self, envelope):
+        path = self.dir / 'work/statement.wms2'
+        path.write_bytes(envelope)
+        return self.update('current', path)
+
+    def now(self):
+        state = self.state_of()
+        return tuple(state[name] for name in ('current', 'current_statement', 'current_list', 'current_release', 'current_until'))
+
+    def test_a_unit_shown_nothing_keeps_nothing_and_takes_releases_as_before(self):
+        self.assertEqual(self.now(), ('none', '', '', '', ''))
+        self.assertEqual(self.release(7).returncode, 0)
+
+    def test_a_statement_is_kept_in_durable_storage_and_said(self):
+        shown = self.show(statement(3, a_list(1, WITH_NOW), release=7, manifest='cd' * 32, until=99000))
+        self.assertEqual(shown.returncode, 0, shown.stderr)
+        self.assertIn('statement=3 list=1.1 release=7 until=99000 sealed_by=now standing=current', shown.stdout)
+        self.assertEqual(self.current.read_bytes(), statement(3, a_list(1, WITH_NOW), release=7, manifest='cd' * 32, until=99000))
+        self.assertEqual(self.now(), ('current', '3', '1.1', '7', '99000'))
+        self.assertEqual(self.release(7).returncode, 0, 'a unit on the current list takes releases')
+        again = self.show(statement(3, a_list(1, WITH_NOW), release=7, manifest='cd' * 32, until=99000))
+        self.assertIn('this is the statement kept', again.stdout)
+        self.assertEqual(os.listdir(self.dir / 'durable'), sorted(os.listdir(self.dir / 'durable')))
+        self.assertFalse(list((self.dir / 'durable').glob('*.part')))
+
+    def test_a_unit_shown_that_a_newer_list_exists_takes_no_release_until_it_holds_it(self):
+        newer = a_list(2, WITH_NOW[:2] + ((SPARE, 'release'), (NOW_KEY, 'timestamp')))      # the primary key is dropped
+        self.assertEqual(self.show(statement(3, newer)).returncode, 0)
+        self.assertEqual(self.now()[:3], ('behind', '3', '1.2'))
+        refused = self.release(7)                       # sealed by the key the newer list drops
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn('has been shown that list 1.2 is current (statement 3)', refused.stderr)
+        self.assertIn('holds list 1.1', refused.stderr)
+        self.assertIn('until it is given that list', refused.stderr)
+        self.assertEqual(self.state_of()['release_verified'], '')
+        self.assertEqual(self.stage('stage', NEW_ROOT).returncode, 1, 'and stages nothing as a release')
+        # The owner's own build is the owner's still.
+        owned = self.stage('stage', NEW_ROOT, '--unsigned')
+        self.assertEqual(owned.returncode, 0, owned.stderr)
+        self.update('cancel')
+        # Given the list, it is behind no more: and the dropped key seals nothing for it now.
+        self.assertEqual(self.give('rotate', rotation(newer, KEYS_KEY)).returncode, 0)
+        self.assertEqual(self.now()[:3], ('current', '3', '1.2'))
+        self.assertEqual(self.release(7).returncode, 1, 'the key the list dropped')
+        self.assertEqual(self.release(7, signing(SPARE)[1]).returncode, 0)
+
+    def test_an_older_statement_does_not_put_a_newer_one_back(self):
+        self.assertEqual(self.show(statement(3, a_list(2, WITH_NOW))).returncode, 0)
+        older = self.show(statement(2, a_list(1, WITH_NOW)))
+        self.assertEqual(older.returncode, 1)
+        self.assertIn('not a statement this unit takes', older.stderr)
+        self.assertEqual(self.now()[:3], ('behind', '3', '1.2'), 'replaying what was true does not make it true again')
+
+    def test_what_is_kept_and_does_not_read_stops_releases_until_a_statement_reads_again(self):
+        self.assertEqual(self.show(statement(3, a_list(1, WITH_NOW))).returncode, 0)
+        self.current.write_bytes(self.current.read_bytes()[:-1])
+        self.assertEqual(self.now()[0], 'damaged')
+        refused = self.release(7)
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn('what this unit keeps of what is current does not read', refused.stderr)
+        self.assertEqual(self.stage('stage', NEW_ROOT, '--unsigned').returncode, 0, 'the owner is not locked out')
+        self.update('cancel')
+        self.assertEqual(self.show(statement(2, a_list(1, WITH_NOW))).returncode, 0, 'any that reads: its number cannot be held to one that does not')
+        self.assertEqual(self.now()[:2], ('current', '2'))
+        self.assertEqual(self.release(7).returncode, 0)
+
+    def test_a_statement_that_names_another_list_under_the_units_stamp_stops_releases(self):
+        other = a_list(1, WITH_NOW[:2] + ((STRANGER, 'release'), (NOW_KEY, 'timestamp')))
+        self.assertEqual(self.show(statement(3, other)).returncode, 0, 'the verifier cannot tell: it has no digest of its own list')
+        self.assertEqual(self.now()[0], 'another')
+        refused = self.release(7)
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn('ANOTHER list 1.1', refused.stderr)
+
+    def test_a_unit_with_no_list_or_a_lost_one_is_shown_nothing(self):
+        envelope = statement(3, a_list(1, WITH_NOW))
+        self.keys.unlink()
+        lost = self.show(envelope)
+        self.assertEqual(lost.returncode, 1)
+        self.assertIn('holds none that reads', lost.stderr)
+        self.marked(False)
+        unkeyed = self.show(envelope)
+        self.assertEqual(unkeyed.returncode, 1)
+        self.assertIn('nothing is current to it', unkeyed.stderr)
+        self.assertFalse(self.current.exists())
+        self.assertEqual(self.state_of()['current'], 'none')
+
+    def test_new_keys_start_with_nothing_kept(self):
+        self.assertEqual(self.show(statement(3, a_list(2, WITH_NOW))).returncode, 0)
+        self.at_the_bench()
+        self.assertEqual(self.update('unkey').returncode, 0)
+        self.assertFalse(self.current.exists())
+        self.current.write_bytes(statement(3, a_list(2, WITH_NOW)))         # left behind by some other way
+        first = self.give('first', rotation(a_list(1, WITH_NOW), ROOT_KEY))
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertFalse(self.current.exists(), 'what was current under other keys says nothing under these')
+        self.assertEqual(self.now()[0], 'none')
+
+    def test_a_statement_is_not_taken_while_another_run_holds_the_unit(self):
+        (self.dir / 'lock').mkdir()
+        (self.dir / 'lock/pid').write_text(f'{os.getpid()}\n')
+        held = self.show(statement(3, a_list(1, WITH_NOW)))
+        self.assertEqual(held.returncode, 1)
+        self.assertFalse(self.current.exists())
+
+
 class LocalConsole:
     """A console whose other end is a shell here: what the bench types is run, with the unit's
     paths led to the test's directory."""
@@ -1907,6 +2267,79 @@ class Archive(unittest.TestCase):
         self.assertEqual(release.read_bytes(), whole.read_bytes())
         self.assertIn('never overwritten', self.tool('attach', '--request', path, '--signature', signature.hex(),
                                                      '--keys', self.list, self.plain).stderr)
+
+    def test_the_signing_tool_says_what_is_current_with_a_key_here_or_one_held_elsewhere(self):
+        listed, key = self.dir / 'keys.txt', self.dir / 'now.key'
+        listed.write_bytes(a_list(2, WITH_NOW))
+        key.write_text((bytes((NOW_KEY,)) * 32).hex() + '\n')
+        key.chmod(0o600)
+        held = seal.parse_list(listed.read_bytes())
+        release = self.dir / 'release-5.tar'
+        sealed = bundle.sign(self.plain, release, 5, self.sign)
+        # With the key here, naming the newest release by its sealed archive.
+        out = self.dir / 'current.wms2'
+        made = self.tool('current', '--key', key, '--domain', 'development', '--number', 7, '--list', listed,
+                         '--good-for', '30d', '--archive', release, '-o', out)
+        self.assertEqual(made.returncode, 0, made.stderr)
+        statement, by = seal.read_statement(held, out.read_bytes())
+        self.assertEqual((statement.number, statement.domain, statement.label, statement.release, by.name),
+                         (7, 'development', '1.2', 5, 'now'))
+        self.assertEqual(statement.manifest_sha256, hashlib.sha256(seal.body_of(sealed)).hexdigest())
+        self.assertEqual(statement.until_ms - statement.sealed_ms, 30 * 86_400_000)
+        self.assertLess(abs(statement.sealed_ms - time.time() * 1000), 60_000)
+        self.assertIn('statement 7 (development): list 1.2 is current, release 5 the newest', made.stdout)
+        self.assertIn('list 1.2 is current', self.tool('show', out).stdout)
+        self.assertIn('never overwritten', self.tool('current', '--key', key, '--domain', 'development', '--number', 7,
+                                                     '--list', listed, '--good-for', '30d', '--no-release', '-o', out).stderr)
+        # With the key elsewhere: a request, the 64 bytes that come back, and the statement.
+        request = self.dir / 'current.request.json'
+        asked = self.tool('current-request', '--domain', 'development', '--number', 8, '--list', listed, '--good-for', '10m',
+                          '--release', 5, '--manifest', 'ab' * 32, '-o', request)
+        self.assertEqual(asked.returncode, 0, asked.stderr)
+        fields = json.loads(request.read_text())
+        self.assertEqual((fields['topic'], fields['counter'], fields['domain'], fields['statement'], fields['list'],
+                          fields['release'], fields['needs'], fields['until_ms'] - fields['sealed_ms']),
+                         (seal.CURRENT_TOPIC, 8, 'development', 8, '1.2', 5, 'timestamp', 600_000))
+        message = bytes.fromhex(fields['auth_hex'])
+        self.assertEqual(seal.parse_statement(message[fields['statement_at']:]).number, 8)
+        self.assertIn(fields['auth_sha256'], asked.stdout, 'the hash is said before the file goes anywhere')
+        second = self.dir / 'current-8.wms2'
+        for name, signature in (('a release key', self.sign(message)), ('a stranger', signing(STRANGER)[1](message)),
+                                ('over other bytes', signing(NOW_KEY)[1](message + b'x'))):
+            with self.subTest(name):
+                refused = self.tool('current-attach', '--request', request, '--signature', signature.hex(), '--keys', listed,
+                                    '-o', second)
+                self.assertNotEqual(refused.returncode, 0)
+                self.assertFalse(second.exists())
+        attached = self.tool('current-attach', '--request', request, '--signature', signing(NOW_KEY)[1](message).hex(),
+                             '--keys', listed, '-o', second)
+        self.assertEqual(attached.returncode, 0, attached.stderr)
+        self.assertEqual(seal.read_statement(held, second.read_bytes())[0].number, 8)
+
+    def test_the_signing_tool_seals_no_statement_that_would_say_nothing(self):
+        listed, bare, key = self.dir / 'keys.txt', self.dir / 'bare.txt', self.dir / 'now.key'
+        listed.write_bytes(a_list(2, WITH_NOW))
+        bare.write_bytes(a_list(2))
+        key.write_text((bytes((NOW_KEY,)) * 32).hex() + '\n')
+        usual = ('--domain', 'development', '--number', 7, '--good-for', '1d')
+        cases = {'no release said': (*usual, '--list', listed),
+                 'a release with no manifest': (*usual, '--list', listed, '--release', 5),
+                 'an archive that is not sealed': (*usual, '--list', listed, '--archive', self.plain),
+                 'a time that is none': ('--domain', 'development', '--number', 7, '--good-for', 'soon', '--list', listed, '--no-release'),
+                 'no time at all': ('--domain', 'development', '--number', 7, '--good-for', '0d', '--list', listed, '--no-release'),
+                 'number 0': ('--domain', 'development', '--number', 0, '--good-for', '1d', '--list', listed, '--no-release'),
+                 'a list with no timestamp key': (*usual, '--list', bare, '--no-release')}
+        for name, arguments in cases.items():
+            with self.subTest(name):
+                out = self.dir / 'out.wms2'
+                result = self.tool('current', '--key', key, *arguments, '-o', out)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertTrue(result.stderr.startswith('sign: '), result.stderr)
+                self.assertFalse(out.exists())
+        asked = self.tool('current-request', *usual, '--list', bare, '--no-release', '-o', self.dir / 'r.json')
+        self.assertIn('names no timestamp key', asked.stderr)
+        self.assertEqual(self.tool('current', '--key', key, *usual, '--list', listed, '--no-release', '-o',
+                                   self.dir / 'none-yet.wms2').returncode, 0)
 
     def test_a_signature_is_attached_only_if_it_is_a_release_keys_over_this_request(self):
         release = self.dir / 'w1700k-release-4.tar'

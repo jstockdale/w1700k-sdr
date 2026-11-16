@@ -62,6 +62,9 @@ def main():
     parser.add_argument('--no-login-key', action='store_true',
                         help='give the unit no login key and carry none across from a root that '
                              'had one built in: it takes one from its reset button alone (init/key)')
+    parser.add_argument('--current', metavar='WHERE', default=settings['current'],
+                        help='with --bundle or --ssh: the statement of what is current, a file or an '
+                             'http(s) address; a keyed unit and its update are held to it')
     args = parser.parse_args()
     targets = (args.system, args.fit, args.rootfs, args.loader, args.durable)
     if args.bundle and (args.ssh or args.recovery or args.detect_only or args.no_boot or any(targets)):
@@ -83,7 +86,7 @@ def main():
         if args.bundle or (args.ssh and args.loader and args.rootfs):
             return remote.run_joint(settings, args.unit, authorized_key=args.authorized_key,
                                     bundle_path=args.bundle, no_login_key=args.no_login_key,
-                                    unsigned=args.unsigned)
+                                    unsigned=args.unsigned, current=args.current)
         if args.ssh and args.loader:
             return remote.run_loader(settings, args.unit, authorized_key=args.authorized_key,
                                      unsigned=args.unsigned)
