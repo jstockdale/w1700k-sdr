@@ -23,6 +23,7 @@ from . import bundle, config, layout, provision, seal
 from .console import StepFailed
 
 SCRIPT = config.ROOT / 'platform/rootfs/overlay/usr/sbin/system-update'
+HOSTKEY = config.ROOT / 'platform/rootfs/overlay/usr/sbin/w1700k-hostkey'
 STAGING = '/work/system-update.squashfs'      # in RAM on the unit
 LOADER_STAGING = '/work/system-update.loader'
 RELEASE_STAGING = '/work/system-update.release'
@@ -33,7 +34,7 @@ POWER_CYCLE_SECONDS = 900   # for the operator to power-cycle a unit that did no
 
 
 class Link:
-    """Commands on the unit over ssh, as root, against the host key init/provision recorded."""
+    """Commands on the unit over ssh, as root, against the host key the unit told its installer."""
 
     def __init__(self, settings, directory, authorized_key=None):
         self.address = settings.device_ip
@@ -77,6 +78,29 @@ def tool(link, *arguments, timeout=180):
     """Run system-update on the unit from this tree's copy; (exit status, its output)."""
     command = 'sh -s -- ' + ' '.join(shlex.quote(str(a)) for a in arguments)
     return link.call(command, data=SCRIPT.read_bytes(), timeout=timeout)
+
+
+def keep_host_key(link, loader_coming=False):
+    """Before a root is staged: the unit's ssh host key is in its durable storage, and its loader
+    hands it to the system. No root holds a host key any more, so a unit that ran a root from
+    before has the key built into that root carried across here, on the unit itself; the key
+    does not leave it. Without both, the new root would come up with a key made for that boot,
+    which this host refuses, and the update would be undone.
+
+    `loader_coming`: a loader that hands the key over is staged with the root."""
+    code, text = link.call('sh -s -- keep', data=HOSTKEY.read_bytes(), timeout=180)
+    if code:
+        raise StepFailed("the unit's ssh host key could not be kept in its durable storage: "
+                         f'{text.strip()[-300:]}')
+    if not any(line.startswith('hostkey ') for line in text.splitlines()):
+        raise StepFailed(f'the unit named no ssh host key that it keeps: {text.strip()[-300:]}')
+    code, text = link.call('cat /proc/cmdline', timeout=30)
+    if code:
+        raise StepFailed(f'the unit did not say how it was started: {text.strip()[-200:]}')
+    if not loader_coming and not re.search(r'(?:^|\s)w1700k\.hostkey=(?:handed|none)(?:\s|$)', text):
+        raise StepFailed("the loader on this unit does not hand the unit's ssh host key to the system, and "
+                         'this root holds none: update the loader with it (init/flash --ssh, or '
+                         'init/flash --bundle FILE)')
 
 
 def status(link):
@@ -228,8 +252,8 @@ def run(settings, serial=None, authorized_key=None, link=None, clock=time.monoto
     config.require_images(config.ROOTFS)
     serial = config.pick_unit(settings.data_dir, serial)
     directory = config.unit_dir(settings.data_dir, serial)
-    image, _ = provision.provision(directory, authorized_key, address=settings.device_ip,
-                                   no_login_key=no_login_key)
+    image = provision.provision(directory, authorized_key, address=settings.device_ip,
+                                no_login_key=no_login_key)
     data = Path(image).read_bytes()
     digest = hashlib.sha256(data).hexdigest()
     link = link or Link(settings, directory, authorized_key)
@@ -256,6 +280,7 @@ def run(settings, serial=None, authorized_key=None, link=None, clock=time.monoto
         raise StepFailed('the loader on this unit does not apply staged updates: flash it '
                          'once over the serial console (init/flash --loader)')
     check_layout(link)
+    keep_host_key(link)
     _, root_flags = present(link, admit(link, state, unsigned=unsigned), None)
 
     print(f'  rootfs: sending {Path(image).name} ({len(data)} bytes)')
@@ -333,8 +358,8 @@ def run_joint(settings, serial=None, authorized_key=None, bundle_path=None, link
         else:
             config.require_images(config.ROOTFS, config.LOADER_B)
             loader_data, generic = config.LOADER_B.read_bytes(), None
-        image, _ = provision.provision(directory, authorized_key, address=settings.device_ip, generic=generic,
-                                       no_login_key=no_login_key)
+        image = provision.provision(directory, authorized_key, address=settings.device_ip, generic=generic,
+                                    no_login_key=no_login_key)
     root_data = Path(image).read_bytes()
     root, loader = hashlib.sha256(root_data).hexdigest(), hashlib.sha256(loader_data).hexdigest()
     link = link or Link(settings, directory, authorized_key)
@@ -371,6 +396,8 @@ def run_joint(settings, serial=None, authorized_key=None, bundle_path=None, link
     if not need_root and not need_loader:
         print('  loader and rootfs: already current')
         return 0
+    if need_root:
+        keep_host_key(link, loader_coming=need_loader)
     loader_flags, root_flags = present(link, terms, sealed)
 
     for wanted, name, data, path, verb, flags in (

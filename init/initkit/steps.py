@@ -6,6 +6,7 @@ and reads back what it wrote before the next step relies on it. A failure stops
 the run at once; every step can be repeated.
 """
 from pathlib import Path
+import re
 import shutil
 
 from . import config, console as unit, layout, nand as parts, stock
@@ -169,6 +170,18 @@ def boot_installed(session):
     command(session.console, '/usr/sbin/verify-storage', expect='W1700K_STORAGE_READY',
             limit=120)
     return status
+
+
+def host_keys(session):
+    """In the installed system: the unit's host keys, public halves ("TYPE BASE64" each), with
+    the key it made for this boot kept as its own if it had none. None when its loader does not
+    hand host keys over: then the key is another one at every boot."""
+    console = session.console
+    said = command(console, '/usr/sbin/w1700k-hostkey status', limit=30)
+    if re.search(r'^loader=silent\s*$', said, re.M):
+        return None
+    kept = command(console, '/usr/sbin/w1700k-hostkey keep', limit=120)
+    return [line.split(None, 1)[1].strip() for line in kept.splitlines() if line.startswith('hostkey ')]
 
 
 def boot_recovery(session):

@@ -583,7 +583,8 @@ class Slot(unittest.TestCase):
         self.env = dict(os.environ, W1700K_KEYSLOT_RUN=str(self.dir / 'run'), W1700K_KEYSLOT_KEYS=str(self.dir / 'root/.ssh/authorized_keys'),
                         W1700K_KEYSLOT_BUILT_IN=str(self.dir / 'built-in'), W1700K_KEYSLOT_CMDLINE=str(self.dir / 'cmdline'),
                         W1700K_KEYSLOT_HOST_KEY=str(self.dir / 'host.pub'), W1700K_KEYSLOT_DURABLE_RUN=str(run),
-                        W1700K_KEYSLOT_DIR=str(self.dir / 'durable/key'))
+                        W1700K_KEYSLOT_DIR=str(self.dir / 'durable/key'),
+                        W1700K_KEYSLOT_HOSTKEY=str(self.dir / 'w1700k-hostkey'))
 
     def keyslot(self, verb, stdin='', ok=True):
         result = subprocess.run(['sh', str(KEYSLOT), verb], input=stdin, capture_output=True, text=True, env=self.env)
@@ -642,6 +643,21 @@ class Slot(unittest.TestCase):
         self.assertEqual(self.keys(), [ed25519(5) + ' paperclip'], 'and it works at once')
         self.assertEqual(self.record(), 'on 1')
         self.assertEqual(os.listdir(self.dir / 'durable/key'), ['slot'])
+
+    def test_programming_has_the_unit_keep_the_host_key_the_host_is_told(self):
+        """A unit with only a key for this boot would be another unit to the host at its next
+        boot. A hand is on the unit and its storage is being written: the key stays from here."""
+        hostkey = self.dir / 'w1700k-hostkey'
+        hostkey.write_text(f'#!/bin/sh\necho "$@" >> {self.dir}/hostkey-calls\nexit ${{HOSTKEY_STATUS:-0}}\n')
+        hostkey.chmod(0o755)
+        self.boot('w1700k.keyslot=empty')
+        result = self.keyslot('program', self.slot_form(ed25519(5)) + '\n')
+        self.assertEqual((self.dir / 'hostkey-calls').read_text().split(), ['keep'])
+        self.assertEqual(result.stdout.strip(), 'persist=1 hostkey=ssh-ed25519:HOSTBODY')
+        self.env['HOSTKEY_STATUS'] = '1'        # it has its own already, or cannot keep one
+        result = self.keyslot('program', self.slot_form(ed25519(6)) + '\n')
+        self.assertEqual(result.stdout.strip(), 'persist=1 hostkey=ssh-ed25519:HOSTBODY', 'the login key is in all the same')
+        self.assertEqual(self.keys(), [ed25519(6) + ' paperclip'])
 
     def test_a_new_key_replaces_the_one_in_the_slot(self):
         self.boot('w1700k.keyslot=empty')
@@ -771,7 +787,7 @@ class NoLoginKey(unittest.TestCase):
         self.said = []
 
     def root(self, **options):
-        image, _ = provision.provision(self.dir / 'unit', self.dir / 'k.pub', say=self.said.append, **options)
+        image = provision.provision(self.dir / 'unit', self.dir / 'k.pub', say=self.said.append, **options)
         listing = subprocess.run([str(config.SQUASHFS_TOOLS / 'unsquashfs'), '-l', str(image)],
                                  capture_output=True, text=True, check=True).stdout
         return {line.split('squashfs-root/', 1)[1] for line in listing.splitlines() if 'squashfs-root/' in line}
@@ -783,7 +799,8 @@ class NoLoginKey(unittest.TestCase):
     def test_with_the_option_the_root_has_no_login_key_and_everything_else(self):
         with_key, without = self.root(), self.root(no_login_key=True)
         self.assertEqual(with_key - without, {'root/.ssh/authorized_keys', 'root/.ssh'})
-        self.assertIn('etc/dropbear/dropbear_ed25519_host_key', without, 'the unit still has its host key')
+        self.assertFalse({name for name in with_key if 'host_key' in name}, 'no root holds a host key')
+        self.assertIn('usr/sbin/w1700k-hostkey', without, 'the unit has its own, from its durable storage')
         self.assertIn('usr/sbin/w1700k-key', without, 'and the button that gives it a login key')
         self.assertEqual((self.dir / 'unit/login-key').read_text().strip(), 'none')
         self.assertEqual(self.said, [])

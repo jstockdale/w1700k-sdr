@@ -5,6 +5,7 @@ import contextlib
 from pathlib import Path
 import re
 import shutil
+import struct
 import sys
 import tempfile
 import unittest
@@ -75,13 +76,12 @@ class Bench(unittest.TestCase):
         key = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA=='
         with mock.patch.object(install, 'open_session', self.open_session), \
                 mock.patch.object(provision, 'authorized_key', return_value=key.encode()), \
-                mock.patch.object(provision, 'provision', return_value=(self.unit_root, key)):
+                mock.patch.object(provision, 'provision', return_value=self.unit_root):
             return install.run(self.settings, **options)
 
     def flash(self, **options):
         with mock.patch.object(update, 'open_session', self.open_session), \
-                mock.patch.object(provision, 'provision',
-                                  return_value=(self.unit_root, 'ssh-ed25519 AAAA')):
+                mock.patch.object(provision, 'provision', return_value=self.unit_root):
             return update.run(self.settings, **options)
 
     def commands(self, state=None):
@@ -131,13 +131,60 @@ class Install(Bench):
         key = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA=='
         with mock.patch.object(install, 'open_session', self.open_session), \
                 mock.patch.object(provision, 'authorized_key', side_effect=provision.ProvisionError('no key')), \
-                mock.patch.object(provision, 'provision', return_value=(self.unit_root, key)) as provisioned, \
+                mock.patch.object(provision, 'provision', return_value=self.unit_root) as provisioned, \
                 mock.patch('builtins.print') as printed:
             self.assertEqual(install.run(self.settings, no_login_key=True), 0)
         self.assertTrue(provisioned.call_args.kwargs['no_login_key'])
         said = ' '.join(str(call.args[0]) for call in printed.call_args_list if call.args)
         self.assertIn('It has no login key: give it one with its reset button (init/key)', said)
         self.assertNotIn('Log in with', said)
+
+    def test_the_unit_keeps_the_host_key_it_made_and_the_host_learns_it_over_the_console(self):
+        unit = self.make_unit()
+        with mock.patch('builtins.print') as printed:
+            self.assertEqual(self.install(), 0)
+        directory = config.unit_dir(self.settings.data_dir, 'W1700KTEST0001')
+        self.assertTrue(unit.host_kept)
+        self.assertEqual((directory / provision.KNOWN_HOSTS).read_text(), f'{self.settings.device_ip} {unit.HOST_KEY}\n')
+        self.assertFalse((directory / provision.HOST_KEY).exists(), 'no private key of the unit is on the host')
+        linux = self.commands('linux')
+        self.assertLess(linux.index('/usr/sbin/verify-storage'), linux.index('/usr/sbin/w1700k-hostkey keep'),
+                        'storage is checked as it booted, before it is opened to keep the key')
+        said = ' '.join(str(call.args[0]) for call in printed.call_args_list if call.args)
+        self.assertIn('unit host key ' + provision.fingerprint(unit.HOST_KEY), said)
+
+    def test_a_root_flashed_over_the_console_leaves_the_host_knowing_the_units_key(self):
+        unit = self.make_unit(installed=True)
+        unit.state = 'linux'
+        directory = config.unit_dir(self.settings.data_dir, 'W1700KTEST0001')
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / provision.KNOWN_HOSTS).write_text(f'{self.settings.device_ip} ssh-ed25519 AAAAbefore\n')
+        with mock.patch('builtins.print') as printed, mock.patch.object(config, 'pick_unit', return_value='W1700KTEST0001'):
+            self.assertEqual(self.flash(rootfs=True), 0)
+        self.assertEqual((directory / provision.KNOWN_HOSTS).read_text(), f'{self.settings.device_ip} {unit.HOST_KEY}\n')
+        self.assertIn('the unit has a new ssh host key', ' '.join(str(c.args[0]) for c in printed.call_args_list if c.args))
+
+    def test_a_root_flashed_onto_a_unit_that_has_its_key_says_nothing_of_it(self):
+        unit = self.make_unit(installed=True)
+        unit.state, unit.host_kept, unit.host_loader = 'linux', True, 'handed'
+        directory = config.unit_dir(self.settings.data_dir, 'W1700KTEST0001')
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / provision.KNOWN_HOSTS).write_text(f'{self.settings.device_ip} {unit.HOST_KEY}\n')
+        with mock.patch('builtins.print') as printed:
+            self.assertEqual(self.flash(rootfs=True), 0)
+        self.assertNotIn('host key', ' '.join(str(c.args[0]) for c in printed.call_args_list if c.args))
+
+    def test_a_root_flashed_under_a_loader_from_before_host_keys_is_said_to_change_key_every_boot(self):
+        unit = self.make_unit(installed=True)
+        unit.state = 'linux'
+        unit.host_loader = 'silent'
+        directory = config.unit_dir(self.settings.data_dir, 'W1700KTEST0001')
+        directory.mkdir(parents=True)
+        with mock.patch('builtins.print') as printed, mock.patch.object(config, 'pick_unit', return_value='W1700KTEST0001'):
+            self.assertEqual(self.flash(rootfs=True), 0)
+        self.assertFalse(unit.host_kept)
+        self.assertFalse((directory / provision.KNOWN_HOSTS).exists())
+        self.assertIn('Flash the loader too', ' '.join(str(c.args[0]) for c in printed.call_args_list if c.args))
 
     def test_the_flag_installs_on_an_untested_nand_with_its_own_layout(self):
         unit = self.make_unit(part=LV)
@@ -640,15 +687,43 @@ class Prompts(unittest.TestCase):
 
 
 class Keys(unittest.TestCase):
-    def test_an_openssh_key_converts_to_dropbear(self):
-        if not shutil.which('ssh-keygen'):
-            self.skipTest('ssh-keygen is unavailable')
-        key = provision.generate_host_key()
-        self.assertEqual(len(key), 83)
-        self.assertEqual(key[:15], b'\0\0\0\x0bssh-ed25519')
-        public = provision.host_public_key(key)
-        self.assertTrue(public.startswith(b'ssh-ed25519 '))
-        self.assertTrue(provision.fingerprint(public.decode()).startswith('SHA256:'))
+    """The unit's ssh host key as the host has it: the public half alone, as the unit said it."""
+    PUBLIC = fake.FakeUnit.HOST_KEY
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.dir)
+
+    def test_what_a_unit_reports_becomes_its_known_hosts(self):
+        entries = provision.known_host(self.dir, '192.168.1.1', [self.PUBLIC])
+        self.assertEqual(entries, [f'192.168.1.1 {self.PUBLIC}'])
+        self.assertEqual((self.dir / provision.KNOWN_HOSTS).read_text(), f'192.168.1.1 {self.PUBLIC}\n')
+        self.assertTrue(provision.fingerprint(self.PUBLIC).startswith('SHA256:'))
+
+    def test_nothing_else_is_written_there(self):
+        kind, body = self.PUBLIC.split()
+        for lines in ([], ['hello'], [kind], [f'{kind} not-base64!'], [f'ssh-rsa {body}'], [f'ssh-dss {body}'],
+                      [f'{kind} {body} extra'], [f'{kind} {body}\n192.168.1.9 {kind} {body}'],
+                      [self.PUBLIC, 'garbage']):
+            with self.subTest(lines=lines), self.assertRaises(provision.ProvisionError):
+                provision.known_host(self.dir, '192.168.1.1', lines)
+        self.assertFalse((self.dir / provision.KNOWN_HOSTS).exists())
+
+    def test_a_key_is_found_in_a_pub_file_a_known_hosts_line_or_what_the_installer_printed(self):
+        for text in (f'{self.PUBLIC} root@w1700k-sdr\n', f'192.168.1.1 {self.PUBLIC}\n',
+                     f'# the unit\n\nhostkey {self.PUBLIC}\n'):
+            self.assertEqual(provision.public_lines(text), [self.PUBLIC])
+        self.assertEqual(provision.public_lines('nothing here\nssh-ed25519\n'), [])
+
+    def test_a_directory_from_before_gets_its_known_hosts_from_the_key_it_holds(self):
+        key = struct.pack('>I', 11) + b'ssh-ed25519' + struct.pack('>I', 64) + bytes(range(64))
+        (self.dir / provision.HOST_KEY).write_bytes(key)
+        provision.legacy_known_host(self.dir, '192.168.1.1')
+        line = (self.dir / provision.KNOWN_HOSTS).read_text()
+        self.assertEqual(line, '192.168.1.1 ' + provision.host_public_key(key).decode() + '\n')
+        (self.dir / provision.KNOWN_HOSTS).write_text('192.168.1.1 ssh-ed25519 AAAAnewer\n')
+        provision.legacy_known_host(self.dir, '192.168.1.1')
+        self.assertIn('AAAAnewer', (self.dir / provision.KNOWN_HOSTS).read_text(), 'what the unit said later stands')
 
     def test_a_non_key_is_refused(self):
         with tempfile.NamedTemporaryFile('w', suffix='.pub') as stream:

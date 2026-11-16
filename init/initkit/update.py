@@ -34,8 +34,8 @@ def run(settings, serial=None, fit=False, rootfs=False, durable=False, loader=Fa
     image = None
     if rootfs:
         serial = config.pick_unit(settings.data_dir, serial)
-        image, _ = provision.provision(config.unit_dir(settings.data_dir, serial),
-                                       authorized_key, address=settings.device_ip, no_login_key=no_login_key)
+        image = provision.provision(config.unit_dir(settings.data_dir, serial),
+                                    authorized_key, address=settings.device_ip, no_login_key=no_login_key)
     with open_session(settings, 'flash', write=not recovery) as session:
         console, log = session.console, session.log
         state = unit.identify(console, log)
@@ -80,8 +80,27 @@ def run(settings, serial=None, fit=False, rootfs=False, durable=False, loader=Fa
             print('flash: left at the loader prompt')
             return 0
         status = steps.boot_installed(session)
+        if rootfs:
+            host_keys(session, config.unit_dir(settings.data_dir, serial), settings.device_ip)
     print(f'flash: done; {status}')
     return 0
+
+
+def host_keys(session, directory, address):
+    """After a root was written over the console: the host key the unit now answers with is
+    recorded, and said when it is not the one this host knew the unit by (a root from before
+    host keys left the root had its key built in, and that key went with it)."""
+    known = directory / provision.KNOWN_HOSTS
+    before = known.read_text() if known.is_file() else None
+    lines = steps.host_keys(session)
+    if lines is None:
+        print("flash: this unit's loader does not hand its ssh host key to the system, so the unit has\n"
+              '       another host key at every boot. Flash the loader too (init/flash --loader)')
+        return
+    provision.known_host(directory, address, lines)
+    if before is not None and known.read_text() != before:
+        print(f'flash: the unit has a new ssh host key, recorded in {known}; a host that knew the old '
+              'one will say so')
 
 
 def update_loader(session, state):

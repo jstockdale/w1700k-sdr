@@ -1,0 +1,184 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# The unit's ssh host keys: who it is to a host that logs in. They are the unit's own, kept in its
+# durable storage and in no root image, so one root fits every unit and an update never changes
+# who the unit is.
+#
+#   w1700k-hostkey boot             at start-up: the keys the loader handed over go where
+#                                   Dropbear reads them, in RAM; with none, a key for this boot
+#   w1700k-hostkey keep [--replace] the keys this boot uses become the unit's lasting ones
+#   w1700k-hostkey status           what this boot uses, and what the loader said
+#
+# They are a file in durable storage, `ssh/host`, in the form the loader imports, one line a kind,
+# each the key file as Dropbear writes it, in hex:
+#
+#   host_ed25519=0000000b7373682d65643235353139...
+#   host_ecdsa=...                  (a second kind; no tool here makes one yet)
+#
+# Linux opens durable storage only to change it. At every boot it is the loader that reads the
+# file and puts each key into the device tree it hands over, `/chosen/security-w1700k-host-KIND`
+# (the kernel shows a property of that name to root alone), and says on the kernel command line
+# only that it did: `w1700k.hostkey=handed|none`. A loader that says nothing does not know of
+# host keys: a key kept then is not used until the loader is a newer one.
+#
+# With no key handed over the unit makes one for this boot, so it can still be reached; it is
+# another one at the next boot, and `status` says `temporary`. `keep` makes it the unit's own. A
+# key that is there already is not replaced without --replace. On a root from before host keys
+# left the root, `keep` carries the key built into that root across.
+#
+# What this boot has goes to /run/w1700k-hostkey, "STATE LOADER". `keep` and `status` print each
+# key's public half, `hostkey TYPE BASE64`, as a known_hosts line has it.
+set -eu
+RUN=${W1700K_HOSTKEY_RUN:-/run/w1700k-hostkey}
+KEYS=${W1700K_HOSTKEY_KEYS:-/etc/dropbear}
+CHOSEN=${W1700K_HOSTKEY_CHOSEN:-/proc/device-tree/chosen}
+CMDLINE=${W1700K_HOSTKEY_CMDLINE:-/proc/cmdline}
+DURABLE_RUN=${W1700K_HOSTKEY_DURABLE_RUN:-/usr/sbin/durable-run}
+STORE=${W1700K_HOSTKEY_DIR:-/durable/ssh}
+DROPBEARKEY=${W1700K_HOSTKEY_DROPBEARKEY:-dropbearkey}
+KINDS='ed25519 ecdsa'
+HEX_MOST=900			# the loader's command line holds a little over this
+
+fail() { echo "w1700k-hostkey: $*" >&2; exit 1; }
+
+file_of() { echo "$KEYS/dropbear_${1}_host_key"; }
+
+# The public half of the key file $2, if it is a key of kind $1: "TYPE BASE64".
+public()
+{
+	case $1 in ed25519) type='ssh-ed25519 ' ;; ecdsa) type='ecdsa-sha2-nistp' ;; *) return 1 ;; esac
+	line=$("$DROPBEARKEY" -y -f "$2" 2>/dev/null | grep "^$type" | head -n 1 | cut -d' ' -f1,2) || return 1
+	case $line in "$type"*) ;; *) return 1 ;; esac
+	case $line in *' '?*) echo "$line" ;; *) return 1 ;; esac
+}
+
+# The key of kind $1 that the loader handed over as hex $2, put where Dropbear reads it.
+take()
+{
+	case $2 in *[!0-9a-f]* | '') return 1 ;; esac
+	[ ${#2} -le "$HEX_MOST" ] && [ $((${#2} % 2)) = 0 ] || return 1
+	file=$(file_of "$1")
+	rm -f "$file.part"
+	( umask 077; printf %s "$2" | xxd -r -p > "$file.part" ) || return 1
+	if line=$(public "$1" "$file.part"); then
+		mv "$file.part" "$file"
+		echo "$line" > "$file.pub"
+	else
+		rm -f "$file.part"
+		return 1
+	fi
+}
+
+# A key for this boot alone.
+make()
+{
+	file=$(file_of ed25519)
+	rm -f "$file" "$file.pub"
+	( umask 077; "$DROPBEARKEY" -t ed25519 -f "$file" > /dev/null 2>&1 ) || return 1
+	line=$(public ed25519 "$file") || return 1
+	echo "$line" > "$file.pub"
+}
+
+record() { echo "$1 $2" > "$RUN.part"; mv "$RUN.part" "$RUN"; }
+
+said()
+{
+	loader=silent
+	for word in $(cat "$CMDLINE"); do
+		case $word in w1700k.hostkey=handed | w1700k.hostkey=none) loader=${word#*=} ;; esac
+	done
+}
+
+# What this boot has. A root from before host keys left it never ran `boot` and has no record:
+# the key it uses is the one built into it (`built-in`), which `keep` carries across.
+known()
+{
+	if [ -r "$RUN" ]; then
+		read -r state loader < "$RUN"
+	else
+		state=built-in
+		said
+	fi
+}
+
+show()
+{
+	for kind in $KINDS; do
+		[ ! -r "$(file_of "$kind").pub" ] || echo "hostkey $(cat "$(file_of "$kind").pub")"
+	done
+}
+
+case ${1:-} in
+boot)
+	# The root as built links this to a RAM directory; it is one itself here, also in RAM.
+	[ ! -L "$KEYS" ] || rm -f "$KEYS"
+	mkdir -p "$KEYS"
+	chmod 700 "$KEYS"
+	said
+	got=0 bad=0
+	for kind in $KINDS; do
+		rm -f "$(file_of "$kind")" "$(file_of "$kind").pub"
+		property=$CHOSEN/security-w1700k-host-$kind
+		[ -r "$property" ] || continue
+		if take "$kind" "$(tr -d '\000' < "$property")"; then
+			got=1
+		else
+			echo "w1700k-hostkey: the loader handed over no usable $kind key" >&2
+			bad=1
+		fi
+	done
+	if [ "$got" = 1 ]; then
+		record lasting "$loader"
+	else
+		make || { record none "$loader"; fail "no host key could be made for this boot"; }
+		record temporary "$loader"
+	fi
+	[ "$bad" = 0 ]
+	;;
+keep)
+	replace=
+	case ${2:-} in '') ;; --replace) replace=replace ;; *) fail "usage: w1700k-hostkey keep [--replace]" ;; esac
+	known
+	if [ "$state" = lasting ] && [ -z "$replace" ]; then	# they are what durable storage holds
+		show
+		exit 0
+	fi
+	lines=0
+	for kind in $KINDS; do
+		[ ! -r "$(file_of "$kind")" ] || lines=$((lines + 1))
+	done
+	[ "$lines" -gt 0 ] || fail "this boot has no host key to keep"
+	# The keys go in on stdin, so no command line carries one.
+	written=$(for kind in $KINDS; do
+			[ -r "$(file_of "$kind")" ] || continue
+			printf 'host_%s=%s\n' "$kind" "$(xxd -p "$(file_of "$kind")" | tr -d '\n')"
+		done | "$DURABLE_RUN" sh -c '
+		set -e
+		umask 077
+		mkdir -p "$1"
+		cat > "$1/host.part"
+		[ -s "$1/host.part" ]
+		if [ -s "$1/host" ] && cmp -s "$1/host.part" "$1/host"; then
+			rm -f "$1/host.part"; echo "host: written"
+		elif [ -s "$1/host" ] && [ -z "$2" ]; then
+			rm -f "$1/host.part"; echo "host: there"
+		else
+			mv "$1/host.part" "$1/host"; echo "host: written"
+		fi' sh "$STORE" "$replace" | sed -n 's/^host: //p')
+	case $written in
+	written) [ "$state" = built-in ] || record lasting "$loader"; show ;;
+	there) fail "the unit has host keys that this boot was not handed (its loader does not hand them over, or they are damaged); --replace puts this boot's key in their place" ;;
+	*) fail "the host keys could not be written" ;;
+	esac
+	;;
+status)
+	known
+	echo "hostkey=$state"
+	echo "loader=$loader"
+	show
+	;;
+*)
+	echo "usage: w1700k-hostkey boot | keep [--replace] | status" >&2
+	exit 2
+	;;
+esac
