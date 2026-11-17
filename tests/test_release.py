@@ -2051,7 +2051,7 @@ class Bench(Scripted):
         self.assertEqual(self.keys.read_bytes(), third)
         # The development lists in the repository, as the tool reads a directory of them.
         development = keying.in_order(path.read_bytes() for path in sorted((SEAL / 'development').glob('*.wms2')))
-        self.assertEqual([seal.parse_list(seal.body_of(envelope)).label for envelope in development], ['1.1', '1.2', '2.1', '2.2'])
+        self.assertEqual([seal.parse_list(seal.body_of(envelope)).label for envelope in development], ['1.1', '1.2', '2.1', '2.2', '2.3'])
         bundle.chain(development)
 
     def test_lists_that_do_not_follow_one_from_another_are_not_sent(self):
@@ -2558,7 +2558,10 @@ class Issued(unittest.TestCase):
              ('2.2', 'w1700k-sdr-authority-dev-primary-2', 'keys',
               {'w1700k-sdr-timestamp-dev': ('68b2037fe4017650', 'b4e6cec6cf24308f',
                                             '6a7d2aabceae02f35ec8470d2d28120aa45ab5bc299643b70ab034b2d66b3e7e'
-                                            '144de4ad32eb2e228cb42f5bf00dc65b93190aca6b55a6e263c70bc85be6a600')}))
+                                            '144de4ad32eb2e228cb42f5bf00dc65b93190aca6b55a6e263c70bc85be6a600')}),
+             # The same five keys under the next generation: sealed so that a statement of what is
+             # current could name a list a unit did not hold yet.
+             ('2.3', 'w1700k-sdr-authority-dev-primary-2', 'keys', {}))
 
     def chain(self):
         sealed = [path.read_bytes() for path in self.CHAIN.glob('*.wms2')]
@@ -2626,7 +2629,7 @@ class Issued(unittest.TestCase):
                                         '--out', str(held), str(sealed)], capture_output=True, text=True)
                 self.assertEqual(taken.returncode, 0, taken.stderr)
             self.assertEqual(seal.body_of(links(held.read_bytes())[-1]), seal.body_of(self.chain()[-1]))
-            self.assertEqual([seal.parse_list(seal.body_of(link)).label for link in links(held.read_bytes())], ['1.1', '2.1', '2.2'],
+            self.assertEqual([seal.parse_list(seal.body_of(link)).label for link in links(held.read_bytes())], ['1.1', '2.1', '2.3'],
                              'the first list, the one that began the epoch it is in, and the one it holds')
 
 
