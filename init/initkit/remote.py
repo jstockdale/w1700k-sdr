@@ -232,6 +232,11 @@ def consult(link, state, where, terms, archive_release=None, now_ms=None, fetch=
     the unit is shown it and keeps the newest: a unit that has been shown a newer list than its
     own exists takes no release until it holds it.
 
+    The newest statement shown is the system's, not the unit's alone: one older than the
+    statement the unit keeps says nothing here either, however good its dates. A host whose
+    judgement could be put back by a stale copy of the statement would be no window at all for
+    the units behind it.
+
     Nothing here locks an owner out. No statement, one that cannot be had, or one out of date
     is said, loudly, and the update goes on. Only a statement that is good stops an update: when
     it says the unit's list is superseded and this update does not bring the newer one, or that
@@ -260,12 +265,22 @@ def consult(link, state, where, terms, archive_release=None, now_ms=None, fetch=
         say(f'the statement at {where} names list {statement.label}, older than the {held.label} this unit holds: '
             'it is OUT OF DATE and says nothing. Going on without it')
         return
+    kept = int(state.get('current_statement') or 0)
+    if statement.number < kept:
+        say(f'the statement at {where} is statement {statement.number}, and this unit keeps statement {kept}: it is '
+            'AN OLDER ONE than the unit has been shown, and says nothing. Going on without it')
+        return
+    if statement.number == kept and (statement.label, str(statement.release), str(statement.until_ms)) != (
+            state.get('current_list'), state.get('current_release'), state.get('current_until')):
+        say(f'the statement at {where} is ANOTHER statement {kept} than the one this unit keeps: two were sealed '
+            'under one number. It says nothing. Going on without it')
+        return
     stamp = lambda ms: time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(ms / 1000))
     print(f'  current: list {statement.label}' + (f', release {statement.release}' if statement.release else ', no release')
           + f' (statement {statement.number}, sealed {stamp(statement.sealed_ms)} by {by.name}, good until '
           f'{stamp(statement.until_ms)})')
     # The unit keeps the newest it is shown, whatever its dates: it has no clock to hold them to.
-    if 'current' in state and int(state.get('current_statement') or 0) < statement.number:
+    if 'current' in state and kept < statement.number:
         code, text = link.call(f'cat > {STATEMENT_STAGING}', data=data)
         if code == 0:
             code, text = tool(link, 'current', STATEMENT_STAGING)

@@ -76,12 +76,13 @@ installation, the first loader and the kernel image.
   (the item above); and nothing yet fetches the newest release and the
   rotations for a host to hand to its unit.
 - **Keyed units, before one ships.** Found by review and not built:
-  - *What is current, in use.* The statement of the newest list and release
-    is built: sealed by a `timestamp` key, held to its dates by the host,
-    kept by the unit, which then refuses releases while it knows of a newer
-    list (`seal/README.md`). Not yet done: a `timestamp` key in the lists
-    that are issued, an address where statements are published, and a unit
-    that has been through it with those keys.
+  - *What is current, published.* The statement of the newest list and
+    release is built and has been through a unit with the development keys:
+    a good one kept, one out of date said and stopping nothing, a stale copy
+    disregarded, and a unit shown a newer list refusing releases until given
+    it (`seal/README.md`). Not yet done: an address where statements are
+    published and the habit of sealing one each week; and all of it for the
+    production domain.
   - *The first list, checked by machine.* The bench shows fingerprints and a
     person compares them. For a unit that ships, the tool should hold the
     list to a signed record of the keys issued, as an exact set.
