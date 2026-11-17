@@ -167,6 +167,11 @@ nothing a unit installs and so can be used often.
   not made a thing every unit depends on. A statement that is good stops an
   update in two cases: it names a newer list than the unit's and the update
   does not bring that list, or the archive is older than the newest release.
+- **The newest shown is the system's, not the unit's alone.** The host asks
+  the unit which statement it keeps, and one older than that says nothing to
+  the host either, however good its dates: a stale copy of the statement
+  cannot put the host's judgement back. Another statement under the number
+  the unit keeps is said, and says nothing.
 - **The unit keeps the newest it was shown**, whatever its dates, sealed, in
   its durable storage, and reads it by its seal each time as it reads its
   list. Once that names a newer list than the unit holds, the unit takes no

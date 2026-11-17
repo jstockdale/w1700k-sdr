@@ -481,6 +481,8 @@ for good. Getting it sends nothing about the unit or its owner.)
 - A unit shown that a newer list than its own exists takes no release until
   it holds that list. The lists a release carries bring it there.
 - An archive older than the newest release is not sent.
+- A statement older than the one the unit keeps says nothing, however good
+  its dates: a stale copy cannot put things back.
 - No statement, one that cannot be fetched or one out of date is said in
   capitals and the update goes on.
 

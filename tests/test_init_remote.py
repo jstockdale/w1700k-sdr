@@ -806,6 +806,9 @@ class ReleaseUnit(JointUnit):
                                  f'release_keys={len(self.held.release_keys()) if self.held else 0}\n'
                                  f'release={self.floor}\nrelease_manifest={self.settled}\n'
                                  + (f'current={self.now()}\ncurrent_statement={self.statement.number if self.statement else ""}\n'
+                                    f'current_list={self.statement.label if self.statement else ""}\n'
+                                    f'current_release={self.statement.release if self.statement else ""}\n'
+                                    f'current_until={self.statement.until_ms if self.statement else ""}\n'
                                     if self.knows_statements else ''))
         if verb == 'current':
             self.calls.append(command)
@@ -1155,12 +1158,48 @@ class WhatIsCurrent(Releases):
         self.assertEqual((unit.running, unit.floor), (self.root, 4))
         self.assertLess(self.verbs(unit).index('current'), self.verbs(unit).index('release'), 'before the release is judged')
 
-    def test_a_unit_that_keeps_this_statement_or_a_newer_one_is_not_shown_it_again(self):
+    def test_a_unit_that_keeps_this_statement_is_not_shown_it_again(self):
         unit = ReleaseUnit(self.held)
-        unit.statement = seal.read_statement(self.held, self.statement(9).read_bytes())[0]
+        unit.statement = seal.read_statement(self.held, self.statement(7).read_bytes())[0]
         self.assertEqual(self.run_update(unit, self.release(4), current=self.statement(7)), 0)
         self.assertNotIn('current', self.verbs(unit))
-        self.assertEqual(unit.statement.number, 9)
+        self.assertNotIn('CURRENT:', self.said())
+        self.assertIn('current: list 1.1, release 4 (statement 7', self.said())
+
+    def test_a_statement_older_than_the_one_the_unit_keeps_says_nothing_however_good_its_dates(self):
+        """A stale copy of the statement must not put the host's judgement back: the newest shown
+        is the system's, not the unit's alone."""
+        unit = ReleaseUnit(self.held)
+        unit.statement = seal.read_statement(self.held, self.statement(9).read_bytes())[0]
+        stale = self.statement(7, release=6)        # within its day, and it would stop this archive
+        self.assertEqual(self.run_update(unit, self.release(4), current=stale), 0)
+        self.assertIn('CURRENT: ', self.said())
+        self.assertIn('is statement 7, and this unit keeps statement 9', self.said())
+        self.assertIn('AN OLDER ONE', self.said())
+        self.assertNotIn('current: list', self.said(), 'nothing of it is said as what is current')
+        self.assertNotIn('current', self.verbs(unit))
+        self.assertEqual((unit.statement.number, unit.floor), (9, 4))
+        # The other way about, the stale copy cannot make a superseded unit look current either.
+        newer = keys_list(2, *USUAL, self.NOW)
+        unit = ReleaseUnit(self.held)
+        unit.statement = seal.read_statement(self.held, self.statement(9, newer).read_bytes())[0]
+        self.printed.reset_mock()
+        with self.assertRaisesRegex(StepFailed, 'does not take this release'):
+            self.run_update(unit, self.release(4), current=self.statement(7))
+        self.assertIn('AN OLDER ONE', self.said())
+        self.assertEqual(unit.now(), 'behind', 'the unit holds its own line whatever the host was handed')
+
+    def test_another_statement_under_the_number_the_unit_keeps_says_nothing(self):
+        unit = ReleaseUnit(self.held)
+        unit.statement = seal.read_statement(self.held, self.statement(7).read_bytes())[0]
+        for name, options in (('another release', {'release': 6}), ('other dates', {'good_for': 3_600_000})):
+            with self.subTest(name):
+                self.printed.reset_mock()
+                (self.work / 'current-7.wms2').unlink()
+                self.assertEqual(self.run_update(unit, self.release(4), current=self.statement(7, **options)), 0)
+                self.assertIn('ANOTHER statement 7 than the one this unit keeps', self.said())
+                self.assertNotIn('current', self.verbs(unit))
+                self.assertEqual(unit.floor, 4)
 
     def test_an_archive_older_than_the_current_release_is_not_sent(self):
         unit = ReleaseUnit(self.held)
