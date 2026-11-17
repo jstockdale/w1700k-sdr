@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="192 192 640 640" role="img" aria-labelledby="t">
+<title id="t">w1700k-sdr</title>
+<rect x="192" y="192" width="640" height="640" rx="140" fill="#0b1612"/>
+<rect x="236" y="236" width="552" height="552" rx="104" ry="104" fill="none" stroke="#5ff0b0" stroke-width="30"/>
+<rect x="468" y="318" width="88" height="16" rx="8" ry="8" fill="#5ff0b0"/>
+<path d="M300 672 L332 664 L352 676 L372 624 L388 676 L404 668 L420 548 L430 676 L450 666 L472 590 L484 676 L504 670 L522 446 L534 676 L560 666 L582 618 L598 676 L622 670 L642 520 L654 676 L682 666 L702 656 L724 672" fill="none" stroke="#5ff0b0" stroke-width="16" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M300 672 L332 664 L352 676 L372 624 L388 676 L404 668 L420 548 L430 676 L450 666 L472 590 L484 676 L504 670 L522 446 L534 676 L560 666 L582 618 L598 676 L622 670 L642 520 L654 676 L682 666 L702 656 L724 672 L724 690 L300 690 Z" fill="#5ff0b0" fill-opacity="0.16"/>
+</svg>

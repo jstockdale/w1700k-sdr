@@ -1,4 +1,9 @@
-# W1700K SDR
+<h1>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/lockup-dark.svg">
+    <img alt="W1700K SDR" src="assets/lockup-light.svg" width="776">
+  </picture>
+</h1>
 
 Turns a Gemtek W1700K Wi-Fi 7 router into a wideband software-defined receiver.
 The router's MediaTek MT7996 radio captures raw 14-bit IQ at up to 320 Msps,
@@ -143,6 +148,7 @@ between them, in 1.22 kHz bins.*
 | [`init/`](init/README.md) | Installation from stock, updates, recovery, return to stock |
 | [`include/hw/`](include/hw/README.md) | Register reference: every known MT7996, A-die and AN7581 register, as C headers |
 | [`docs/`](docs/) | [Architecture](docs/architecture.md), [the front LED](docs/led.md), [roadmap](docs/roadmap.md) |
+| [`assets/`](assets/README.md) | The project's mark and wordmark as SVG and PNG, their colours, and how they are generated |
 | `tests/`, `tools/` | The test suite and its report page (`tools/test_report.py`), the on-unit sweep of the stream modes (`tools/unit_sweep.py`), a trial of the host's receive settings (`tools/host_rx_trial`), a benchmark of what the host takes in (`tools/host_bench.py`), and the driver and notes for a USB adapter on the stream link ([`tools/r8152-rtl8159`](tools/r8152-rtl8159/README.md)) |
 
 ## Getting started
