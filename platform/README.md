@@ -374,9 +374,31 @@ net_export_mtu=9000
 `tests/test_network.py` runs the program over directories, and
 `tests/test_loader_update.py` the loader's side through its model.
 
+### Which board a unit is
+
+One set of images runs on the W1700K, the W1700K2 and the XR1710G, the same
+design under another label ([`docs/boards/xr1710g.md`](../docs/boards/xr1710g.md)).
+[`boards.py`](boards.py) has the boards and what each has of its own, which is
+one thing: the W1700K has a GPS receiver on line 43 of the pin controller, and
+on the XR1710G that line is a port LED.
+
+- **The loader names the unit at every boot** (`board_id`, second in
+  `bootcmd`): it reads the first page of `calibration`, takes
+  `serial_number` from the factory identity there and nothing else, and goes by
+  how the serial begins. `XR1710G…` is `xr1710g`, `W1700K…` is `w1700k`, and
+  anything else, or an identity it cannot read, is `unknown`.
+- **Nothing on the unit can change the answer**: `calibration` is read-only to
+  the loader and to Linux, and nothing is stored anywhere else.
+- **The system is told** in the device tree, `/chosen/w1700k,board`, and on the
+  kernel command line, `w1700k.board=`. A root under a loader from before this
+  finds neither, and is on a W1700K.
+- **`gps_off` still comes first, on every board**, because a unit that cannot
+  be named has to be taken for one with a receiver. On an XR1710G that lights
+  the LED for a moment; `board_id` then drives the line high again.
+
 ### The GPS receiver
 
-The board carries an Airoha AG3352 GNSS receiver, which the stock firmware
+The W1700K carries an Airoha AG3352 GNSS receiver, which the stock firmware
 used to report where the unit is for 6 GHz power control. Nothing of ours
 uses it, and it is held off.
 
@@ -389,7 +411,8 @@ uses it, and it is held off.
   to a line that is not yet an output is lost on this chip. So every root has
   the receiver off without having to remember to.
 - **`w1700k-gps on`, `off` and `status`**, in the root, drive and read the same
-  line. `on` lasts until the unit next starts.
+  line. `on` lasts until the unit next starts. On a board the loader names as
+  one without a receiver (the XR1710G) it does nothing, and says so.
 - **Its data** comes out of the SoC's high-speed UART (`serial@1fbe1000`, pin
   group `hsuart`), which is disabled in our device tree: no program can open
   it. Where a unit is stays with its owner.
