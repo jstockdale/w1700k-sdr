@@ -15,6 +15,7 @@ one is there, the page shows it too, with when it was run.
 """
 import argparse
 import ast
+import base64
 import datetime
 import html
 import json
@@ -137,6 +138,7 @@ body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.5 system-ui
 main { max-width:1040px; margin:0 auto; padding:28px 16px 64px; }
 h1 { font-size:22px; margin:0 0 2px; } h2 { font-size:16px; margin:34px 0 10px; }
 .sub { color:var(--soft); font-size:13px; }
+.head { display:flex; align-items:center; gap:14px; } .head img { flex:none; border-radius:10px; }
 .verdict { display:flex; flex-wrap:wrap; gap:10px; margin:18px 0 6px; }
 .tile { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:10px 16px; min-width:112px; }
 .tile b { display:block; font-size:24px; line-height:1.2; font-variant-numeric:tabular-nums; }
@@ -223,6 +225,16 @@ def sweep_html(sweep):
             + ''.join(rows) + '</table></div></details>')
 
 
+def mark():
+    """The project's mark as a data URI (assets/favicon.svg), for a page that must stay one file;
+    nothing where the file is not there."""
+    try:
+        svg = (ROOT / 'assets' / 'favicon.svg').read_bytes()
+    except OSError:
+        return ''
+    return 'data:image/svg+xml;base64,' + base64.b64encode(svg).decode()
+
+
 def page(report, sweep=None):
     counts = report['counts']
     bad = counts['failed'] + counts['error']
@@ -232,12 +244,15 @@ def page(report, sweep=None):
     commit = report['commit'] + (' with uncommitted changes' if report['modified'] else '')
     slow_rows = ''.join(f'<tr><td>{html.escape(words(t["name"]))}<span class="group">{html.escape(t["module"])}'
                         f'</span></td><td class="t">{t["seconds"]:.2f} s</td></tr>' for t in slow)
+    icon = mark()
     return f'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>W1700K SDR test report</title><style>{CSS}</style></head><body><main>
+<title>W1700K SDR test report</title>{f'<link rel="icon" href="{icon}" type="image/svg+xml">' if icon else ''}<style>{CSS}</style></head><body><main>
+<div class="head">{f'<img src="{icon}" width="44" height="44" alt="">' if icon else ''}<div>
 <h1>{verdict}</h1>
 <div class="sub">W1700K SDR test suite · {html.escape(report['when'])} · {html.escape(report['branch'])} at {html.escape(commit)}
  · {html.escape(report['host'])}</div>
+</div></div>
 <div class="verdict">
 <div class="tile ok"><b>{counts['passed']}</b><span>passed</span></div>
 <div class="tile{' bad' if bad else ''}"><b>{bad}</b><span>failed</span></div>

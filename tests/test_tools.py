@@ -2,8 +2,10 @@
 """The test report (tools/test_report.py) run on a small suite of its own: what it records of a
 pass, a failure, an error and a skip, its exit status, and the page; and the list of modes the
 on-unit sweep (tools/unit_sweep.py) walks for a link, which needs no unit to work out."""
+import base64
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -79,6 +81,21 @@ class Report(unittest.TestCase):
         self.assertIn('<details open>', self.page, 'a module with failures is open')
         self.assertIn('No sweep of the stream modes on a real unit', self.page)
         self.assertNotIn('<script', self.page, 'one file, nothing fetched or run')
+
+    def test_the_page_carries_the_projects_mark_and_stays_one_file(self):
+        """The mark is assets/favicon.svg, put into the page itself: its tab icon and beside its title."""
+        favicon = (ROOT / 'assets' / 'favicon.svg').read_bytes()
+        uri = 'data:image/svg+xml;base64,' + base64.b64encode(favicon).decode()
+        self.assertIn(f'<link rel="icon" href="{uri}"', self.page)
+        self.assertIn(f'<img src="{uri}"', self.page)
+        self.assertIsNone(re.search(r'(src|href)="(?!data:)', self.page), 'nothing the page would have to fetch')
+
+    def test_the_spectrum_pages_icon_is_the_same_mark(self):
+        """The web UI's files are compiled into the server from their own directory, so its icon is
+        a copy: the two are held together here."""
+        icon = (ROOT / 'host' / 'spectrum' / 'web' / 'icon.svg').read_text()
+        self.assertTrue(icon.endswith((ROOT / 'assets' / 'favicon.svg').read_text()),
+                        'host/spectrum/web/icon.svg is assets/favicon.svg after its two comment lines')
 
     def test_a_sweep_left_beside_it_is_shown(self):
         import test_report
