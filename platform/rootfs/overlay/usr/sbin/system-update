@@ -80,22 +80,45 @@ CONSOLE=/dev/console		# where the bench is
 fail() { echo "system-update: $*" >&2; exit 1; }
 
 # Whatever this run leaves in RAM goes with it, and so does its hold on the unit.
-trap 'rm -f "$HELD" "$HELD.new" "$HELD.new.part" "$SEEN" "$SEEN.new" "$SEEN.new.part"; [ -z "${LOCKED:-}" ] || rm -rf "$LOCK"' EXIT
+trap 'rm -f "$HELD" "$HELD.new" "$HELD.new.part" "$SEEN" "$SEEN.new" "$SEEN.new.part"; rm -rf "$LOCK.$$" "$LOCK.dead.$$"; [ -z "${LOCKED:-}" ] || rm -rf "$LOCK"' EXIT
 trap 'exit 130' INT TERM HUP
 
 alone()		# nothing else changes this unit's update state or its keys while this run does
 {
-	if ! mkdir "$LOCK" 2>/dev/null; then
+	# The hold is a directory with its holder's process number in it, and it appears whole:
+	# made under a name of this run's own and renamed, and a rename onto a hold that is
+	# there fails. (It was made in place and then written into. A second run that looked
+	# between the two found a hold with no number, took it for one a killed run had left,
+	# and removed it: both went on.)
+	mine=$LOCK.$$
+	rm -rf "$mine"
+	mkdir "$mine" && echo "$$" > "$mine/pid" || fail "this run could not take its hold on the unit"
+	if ! mv -T "$mine" "$LOCK" 2>/dev/null; then
 		# A run that was killed left its hold behind; one that still runs keeps it.
 		other=$(cat "$LOCK/pid" 2>/dev/null || :)
 		case $other in ''|*[!0-9]*) other= ;; esac
-		[ -z "$other" ] || ! kill -0 "$other" 2>/dev/null ||
+		if [ -n "$other" ] && kill -0 "$other" 2>/dev/null; then
+			rm -rf "$mine"
 			fail "another system-update is at work on this unit (process $other); try again when it is done"
-		rm -rf "$LOCK"
-		mkdir "$LOCK" 2>/dev/null || fail "another system-update is at work on this unit; try again when it is done"
+		fi
+		# The dead hold is taken away by name and looked at again: removed only if it is
+		# still the one that was judged, not one a third run has taken since.
+		dead=$LOCK.dead.$$
+		rm -rf "$dead"
+		if mv -T "$LOCK" "$dead" 2>/dev/null; then
+			if [ "$(cat "$dead/pid" 2>/dev/null || :)" != "$other" ]; then
+				mv -T "$dead" "$LOCK" 2>/dev/null || :
+				rm -rf "$mine"
+				fail "another system-update is at work on this unit; try again when it is done"
+			fi
+			rm -rf "$dead"
+		fi
+		mv -T "$mine" "$LOCK" 2>/dev/null || {
+			rm -rf "$mine"
+			fail "another system-update is at work on this unit; try again when it is done"
+		}
 	fi
 	LOCKED=1
-	echo "$$" > "$LOCK/pid"
 }
 
 volume()	# the UBI volume named $1 on ubi0, as /dev/ubi0_N
@@ -134,24 +157,34 @@ second_loader()	# the digest of the image in `loader-b`; nothing when it holds n
 # nothing else is passed on as one.
 loader_note() { fw_printenv -n "$1" 2>/dev/null | head -n 1 | tr -cd '0-9a-f' || :; }
 
-# The staged request as it is kept, a line a field (update_new, update_old, loader_new);
-# nothing when none is staged.
+# One read of durable storage: what a command says, run with it open.
 #
 # Durable storage is opened for the read and may be open already: the reset button's service
 # and the tools that keep a login key or the network's settings open it too, each for a
 # moment. That is waited for. A read that still cannot be made ends the run here, and so
-# every caller's (call it as `x=$(request)`, which passes the failure on; in a pipeline or
-# as a word of another command it would be lost, and no answer taken for "nothing staged",
-# which is how a confirm once settled on a root it had not compared).
-request()
+# every caller's: call it as `x=$(durable_read ...) || exit 1` and take `x` apart afterwards.
+# In a pipeline, or as a word of another command, the failure would be lost and no answer
+# taken for an answer, "nothing staged" or "no release noted", which is how a confirm once
+# settled on a root it had not compared, and could settle without moving the floor.
+# The command says what it found on lines of its own making (durable-open and durable-close
+# speak on the same output), and is to succeed whatever it finds.
+durable_read()
 {
 	tries=5
-	until said=$(/usr/sbin/durable-run sh -c '[ ! -f "$1/request" ] || sed "s/^/request: /" "$1/request"' sh "$STAGED" 2>&1); do
+	until said=$(/usr/sbin/durable-run "$@" 2>&1); do
 		tries=$((tries - 1))
 		[ "$tries" -gt 0 ] || fail "durable storage could not be read ($(printf '%s' "$said" | tail -n 1)); nothing was decided"
 		sleep 1
 	done
-	printf '%s\n' "$said" | sed -n 's/^request: //p'
+	printf '%s\n' "$said"
+}
+
+# The staged request as it is kept, a line a field (update_new, update_old, loader_new);
+# nothing when none is staged. Call it as `x=$(request)`.
+request()
+{
+	got=$(durable_read sh -c '[ ! -f "$1/request" ] || sed "s/^/request: /" "$1/request"' sh "$STAGED") || exit 1
+	printf '%s\n' "$got" | sed -n 's/^request: //p'
 }
 
 field() { printf '%s\n' "$1" | sed -n "s/^$2=//p"; }	# the field $2 of the request $1
@@ -192,7 +225,8 @@ look()	# LIST: is the list held good, none or damaged? MARK. REGIME: unkeyed, ke
 	NOW=none NOW_statement= NOW_list= NOW_release= NOW_until=
 	if [ ! -x "$RELEASE" ] || ! "$RELEASE" mark --environment /dev/null 2>&1 | grep -q 'stock environment'; then
 		LIST=none MARK=no
-		/usr/sbin/durable-run sh -c '[ ! -e "$1" ]' sh "$KEYS" > /dev/null 2>&1 || LIST=damaged
+		got=$(durable_read sh -c '[ ! -e "$1" ] || echo "list: there"' sh "$KEYS") || exit 1
+		case $got in *'list: there'*) LIST=damaged ;; esac
 		! head -c 16384 "$(partition "$MARKED")" 2>/dev/null | tr '\0' '\n' | grep -qx 'w1700k_keyed=1' ||
 			MARK=yes
 		[ "$LIST$MARK" = noneno ] && REGIME=unkeyed || REGIME=lost
@@ -200,9 +234,8 @@ look()	# LIST: is the list held good, none or damaged? MARK. REGIME: unkeyed, ke
 	fi
 	MARK=$(mark)
 	rm -f "$HELD" "$HELD.new" "$SEEN" "$SEEN.new"
-	/usr/sbin/durable-run sh -c '[ ! -e "$1" ] || cat "$1" > "$2"; [ ! -e "$3" ] || cat "$3" > "$4"' \
-		sh "$KEYS" "$HELD" "$CURRENT" "$SEEN" > /dev/null ||
-		fail "durable storage could not be read for the key list"
+	durable_read sh -c '[ ! -e "$1" ] || cat "$1" > "$2"; [ ! -e "$3" ] || cat "$3" > "$4"; :' \
+		sh "$KEYS" "$HELD" "$CURRENT" "$SEEN" > /dev/null
 	if [ ! -e "$HELD" ]; then
 		LIST=none
 	elif "$RELEASE" list --keys "$HELD" > /dev/null 2>&1; then
@@ -290,21 +323,24 @@ keep_list()	# put $HELD.new, which the verifier wrote, in the list's place
 }
 
 settled()	# what is kept of the newest release settled on: its number, then its manifest's digest;
-		# `none' before the first, and nothing at all when durable storage does not say
+		# `none' before the first. Call it as `x=$(settled) || exit 1`: storage that
+		# cannot be read is no answer, and was once taken for a number that does not read
 {
-	/usr/sbin/durable-run sh -c 'if [ -e "$1" ]; then echo "floor: $(cat "$1")"; else echo "floor: none"; fi' \
-		sh "$FLOOR" | sed -n 's/^floor: //p'
+	got=$(durable_read sh -c 'if [ -e "$1" ]; then echo "floor: $(cat "$1")"; else echo "floor: none"; fi' \
+		sh "$FLOOR") || exit 1
+	printf '%s\n' "$got" | sed -n 's/^floor: //p'
 }
 
 release_floor()	# the newest release settled on; 0 before the first; `unreadable' for what is no number
 {
-	set -- $(settled)
+	kept=$(settled) || exit 1
+	set -- $kept
 	case ${1:-} in none) echo 0 ;; ''|*[!0-9]*) echo unreadable ;; *) echo "$1" ;; esac
 }
 
 floor()		# the same for a decision: a number that does not read stops it
 {
-	number=$(release_floor)
+	number=$(release_floor) || exit 1
 	[ "$number" != unreadable ] || fail "the number of the release this unit settled on does not read" \
 		"($FLOOR): it takes no release until it is keyed at the bench again"
 	echo "$number"
@@ -312,7 +348,7 @@ floor()		# the same for a decision: a number that does not read stops it
 
 verified() { "$RELEASE" number --state "$STATE" 2>/dev/null || :; }
 
-permitted()	# may the image with digest $1 be staged, given the flag $2? $3 names it
+permitted()	# may the image with digest $1 be staged, given the flag $2? $3 names it; $4: root or loader
 {
 	look
 	[ "$REGIME" != unkeyed ] || return 0
@@ -321,7 +357,11 @@ permitted()	# may the image with digest $1 be staged, given the flag $2? $3 name
 		return 0
 	fi
 	[ "$REGIME" = keyed ] || lost ", or pass --unsigned for a build of your own"
-	"$RELEASE" allows --state "$STATE" "$1"
+	# By what this unit has been shown since, too: a release verified before it was shown
+	# that a newer list is current is not one to stage from.
+	uninformed ", or pass --unsigned for a build of your own"
+	# As the image it is: a release's loader is not staged as its root, nor the other way.
+	"$RELEASE" allows --state "$STATE" --as "$4" "$1"
 }
 
 note_release()	# beside what is staged: the release it comes from, for `confirm` to keep
@@ -368,8 +408,10 @@ status)
 	echo "key_list=$LIST"
 	echo "key_generation=$(generation)"
 	echo "release_keys=$("$RELEASE" list --keys "$HELD" 2>/dev/null | grep -c '^release ' || :)"
-	echo "release=$(release_floor)"
-	set -- $(settled)
+	number=$(release_floor) || exit 1
+	echo "release=$number"
+	kept=$(settled) || exit 1
+	set -- $kept
 	echo "release_manifest=${2:-}"
 	echo "release_verified=$(verified)"
 	echo "current=$NOW"
@@ -392,7 +434,8 @@ release)
 	"$RELEASE" verify --keys "$HELD" --state "$STATE" --floor "$number" "$envelope" > /dev/null ||
 		fail "not a release this unit takes"
 	# The number this unit settled on is one release: another under the same number is not it.
-	set -- $(settled)
+	kept=$(settled) || exit 1
+	set -- $kept
 	if [ "$(verified)" = "${1:-}" ] && [ -n "${2:-}" ] && [ "$(digest < "$STATE/manifest")" != "$2" ]; then
 		rm -rf "$STATE"
 		fail "this is ANOTHER release $1 than the one this unit settled on: two were sealed under one number"
@@ -412,6 +455,8 @@ current)
 	*unchanged) echo "system-update: this is the statement kept ($said)"; exit 0 ;;
 	esac
 	keep_current || fail "the statement could not be kept; look at what is (system-update status)"
+	# A release verified before this unit was shown the statement was judged without it.
+	rm -rf "$STATE"
 	echo "system-update: what is current, as this unit was shown: $said"
 	;;
 keys)
@@ -479,7 +524,7 @@ stage)
 		"flash it once over the serial console (init/flash --loader)"
 	[ "$(digest < "$image")" = "$want" ] || fail "$image is not $want"
 	[ "$(head -c 4 "$image")" = hsqs ] || fail "$image is not a SquashFS root"
-	permitted "$want" "${4:-}" "this root" || fail "this unit takes releases: verify one first " \
+	permitted "$want" "${4:-}" "this root" root || fail "this unit takes releases: verify one first " \
 		"(system-update release), whose manifest lists this root; " \
 		"or pass --unsigned for a build of your own"
 	root=$(volume rootfs)
@@ -525,7 +570,7 @@ stage-loader)
 	head -c 512 "$image" | grep -q "$SECOND_KIND" ||
 		fail "$image is not a second loader (w1700k-loader-b.itb)"
 	case ${4:-} in ''|--unsigned) ;; *) fail "usage: system-update stage-loader IMAGE SHA256 [--unsigned]" ;; esac
-	permitted "$want" "${4:-}" "this loader" || fail "this unit takes releases: verify one first " \
+	permitted "$want" "${4:-}" "this loader" loader || fail "this unit takes releases: verify one first " \
 		"(system-update release) whose manifest lists this loader, or pass --unsigned for a " \
 		"build of your own"
 	node=$(partition loader-b)
@@ -568,8 +613,10 @@ confirm)
 		[ "$(second_loader)" = "$loader" ] || fail "loader-b does not hold the staged loader $loader"
 	fi
 	# What was staged from a release moves the floor up to it: nothing older is taken again.
-	noted=$(/usr/sbin/durable-run sh -c '[ ! -f "$1/release" ] || echo "release: $(cat "$1/release")"' \
-		sh "$STAGED" | sed -n 's/^release: //p')
+	# (Read like the request: a read that cannot be made is not "from no release", which
+	# settled the update and left the floor where it was.)
+	got=$(durable_read sh -c '[ ! -f "$1/release" ] || echo "release: $(cat "$1/release")"' sh "$STAGED") || exit 1
+	noted=$(printf '%s\n' "$got" | sed -n 's/^release: //p')
 	number=${noted%% *}
 	case $number in *[!0-9]*) number= ;; esac
 	if [ -n "$number" ]; then

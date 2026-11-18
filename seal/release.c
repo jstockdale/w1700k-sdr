@@ -5,7 +5,7 @@
  *   w1700k-release rotate [--keys FILE] [--first] --out FILE ENVELOPE
  *   w1700k-release list [--keys FILE]
  *   w1700k-release mark --environment FILE
- *   w1700k-release allows [--state DIR] SHA256
+ *   w1700k-release allows [--state DIR] [--as root|loader] SHA256
  *   w1700k-release number [--state DIR]
  *
  * Both are WMS2 control envelopes: `wms2.c`, the envelope Whitehat Hardware's
@@ -51,7 +51,8 @@
  *
  * `list` prints the held list's generation and keys, with the fingerprint a
  * person compares; it exits 1 for no list and 2 for one that does not read.
- * `allows` says whether the verified manifest lists an image with that digest.
+ * `allows` says whether the verified manifest lists an image with that digest: with --as, as
+ * that image (the root, or the second loader) and not as the other.
  *
  * `mark` says whether this unit is marked as keyed: whether the stock boot
  * loader's environment (FILE: the `uenv` partition) holds `w1700k_keyed=1`. It
@@ -1098,26 +1099,70 @@ static int marked(const char *path)
 	return 1;
 }
 
-static int allows(const char *state, const char *digest)
+/* The manifest's own names for the two images an update carries (init/initkit/bundle.py). */
+static const char *image_named(const char *kind)
+{
+	if (!strcmp(kind, "root"))
+		return "rootfs.squashfs";
+	if (!strcmp(kind, "loader"))
+		return "w1700k-loader-b.itb";
+	return NULL;
+}
+
+/* Is `listed` (an image's digest, as the manifest writes it) inside the entry of the file
+ * `name`: after "name": { and before that object's closing brace? An entry holds a digest
+ * and a length and no object of its own. */
+static bool listed_as(const char *manifest, const char *name, const char *listed)
+{
+	char key[64];
+	size_t length = (size_t)snprintf(key, sizeof key, "\"%s\"", name);
+
+	for (const char *at = manifest; (at = strstr(at, key)) != NULL; at += length) {
+		const char *entry = at + length, *end, *found;
+
+		entry += strspn(entry, " \t\r\n");
+		if (*entry++ != ':')
+			continue;
+		entry += strspn(entry, " \t\r\n");
+		if (*entry != '{')
+			continue;
+		end = strchr(entry, '}');
+		found = strstr(entry, listed);
+		if (end && found && found < end)
+			return true;
+	}
+	return false;
+}
+
+/* `kind` NULL: as any image of the manifest. A root is asked for as the root and a loader as the
+ * loader (system-update does): the digest of one is no leave to stage it as the other. */
+static int allows(const char *state, const char *kind, const char *digest)
 {
 	static char manifest[RELEASE_ENVELOPE_MOST + 1];
 	char listed[80];
+	const char *name = kind ? image_named(kind) : NULL;
 
 	if (strlen(digest) != 64 || strspn(digest, "0123456789abcdef") != 64) {
 		fprintf(stderr, "w1700k-release: %s is not a SHA-256 digest\n", digest);
+		return 2;
+	}
+	if (kind && !name) {
+		fprintf(stderr, "w1700k-release: %s is no kind of image (root, loader)\n", kind);
 		return 2;
 	}
 	if (read_whole(state, "manifest", manifest, sizeof manifest) < 0)
 		return 1;
 	/* As the digest of an image and nothing else: a manifest has other text in it. */
 	snprintf(listed, sizeof listed, "\"sha256\": \"%s\"", digest);
+	if (name)
+		return listed_as(manifest, name, listed) ? 0 : 1;
 	return strstr(manifest, listed) ? 0 : 1;
 }
 
 int main(int argc, char **argv)
 {
 	const char *keys = KEYS_FILE, *state = STATE_DIR, *verb = argc > 1 ? argv[1] : "";
-	const char *operand = NULL, *out = NULL, *environment = NULL, *kept = NULL;
+	const char *operand = NULL, *out = NULL, *environment = NULL, *kept = NULL, *kind = NULL;
 	unsigned long long floor = 0;
 	bool first = false;
 	char text[32], *end;
@@ -1133,6 +1178,8 @@ int main(int argc, char **argv)
 			environment = argv[++i];
 		} else if (!strcmp(argv[i], "--statement") && i + 1 < argc) {
 			kept = argv[++i];
+		} else if (!strcmp(argv[i], "--as") && i + 1 < argc) {
+			kind = argv[++i];
 		} else if (!strcmp(argv[i], "--first")) {
 			first = true;
 		} else if (!strcmp(argv[i], "--floor") && i + 1 < argc) {
@@ -1166,7 +1213,7 @@ int main(int argc, char **argv)
 	if (!strcmp(verb, "mark") && !operand && environment)
 		return marked(environment);
 	if (!strcmp(verb, "allows") && operand)
-		return allows(state, operand);
+		return allows(state, kind, operand);
 	if (!strcmp(verb, "number") && !operand) {
 		if (read_whole(state, "number", text, sizeof text) <= 0)
 			return 1;
@@ -1181,7 +1228,7 @@ usage:
 			"       w1700k-release current [--keys FILE] [--statement KEPT] --out FILE ENVELOPE\n"
 			"       w1700k-release statement [--keys FILE] KEPT\n"
 			"       w1700k-release mark --environment FILE\n"
-			"       w1700k-release allows [--state DIR] SHA256\n"
+			"       w1700k-release allows [--state DIR] [--as root|loader] SHA256\n"
 			"       w1700k-release number [--state DIR]\n");
 	return 2;
 }
