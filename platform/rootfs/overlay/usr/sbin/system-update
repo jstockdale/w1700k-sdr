@@ -183,6 +183,21 @@ mark()	# yes, no, or unreadable: is this unit marked as keyed?
 	case $code in 0) echo yes ;; 1) echo no ;; *) echo unreadable ;; esac
 }
 
+# Whether durable storage holds the file $1: yes or no. Asked as `request` asks: storage that
+# is open elsewhere for a moment is waited for, and a read that still cannot be made ends the
+# run (call it as `x=$(kept FILE) || exit 1`). That it could not be read is not that a file is
+# there: a unit that holds no list would be taken for one whose list is damaged.
+kept()
+{
+	tries=5
+	until said=$(/usr/sbin/durable-run sh -c 'if [ -e "$1" ]; then echo "kept: yes"; else echo "kept: no"; fi' sh "$1" 2>&1); do
+		tries=$((tries - 1))
+		[ "$tries" -gt 0 ] || fail "durable storage could not be read ($(printf '%s' "$said" | tail -n 1)); nothing was decided"
+		sleep 1
+	done
+	printf '%s\n' "$said" | sed -n 's/^kept: //p'
+}
+
 look()	# LIST: is the list held good, none or damaged? MARK. REGIME: unkeyed, keyed or lost
 {
 	# A root from before there were lists has no verifier, or one that knows nothing of
@@ -192,7 +207,8 @@ look()	# LIST: is the list held good, none or damaged? MARK. REGIME: unkeyed, ke
 	NOW=none NOW_statement= NOW_list= NOW_release= NOW_until=
 	if [ ! -x "$RELEASE" ] || ! "$RELEASE" mark --environment /dev/null 2>&1 | grep -q 'stock environment'; then
 		LIST=none MARK=no
-		/usr/sbin/durable-run sh -c '[ ! -e "$1" ]' sh "$KEYS" > /dev/null 2>&1 || LIST=damaged
+		kept=$(kept "$KEYS") || exit 1
+		[ "$kept" = no ] || LIST=damaged
 		! head -c 16384 "$(partition "$MARKED")" 2>/dev/null | tr '\0' '\n' | grep -qx 'w1700k_keyed=1' ||
 			MARK=yes
 		[ "$LIST$MARK" = noneno ] && REGIME=unkeyed || REGIME=lost
