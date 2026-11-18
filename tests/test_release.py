@@ -614,6 +614,22 @@ class Verifier(Built):
         self.assertEqual(self.run_it('allows', 'cd' * 32).returncode, 1, 'what it was made from is not an image')
         self.assertEqual(self.run_it('allows', 'ef' * 32).returncode, 1, 'nor is what a string says')
 
+    def test_a_digest_is_listed_as_the_image_it_is_asked_for_as(self):
+        """A release's second loader is not thereby its root, nor the other way."""
+        files = {'w1700k-loader-b.itb': {'sha256': 'ab' * 32, 'bytes': 3}, 'rootfs.squashfs': {'sha256': 'cd' * 32, 'bytes': 4}}
+        for name, text in (('as images.py writes it', json.dumps({'format': 1, 'files': files}, indent=1)),
+                           ('on one line', json.dumps({'format': 1, 'files': files})),
+                           ('the root first', json.dumps({'format': 1, 'files': dict(reversed(files.items()))}, indent=1))):
+            with self.subTest(name):
+                self.assertEqual(self.verify(seal.seal(text.encode(), 5, self.sign)).returncode, 0)
+                self.assertEqual(self.run_it('allows', '--as', 'loader', 'ab' * 32).returncode, 0)
+                self.assertEqual(self.run_it('allows', '--as', 'root', 'cd' * 32).returncode, 0)
+                self.assertEqual(self.run_it('allows', '--as', 'root', 'ab' * 32).returncode, 1, 'the loader, as the root')
+                self.assertEqual(self.run_it('allows', '--as', 'loader', 'cd' * 32).returncode, 1, 'the root, as the loader')
+                self.assertEqual(self.run_it('allows', '--as', 'root', 'ef' * 32).returncode, 1)
+                self.assertEqual(self.run_it('allows', 'ab' * 32).returncode, 0, 'asked as nothing: as any image')
+                self.assertEqual(self.run_it('allows', '--as', 'kernel', 'ab' * 32).returncode, 2)
+
     def test_a_release_number_is_one_every_tool_can_count_to(self):
         most = seal.RELEASE_MOST
         self.assertEqual(most, int(re.search(r'#define RELEASE_NUMBER_MOST (\d+)', (SEAL / 'release.h').read_text()).group(1)))
@@ -1304,7 +1320,23 @@ class Scripted(Built):
         (d / 'sys/mtd/mtd5/size').write_text('786432\n')
         (d / 'sys/ubi/ubi0_1/reserved_ebs').write_text('30\n')
         (d / 'sys/ubi/ubi0_1/usable_eb_size').write_text('126976\n')
-        (d / 'durable-run').write_text('#!/bin/sh\n"$@"\n')
+        # durable-run: the command, unless this call is one of those listed in `refuse` (durable
+        # storage is open elsewhere). It notes two calls that overlap: within a run's hold on the
+        # unit there are none.
+        (d / 'durable-run').write_text(f'''#!/bin/sh
+d={d}
+n=$(($(cat $d/calls 2>/dev/null || echo 0) + 1))
+echo $n > $d/calls
+if grep -qx "$n" $d/refuse 2>/dev/null; then
+	echo "durable-open: durable is already open" >&2
+	exit 1
+fi
+mkdir $d/inside 2>/dev/null || echo overlap >> $d/overlaps
+"$@"
+code=$?
+rmdir $d/inside 2>/dev/null
+exit $code
+''')
         self.keys.unlink()
         self.keys, self.environment = Kept(d / 'durable/keys'), d / 'dev/uenv'
         self.keys.write_bytes(a_list(1))
@@ -1323,6 +1355,7 @@ class Scripted(Built):
                          ('LOCK=/run/w1700k-update.lock', f'LOCK={d}/lock'),
                          ('df -k /durable', f'df -k {d}/durable'),
                          ('/sys/class/mtd', f'{d}/sys/mtd'), ('/sys/class/ubi', f'{d}/sys/ubi'),
+                         ('\t\tsleep 1\n', '\t\tsleep 0\n'),
                          ('case ${1:-} in\nstatus)', OVERRIDES.replace('@D@', str(d)) + 'case ${1:-} in\nstatus)')):
             self.assertIn(old, text)
             text = text.replace(old, new)
@@ -1335,6 +1368,11 @@ class Scripted(Built):
 
     def update(self, *arguments):
         return subprocess.run(['sh', str(self.script), *map(str, arguments)], capture_output=True, text=True)
+
+    def refuse(self, *calls):
+        """Durable storage is open elsewhere for these calls of durable-run, counted from the next."""
+        (self.dir / 'calls').unlink(missing_ok=True)
+        (self.dir / 'refuse').write_text(''.join(f'{call}\n' for call in calls))
 
     def at_the_bench(self):
         (self.dir / 'tty').write_text('/dev/console\n')
@@ -1783,6 +1821,46 @@ esac
         self.assertEqual(self.state_of()['release_verified'], '', 'a refusal leaves nothing verified')
         self.assertEqual(self.stage('stage-loader', LOADER_IMAGE).returncode, 1)
 
+    def test_a_confirmation_that_cannot_read_which_release_was_staged_settles_nothing(self):
+        """The release's number is read from durable storage at the confirmation. That read was
+        a pipeline: storage open elsewhere answered nothing, nothing was taken for "staged from
+        no release", and the update was settled with the floor left where it was, so that an
+        older release could be given to the unit afterwards."""
+        self.assertEqual(self.release(7).returncode, 0)
+        self.assertEqual(self.stage('stage-loader', LOADER_IMAGE).returncode, 0)
+        digest = hashlib.sha256(LOADER_IMAGE).hexdigest()
+        (self.dir / 'second').write_text(digest)                # the reboot: it was written and ran
+        (self.dir / 'notes/loader_booted').write_text(digest)
+        shutil.rmtree(self.state, ignore_errors=True)
+        self.refuse(2, 3, 4, 5, 6)      # the request reads; the release's number does not, at any try
+        refused = self.update('confirm')
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn('durable storage could not be read (durable-open: durable is already open); nothing was decided',
+                      refused.stderr)
+        self.assertNotIn('settled', refused.stdout)
+        state = self.state_of()
+        self.assertEqual((state['release'], state['loader_staged']), ('0', digest), 'nothing settled, nothing forgotten')
+        self.refuse(2, 3)               # busy for a moment is waited for
+        settled = self.update('confirm')
+        self.assertEqual(settled.returncode, 0, settled.stderr)
+        self.assertIn('release 7', settled.stdout)
+        self.assertEqual(self.state_of()['release'], '7')
+        self.assertEqual(self.release(6).returncode, 1, 'and nothing older is taken')
+
+    def test_a_number_that_cannot_be_read_is_not_a_number_that_does_not_read(self):
+        """Storage open elsewhere when a release is judged used to be answered with "the number
+        of the release this unit settled on does not read ... keyed at the bench again"."""
+        (self.dir / 'durable/release').write_text('5 ' + 'ab' * 32 + '\n')
+        envelope = self.dir / 'work/release.wms2'
+        envelope.write_bytes(bundle.sign(self.archive, self.dir / 'release-7.tar', 7, self.sign))
+        self.refuse(2, 3, 4, 5, 6)      # the list is read; the number is not
+        refused = self.update('release', envelope)
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn('durable storage could not be read', refused.stderr)
+        self.assertNotIn('at the bench', refused.stderr)
+        self.refuse()
+        self.assertEqual(self.update('release', envelope).returncode, 0)
+
     def test_one_run_at_a_time_changes_the_unit(self):
         lock = self.dir / 'lock'
         lock.mkdir()
@@ -1798,8 +1876,26 @@ esac
         self.assertEqual(self.update('cancel').returncode, 0)
         self.assertFalse(lock.exists(), 'a run lets go when it is done')
         self.assertEqual(self.release(7).returncode, 0)
+        self.assertEqual([path.name for path in self.dir.glob('lock*')], [], 'and leaves nothing of its taking')
         self.assertFalse(lock.exists())
         self.assertFalse(list(self.dir.glob('held*')), 'and leaves nothing of its own behind')
+
+    def test_runs_at_the_same_moment_do_not_both_go_on(self):
+        """The hold appears with its holder's number in it. It was made and then written into,
+        and a run that looked in between took it for one a killed run had left and removed it."""
+        self.unkeyed()
+        for _ in range(6):
+            runs = [subprocess.Popen(['sh', str(self.script), 'cancel'], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                     text=True) for _ in range(12)]
+            ended = [(run.wait(), *run.communicate()) for run in runs]
+            for code, said, refusal in ended:
+                if code:
+                    self.assertIn('another system-update is at work', refusal)
+                else:
+                    self.assertEqual(said.strip(), 'system-update: nothing is staged')
+            self.assertTrue(any(code == 0 for code, _, _ in ended))
+            self.assertFalse((self.dir / 'overlaps').exists(), 'two runs were inside durable storage at once')
+            self.assertEqual([path.name for path in self.dir.glob('lock*')], [])
 
     def test_what_is_staged_on_the_owners_word_takes_no_number_from_an_earlier_release(self):
         self.release(7)
@@ -1896,6 +1992,21 @@ class Current(Scripted):
         self.assertEqual(self.now()[:3], ('current', '3', '1.2'))
         self.assertEqual(self.release(7).returncode, 1, 'the key the list dropped')
         self.assertEqual(self.release(7, signing(SPARE)[1]).returncode, 0)
+
+    def test_a_release_verified_before_the_statement_is_not_staged_from_after_it(self):
+        """Verified under the list it holds, then shown that a newer list is current: what was
+        verified was judged without that, and stood until the next start."""
+        self.assertEqual(self.release(7).returncode, 0)
+        self.assertEqual(self.state_of()['release_verified'], '7')
+        newer = a_list(2, WITH_NOW[:2] + ((SPARE, 'release'), (NOW_KEY, 'timestamp')))
+        self.assertEqual(self.show(statement(3, newer)).returncode, 0)
+        self.assertEqual(self.state_of()['release_verified'], '')
+        for verb, data in (('stage-loader', LOADER_IMAGE), ('stage', NEW_ROOT)):
+            with self.subTest(verb):
+                refused = self.stage(verb, data)
+                self.assertEqual(refused.returncode, 1)
+                self.assertIn('has been shown that list 1.2 is current', refused.stderr)
+        self.assertEqual(self.stage('stage', NEW_ROOT, '--unsigned').returncode, 0, 'the owner is not locked out')
 
     def test_an_older_statement_does_not_put_a_newer_one_back(self):
         self.assertEqual(self.show(statement(3, a_list(2, WITH_NOW))).returncode, 0)

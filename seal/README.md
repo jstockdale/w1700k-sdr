@@ -228,13 +228,16 @@ w1700k-release verify [--keys FILE] [--state DIR] [--floor N] ENVELOPE
 w1700k-release rotate [--keys FILE] [--first] --out FILE ENVELOPE
 w1700k-release list [--keys FILE]
 w1700k-release mark --environment FILE
-w1700k-release allows [--state DIR] SHA256
+w1700k-release allows [--state DIR] [--as root|loader] SHA256
 w1700k-release number [--state DIR]
 ```
 
 `verify` checks a release against the list's release keys and the floor, and
 leaves what passes in `/run/w1700k-release`, which is in RAM. `allows` then
-says whether the verified manifest lists an image with that digest. `rotate`
+says whether the verified manifest lists an image with that digest; with
+`--as`, as that image (the root, or the second loader), which is how
+`system-update` asks: a release's loader is no leave to stage it as the root.
+`rotate`
 checks a rotation against the list held and writes the new list to `--out`;
 `--first` is the first list of a unit that holds none. `list` prints the list
 held with each key's fingerprint; it exits 1 for no list and 2 for one that

@@ -66,6 +66,15 @@ class Unit(unittest.TestCase):
         for old, new in (('. /etc/w1700k/storage.conf\n', ''),
                          ('/usr/sbin/durable-run', f'{d}/durable-run'),
                          ('STAGED=/durable/update', f'STAGED={d}/durable/update'),
+                         # This unit was never keyed: it holds no list and has no verifier
+                         # (tests/test_release.py has the keyed unit).
+                         ('RELEASE=/usr/sbin/w1700k-release', f'RELEASE={d}/no-verifier'),
+                         ('STATE=/run/w1700k-release', f'STATE={d}/state'),
+                         ('FLOOR=/durable/release', f'FLOOR={d}/durable/release'),
+                         ('KEYS=/durable/keys', f'KEYS={d}/durable/keys'),
+                         ('CURRENT=/durable/current', f'CURRENT={d}/durable/current'),
+                         ('HELD=/run/w1700k-keys', f'HELD={d}/held'),
+                         ('LOCK=/run/w1700k-update.lock', f'LOCK={d}/lock'),
                          ('df -k /durable', f'df -k {d}/durable'),
                          ('/sys/class/mtd', f'{d}/sys/mtd'), ('/sys/class/ubi', f'{d}/sys/ubi'),
                          ('\t\tsleep 1\n', '\t\tsleep 0\n'),
