@@ -225,8 +225,10 @@ look()	# LIST: is the list held good, none or damaged? MARK. REGIME: unkeyed, ke
 	NOW=none NOW_statement= NOW_list= NOW_release= NOW_until=
 	if [ ! -x "$RELEASE" ] || ! "$RELEASE" mark --environment /dev/null 2>&1 | grep -q 'stock environment'; then
 		LIST=none MARK=no
-		got=$(durable_read sh -c '[ ! -e "$1" ] || echo "list: there"' sh "$KEYS") || exit 1
-		case $got in *'list: there'*) LIST=damaged ;; esac
+		# Asked so that it answers either way: an answer that is neither is not "none".
+		got=$(durable_read sh -c 'if [ -e "$1" ]; then echo "list: there"; else echo "list: none"; fi' \
+			sh "$KEYS") || exit 1
+		[ "$(printf '%s\n' "$got" | sed -n 's/^list: //p')" = none ] || LIST=damaged
 		! head -c 16384 "$(partition "$MARKED")" 2>/dev/null | tr '\0' '\n' | grep -qx 'w1700k_keyed=1' ||
 			MARK=yes
 		[ "$LIST$MARK" = noneno ] && REGIME=unkeyed || REGIME=lost
