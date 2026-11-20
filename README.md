@@ -127,6 +127,7 @@ host/bin/w1700k gps pty --name ~/w1700k-gps     # the receiver as a serial devic
 
 host/bin/w1700k efr32 on --keep                 # the radio, the same way
 host/bin/w1700k efr32 identify                  # what firmware it runs
+host/bin/w1700k efr32 scan                      # Bluetooth LE advertisers nearby; it only listens
 host/bin/w1700k efr32 pty --name ~/w1700k-efr32
 ```
 

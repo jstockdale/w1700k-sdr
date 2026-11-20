@@ -77,12 +77,23 @@ class Radio(unittest.TestCase):
                          {'firmware': 'bgapi', 'stack': '6.2.0', 'build': 212, 'bootloader': '0x00000000',
                           'hardware': None, 'hash': '0x4cff7184'})
 
-    def test_only_hello_and_get_version_are_sent(self):
+    def test_only_these_commands_are_ever_sent(self):
+        """Every place the module sends the radio a command, and which: hello and get_version to
+        identify it; its counters, and the scanner's parameters, start and stop for a passive
+        scan. A new command has to be added here, where it is seen."""
         self.assertEqual((efr32.command(efr32.SYSTEM, efr32.HELLO), efr32.command(efr32.SYSTEM, efr32.GET_VERSION)),
                          (bytes.fromhex('20000100'), bytes.fromhex('2000011b')))
         source = (ROOT / 'host/w1700k/efr32.py').read_text()
         asked = [line.strip() for line in source.splitlines() if 'link.ask(' in line]
-        self.assertEqual(asked, ['hello = link.ask(SYSTEM, HELLO)', 'body = link.ask(SYSTEM, GET_VERSION)'])
+        self.assertEqual(asked, ['hello = link.ask(SYSTEM, HELLO)', 'body = link.ask(SYSTEM, GET_VERSION)',
+                                 'body = link.ask(cls, cmd, payload)'])
+        through = [line.split('_ok(link, ', 1)[1].split(',')[:2] for line in source.splitlines()
+                   if '_ok(link, ' in line and not line.startswith('def ')]
+        self.assertEqual([(cls, cmd.strip().rstrip(')')) for cls, cmd in through],
+                         [('SYSTEM', 'GET_COUNTERS'), ('SCANNER', 'SCAN_SET_PARAMETERS'), ('SCANNER', 'SCAN_START'),
+                          ('SCANNER', 'SCAN_STOP')])
+        self.assertEqual((efr32.SCANNER, efr32.SCAN_SET_PARAMETERS, efr32.SCAN_START, efr32.SCAN_STOP, efr32.GET_COUNTERS),
+                         (0x05, 0x06, 0x03, 0x05, 0x0f), 'as sl_bt_api.h of stack 6.2.0 numbers them')
 
     def test_the_boot_event_is_read_with_its_hardware_word(self):
         link = self.link(FACTORY)
@@ -105,6 +116,165 @@ class Radio(unittest.TestCase):
         self.assertEqual(link.ask(0x20, 0x01), b'\x02\x00', 'its own response, a result that is not zero')
         with self.assertRaisesRegex(efr32.RadioError, 'refused: result 0x0002'):
             efr32.version_from_response(b'\x02\x00' + bytes(16))
+
+
+# A co-processor that scans: it answers as the factory firmware does, notes every command it is
+# sent (class, command, payload, in hex, one a line in the file named), and between a scanner
+# start and its stop reports four made-up advertisers over and over. Its count of packets sent
+# stays 0 unless told to move ("TX_PER_SCAN" in its environment), as an active scan would move it.
+SCANNING = r"""
+import os, sys, threading, time
+out, inp, log = sys.stdout.buffer, sys.stdin.buffer, open(sys.argv[1], 'a')
+lock, scanning, sent = threading.Lock(), threading.Event(), [0]
+def put(data):
+    with lock:
+        out.write(data); out.flush()
+def legacy(flags, address, kind, rssi, channel, data):
+    body = bytes([flags]) + bytes.fromhex(address)[::-1] + bytes([kind, 0xff, rssi & 0xff, channel]) + bytes(7) + bytes([len(data)]) + data
+    return bytes([0xa0, len(body), 0x05, 0x00]) + body
+def extended(flags, address, kind, rssi, channel, data):
+    body = (bytes([flags]) + bytes.fromhex(address)[::-1] + bytes([kind, 0xff, rssi & 0xff, channel]) + bytes(7)
+            + bytes([1, 1, 2, 127, 0, 0, 0, 9, len(data)]) + data)
+    return bytes([0xa0, len(body), 0x05, 0x02]) + body
+name = lambda text, kind=9: bytes([len(text) + 1, kind]) + text.encode()
+REPORTS = [legacy(3, 'c0ffee000001', 0, -52, 37, bytes([2, 1, 6]) + name('Lamp')),
+           legacy(0, 'c0ffee000002', 1, -70, 38, bytes([3, 0xff, 1, 2])),
+           legacy(3, 'c0ffee000001', 0, -41, 39, bytes([2, 1, 6])),
+           extended(0, 'c0ffee000003', 1, -60, 12, name('Tag', 8)),
+           extended(0, '000000000000', 255, -80, 20, b'')]
+def talk():
+    while True:
+        scanning.wait()
+        for one in REPORTS:
+            if scanning.is_set():
+                put(one)
+        time.sleep(0.02)
+threading.Thread(target=talk, daemon=True).start()
+put(bytes.fromhex('a01201000600020000 00d400000000000101 8471ff4c'.replace(' ', '')))
+while True:
+    head = inp.read(4)
+    if len(head) < 4:
+        break
+    body = inp.read((head[0] & 7) << 8 | head[1])
+    log.write(f'{head[2]:02x} {head[3]:02x} {body.hex()}\n'); log.flush()
+    cls, cmd = head[2], head[3]
+    if (cls, cmd) == (1, 0x00):
+        put(bytes.fromhex('200201000000'))
+    elif (cls, cmd) == (1, 0x1b):
+        put(bytes.fromhex('2012011b0000060002000000d400000000008471ff4c'))
+    elif (cls, cmd) == (1, 0x0f):
+        put(bytes([0x20, 10, 1, 0x0f, 0, 0]) + sent[0].to_bytes(2, 'little') + bytes(6))
+    elif (cls, cmd) == (5, 0x06):
+        put(bytes([0x20, 2, 5, 0x06, 0, 0]))
+    elif (cls, cmd) == (5, 0x03):
+        refuse = int(os.environ.get('REFUSE_START', '0'))
+        put(bytes([0x20, 2, 5, 0x03]) + refuse.to_bytes(2, 'little'))
+        if not refuse:
+            sent[0] = (sent[0] + int(os.environ.get('TX_PER_SCAN', '0'))) & 0xffff
+            scanning.set()
+    elif (cls, cmd) == (5, 0x05):
+        scanning.clear()
+        put(bytes([0x20, 2, 5, 0x05, 0, 0]))
+    else:
+        put(bytes([0x20, 2, cls, cmd, 0x02, 0x00]))
+"""
+
+
+class Scan(unittest.TestCase):
+    """efr32.scan against a stand-in that scans. What must hold whatever else changes: the scan
+    asked for is passive, and the scanner is stopped again."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.addCleanup(__import__('shutil').rmtree, self.dir)
+
+    def link(self, **environment):
+        radio = subprocess.Popen([sys.executable, '-c', SCANNING, str(self.dir / 'asked')], stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0, env=dict(os.environ, **environment))
+        link = efr32.Link(radio)
+        self.addCleanup(link.close)
+        return link
+
+    def asked(self):
+        """Every command the radio was sent: (class, command, payload)."""
+        path = self.dir / 'asked'
+        deadline = time.monotonic() + 2
+        while not path.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        return [(int(c, 16), int(m, 16), bytes.fromhex(p)) for c, m, p in
+                (line.rstrip('\n').split(' ', 2) for line in path.read_text().splitlines())]
+
+    def test_it_says_who_was_heard_strongest_first(self):
+        result = efr32.scan(self.link(), seconds=0.5)
+        self.assertEqual((result['phy'], result['transmitted']), ('1m', 0))
+        self.assertGreaterEqual(result['reports'], 10)
+        self.assertEqual(sum(a['reports'] for a in result['advertisers']), result['reports'])
+        self.assertEqual([a['address'] for a in result['advertisers']],
+                         ['c0:ff:ee:00:00:01', 'c0:ff:ee:00:00:03', 'c0:ff:ee:00:00:02', 'anonymous'])
+        lamp, tag, plain, nameless = result['advertisers']
+        self.assertEqual({k: lamp[k] for k in ('address_type', 'rssi', 'name', 'connectable', 'scannable', 'extended')},
+                         {'address_type': 'public', 'rssi': -41, 'name': 'Lamp', 'connectable': True, 'scannable': True,
+                          'extended': False}, 'the strongest level heard, and a name from any report that carried one')
+        self.assertEqual((tag['address_type'], tag['name'], tag['extended'], tag['rssi']), ('random', 'Tag', True, -60))
+        self.assertEqual((plain['name'], plain['connectable'], plain['rssi']), (None, False, -70))
+        self.assertEqual((nameless['address_type'], nameless['rssi']), ('anonymous', -80))
+
+    def test_the_scan_is_passive_and_nothing_else_is_asked_of_the_radio(self):
+        """Mode 0: the radio listens. Mode 1 would have it ask each advertiser for more, which is
+        transmitting. And no command goes out but the ones a passive scan is made of."""
+        link = self.link()
+        efr32.identify(link)
+        efr32.scan(link, seconds=0.2)
+        asked = self.asked()
+        self.assertEqual([(c, m) for c, m, _ in asked],
+                         [(1, 0x00), (1, 0x1b), (1, 0x0f), (5, 0x06), (5, 0x03), (5, 0x05), (1, 0x0f)])
+        parameters = next(p for c, m, p in asked if (c, m) == (5, 0x06))
+        self.assertEqual(parameters[0], 0, 'passive')
+        self.assertEqual(parameters, bytes([0, 0x10, 0, 0x10, 0]), 'listening all the time: window as long as interval')
+        self.assertEqual(next(p for c, m, p in asked if (c, m) == (5, 0x03)), bytes([1, 2]), '1M PHY, every advertiser')
+        self.assertEqual(efr32.PASSIVE, 0)
+        source = (ROOT / 'host/w1700k/efr32.py').read_text()
+        for word in ('advertiser', 'ACTIVE', 'connection_open', 'sl_bt_test'):
+            self.assertNotIn(word, source.replace('active scan', '').replace('advertisers', '').replace('advertiser,', '')
+                             .replace('advertiser for more', '').replace('every advertiser', ''), word)
+
+    def test_the_other_phys(self):
+        for phy, code in (('coded', 4), ('both', 5)):
+            with self.subTest(phy=phy):
+                (self.dir / 'asked').unlink(missing_ok=True)
+                self.assertEqual(efr32.scan(self.link(), seconds=0.1, phy=phy)['phy'], phy)
+                self.assertEqual(next(p for c, m, p in self.asked() if (c, m) == (5, 0x03)), bytes([code, 2]))
+        with self.assertRaisesRegex(ValueError, 'phy: one of 1m, coded, both'):
+            efr32.scan(self.link(), phy='2m')
+
+    def test_the_scanner_is_stopped_however_the_scan_ends(self):
+        link = self.link()
+        message, calls = link.message, []
+
+        def interrupted(timeout=1.0):
+            calls.append(timeout)
+            if len(calls) == 4:
+                raise KeyboardInterrupt
+            return message(timeout)
+        link.message = interrupted
+        with self.assertRaises(KeyboardInterrupt):
+            efr32.scan(link, seconds=30)
+        del link.message
+        self.assertEqual([(c, m) for c, m, _ in self.asked()][-2:], [(5, 0x03), (5, 0x05)], 'started, and stopped')
+
+    def test_a_radio_that_sent_something_meanwhile_is_said_to_have(self):
+        """The count is the radio's own; a scan that was passive leaves it where it was."""
+        self.assertEqual(efr32.scan(self.link(TX_PER_SCAN='3'), seconds=0.1)['transmitted'], 3)
+
+    def test_a_radio_that_refuses_to_scan_is_said_plainly(self):
+        with self.assertRaisesRegex(efr32.RadioError, 'starting the scan: the radio refused, result 0x0002'):
+            efr32.scan(self.link(REFUSE_START='2'), seconds=0.1)
+
+    def test_a_report_that_is_cut_short_is_passed_over(self):
+        self.assertIsNone(efr32.report(efr32.LEGACY_REPORT, bytes(18)))
+        self.assertIsNone(efr32.report(0x01, bytes(40)))
+        address, fields = efr32.report(efr32.LEGACY_REPORT, bytes([1]) + bytes(range(6)) + bytes([0, 0xff, 0xd8, 37]) + bytes(7) + bytes([0]))
+        self.assertEqual((address, fields['rssi'], fields['name'], fields['connectable']), ('05:04:03:02:01:00', -40, None, True))
 
 
 class OnAUnit(unittest.TestCase):
@@ -223,6 +393,15 @@ esac
                 self.assertTrue(got.endswith(bytes.fromhex('200201000000')), got.hex())
                 bridge.send_signal(sig)
                 self.assertEqual(bridge.wait(timeout=10), 0, bridge.stderr.read())
+
+    def test_scan_lists_the_advertisers_heard(self):
+        import json
+        (self.dir / 'factory.py').write_text(f'import sys\nsys.argv = [sys.argv[0], {str(self.dir / "asked")!r}]\n' + SCANNING)
+        result = self.w1700k('scan', '--seconds', '0.4')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        said = json.loads(result.stdout)
+        self.assertEqual((said['transmitted'], said['advertisers'][0]['name'], len(said['advertisers'])), (0, 'Lamp', 4))
+        self.assertEqual(self.w1700k('scan', '--phy', '2m').returncode, 2)
 
     def test_what_the_unit_refuses_is_said_and_is_an_error(self):
         (self.dir / 'ssh').write_text('#!/bin/sh\ncase "$*" in *"-O exit"*) exit 0 ;; esac\n'

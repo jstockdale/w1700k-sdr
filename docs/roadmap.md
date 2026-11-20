@@ -95,9 +95,11 @@ there only then; `w1700k-efr32 link` hands that port to a host over ssh
 (`platform/README.md`, `host/w1700k/README.md`). Nothing on the unit speaks to
 it. To take up later:
 
-- **A stack on the unit.** With the factory firmware (a Bluetooth co-processor
-  that takes commands over the port) a small client on the unit could scan or
-  advertise without anything else installed. A standard Bluetooth host, a
+- **A stack on the unit.** The host can already listen with the factory
+  firmware (`w1700k efr32 scan`, a passive scan). With that firmware (a
+  Bluetooth co-processor that takes commands over the port) a small client on
+  the unit could do the same, or advertise, without anything else installed
+  or a host attached. A standard Bluetooth host, a
   Thread border router or a Zigbee coordinator on the unit needs other firmware
   in the radio and far more in the root (shared libraries, IPv6, a message
   bus); on the host they need only the link.

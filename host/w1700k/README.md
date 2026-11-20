@@ -190,6 +190,7 @@ controller.
 | `efr32 status` | whether it runs (`efr32`), what start-up does (`start`), whether its port is there (`port`) |
 | `efr32 on [--keep]`, `efr32 off [--keep]` | let it run or hold it in reset, until the unit next starts; with `--keep`, at every start-up too |
 | `efr32 identify` | ask the radio what firmware it runs |
+| `efr32 scan [--seconds N] [--phy 1m\|coded\|both]` | listen for Bluetooth LE advertisers and say who was heard |
 | `efr32 pty [--baud N] [--name PATH]` | its serial port as a terminal device on this host, until stopped |
 
 The port is there only at a boot where the radio is kept on, so the first time
@@ -204,6 +205,16 @@ $ host/bin/w1700k efr32 identify
   Bluetooth co-processor image answers and that make it do nothing else
   (`system_hello`, `system_get_version`). The factory firmware is such an
   image. Other firmware will not answer, and that is said.
+- **`scan`** is a passive scan with the factory firmware: the radio listens on
+  the advertising channels for N seconds (10 unless said) and sends nothing.
+  The answer lists each advertiser heard, strongest first: its address and
+  whether that is public or random, the strongest level heard (`rssi`, dBm),
+  how many reports came, its name where its advertisement carries one, and
+  whether it is connectable, scannable, or uses extended advertising. `--phy
+  coded` listens for long-range advertising, `both` for the two together.
+  `transmitted` is the radio's own count of packets it sent meanwhile, read
+  before and after: 0 for a scan that was passive. It is the only Bluetooth
+  this package does; it never scans actively, advertises or connects.
 - **`pty`** prints a device path (`/dev/pts/N`) and stays: that device is the
   radio's port, at 115200 baud (the factory firmware's), 230400 or 460800, 8N1
   without flow control, carried over ssh. Point a Bluetooth host stack, a
@@ -211,8 +222,9 @@ $ host/bin/w1700k efr32 identify
   With `--name PATH` it makes a link to the device at that path for as long as
   it runs and prints that instead: a name that stays the same from run to run.
 - **What goes through the port is the user's doing.** A host that tells the
-  radio to advertise, scan or connect makes the unit transmit at 2.4 GHz, up to
-  10 dBm, beside its own 2.4 GHz antennas. Nothing here does that.
+  radio to advertise, scan actively or connect makes the unit transmit at
+  2.4 GHz, up to 10 dBm, beside its own 2.4 GHz antennas. Nothing here does
+  that.
 
 ## The GPS receiver
 

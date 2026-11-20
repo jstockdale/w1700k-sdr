@@ -7,6 +7,8 @@ Thread at 2.4 GHz) on the unit's second serial port, which the unit hands to the
     w1700k efr32 on [--keep]     let it run; with --keep, at every start-up too (and its port with it)
     w1700k efr32 off [--keep]    hold it in reset
     w1700k efr32 identify        ask the radio what firmware it runs
+    w1700k efr32 scan [--seconds N] [--phy 1m|coded|both]
+                                 listen for Bluetooth LE advertisers; the radio transmits nothing
     w1700k efr32 pty [--baud N] [--name PATH]
                                  its serial port as a terminal device on this host, until stopped
 
@@ -17,6 +19,11 @@ kept on: `on --keep`, restart the unit, then `identify` or `pty`.
 answers and that make it do nothing else: `system_hello` and `system_get_version`. The factory
 firmware is such an image (seen on a unit: stack 6.2.0 build 212). Other firmware (a Zigbee or
 Thread co-processor) will not answer them.
+
+`scan` is a passive scan: the radio listens on the advertising channels and reports what it
+hears, and sends nothing (it asks no advertiser for more, as an active scan would). The radio's
+own count of the packets it has transmitted is read before and after and given with the result.
+That is all of Bluetooth this package does: nothing here advertises, connects or scans actively.
 
 `pty` is the port itself, for whatever the host wants to run against it: a Bluetooth host stack,
 a flasher, a terminal. What goes through it is the user's own doing: a host that tells the radio
@@ -34,7 +41,19 @@ BAUDS = (115200, 230400, 460800)  # what the port reaches
 # the class and the command (sl_bt_api.h: system_hello 0x00010020, system_get_version 0x1b010020).
 SYSTEM = 0x01
 HELLO, GET_VERSION, BOOT = 0x00, 0x1b, 0x00
+GET_COUNTERS = 0x0f
 RESPONSE, EVENT = 0x20, 0xa0
+# The scanner (sl_bt_api.h of stack 6.2.0, the factory firmware's: gecko_sdk v4.3.2).
+SCANNER = 0x05
+SCAN_SET_PARAMETERS, SCAN_START, SCAN_STOP = 0x06, 0x03, 0x05
+LEGACY_REPORT, EXTENDED_REPORT = 0x00, 0x02              # events
+PASSIVE = 0                                              # the scan mode; 1 would be active, which transmits
+OBSERVATION = 2                                          # discover every advertiser, whatever its flags say
+PHYS = {'1m': 1, 'coded': 4, 'both': 5}
+SCAN_UNITS = 0x10                                        # interval and window, 0.625 ms each: 10 ms, so always listening
+CONNECTABLE, SCANNABLE = 0x01, 0x02                      # event flags
+ADDRESS_TYPES = {0: 'public', 1: 'random', 255: 'anonymous'}
+NAME, SHORT_NAME = 0x09, 0x08                            # advertising data fields
 
 
 class RadioError(portlink.LinkError):
@@ -109,6 +128,98 @@ def identify(link):
         raise RadioError(f'system_hello answered {hello.hex()}')
     body = link.ask(SYSTEM, GET_VERSION)
     return dict(firmware='bgapi', **version_from_response(body))
+
+
+def _ok(link, cls, cmd, payload=b'', what=''):
+    """A command that answers a result first: its payload after the result, or RadioError."""
+    body = link.ask(cls, cmd, payload)
+    if len(body) < 2:
+        raise RadioError(f'{what}: an answer of {len(body)} bytes')
+    result = struct.unpack_from('<H', body)[0]
+    if result:
+        raise RadioError(f'{what}: the radio refused, result {result:#06x}')
+    return body[2:]
+
+
+def transmitted(link):
+    """The radio's own count of the packets it has sent since it started (16 bits)."""
+    body = _ok(link, SYSTEM, GET_COUNTERS, b'\x00', 'counters')
+    if len(body) < 8:
+        raise RadioError(f'a counters answer of {len(body) + 2} bytes is not one this knows')
+    return struct.unpack_from('<H', body)[0]
+
+
+def _name(data):
+    """The device name in advertising data, where it carries one."""
+    at = 0
+    while at + 1 < len(data) and data[at]:
+        if data[at + 1] in (NAME, SHORT_NAME):
+            return data[at + 2:at + 1 + data[at]].decode('utf-8', errors='replace')
+        at += data[at] + 1
+    return None
+
+
+def report(cmd, body):
+    """One advertisement report event as (address, fields), or None for anything else."""
+    data_at = {LEGACY_REPORT: 18, EXTENDED_REPORT: 26}.get(cmd)
+    if data_at is None or len(body) <= data_at:
+        return None
+    flags, kind = body[0], body[7]
+    rssi, channel = struct.unpack_from('<bB', body, 9)
+    address = ':'.join(f'{byte:02x}' for byte in reversed(body[1:7])) if kind != 255 else 'anonymous'
+    data = body[data_at + 1:data_at + 1 + body[data_at]]
+    return address, {'address_type': ADDRESS_TYPES.get(kind, str(kind)), 'rssi': rssi, 'channel': channel,
+                     'connectable': bool(flags & CONNECTABLE), 'scannable': bool(flags & SCANNABLE),
+                     'extended': cmd == EXTENDED_REPORT, 'name': _name(data)}
+
+
+def scan(link, seconds=10.0, phy='1m'):
+    """Listen for advertisers for `seconds` and say who was heard, strongest first:
+    {'seconds', 'phy', 'reports', 'transmitted', 'advertisers': [{'address', 'address_type',
+    'rssi' (the strongest heard, dBm), 'reports', 'name', 'connectable', 'scannable', 'extended'}]}.
+
+    A passive scan: the radio only listens. `transmitted` is how many packets it says it sent
+    meanwhile, by its own counter, which is 0 for a scan that was passive. The scanner is stopped
+    again however this ends."""
+    if phy not in PHYS:
+        raise ValueError(f'phy: one of {", ".join(PHYS)}')
+    before = transmitted(link)
+    _ok(link, SCANNER, SCAN_SET_PARAMETERS, struct.pack('<BHH', PASSIVE, SCAN_UNITS, SCAN_UNITS), 'scan parameters')
+    heard, count, done = {}, 0, False
+    try:                                                 # from before it starts: an interrupt then leaves no scan running
+        _ok(link, SCANNER, SCAN_START, bytes([PHYS[phy], OBSERVATION]), 'starting the scan')
+        began = time.monotonic()
+        while True:
+            left = began + seconds - time.monotonic()
+            if left <= 0:
+                break
+            got = link.message(min(left, 0.25))
+            if got is None or got[0] != EVENT or got[1] != SCANNER:
+                continue
+            one = report(got[2], got[3])
+            if one is None:
+                continue
+            address, fields = one
+            count += 1
+            entry = heard.setdefault(address, dict(fields, reports=0))
+            entry['reports'] += 1
+            entry['rssi'] = max(entry['rssi'], fields['rssi'])
+            entry['name'] = entry['name'] or fields['name']
+            for key in ('connectable', 'scannable', 'extended'):
+                entry[key] = entry[key] or fields[key]
+        took = time.monotonic() - began
+        done = True
+    finally:
+        try:
+            _ok(link, SCANNER, SCAN_STOP, what='stopping the scan')
+        except RadioError:
+            if done:                                     # (else what went wrong first is what is said)
+                raise
+    sent = (transmitted(link) - before) & 0xffff
+    order = ('address', 'address_type', 'rssi', 'reports', 'name', 'connectable', 'scannable', 'extended')
+    advertisers = [{key: dict(entry, address=address)[key] for key in order}
+                   for address, entry in sorted(heard.items(), key=lambda item: -item[1]['rssi'])]
+    return {'seconds': round(took, 1), 'phy': phy, 'reports': count, 'transmitted': sent, 'advertisers': advertisers}
 
 
 # --- on a unit ---

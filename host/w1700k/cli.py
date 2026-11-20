@@ -92,10 +92,12 @@ def radio_command(config, args):
             result = efr32.status(unit)
         elif args.radio in ('on', 'off'):
             result = dict(efr32.switch(unit, args.radio == 'on', args.keep), port=efr32.status(unit).get('port'))
-        elif args.radio == 'identify':
+        elif args.radio in ('identify', 'scan'):
             link = efr32.open_link(unit)
             try:
                 result = efr32.identify(link)
+                if args.radio == 'scan':
+                    result = efr32.scan(link, args.seconds, args.phy)
             finally:
                 link.close()
         else:
@@ -188,6 +190,11 @@ def build_parser():
         q = radio.add_parser(name, help='let it run' if name == 'on' else 'hold it in reset')
         q.add_argument('--keep', action='store_true', help='at every start-up from now on too')
     radio.add_parser('identify', help='ask the radio what firmware it runs (it transmits nothing for this)')
+    q = radio.add_parser('scan', help='listen for Bluetooth LE advertisers and say who was heard; a passive scan, '
+                                      'for which the radio transmits nothing')
+    q.add_argument('--seconds', type=float, default=10.0)
+    q.add_argument('--phy', choices=tuple(efr32.PHYS), default='1m',
+                   help='1m: ordinary advertising; coded: long range; both: the two together')
     q = radio.add_parser('pty', help="the radio's serial port as a terminal device here, until stopped; what a "
                                      'host sends through it may make the unit transmit')
     q.add_argument('--baud', type=int, default=efr32.BAUD, choices=efr32.BAUDS)

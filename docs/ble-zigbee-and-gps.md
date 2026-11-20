@@ -92,6 +92,7 @@ host/bin/w1700k efr32 on --keep      # let it run, now and at every start-up
 # restart the unit
 host/bin/w1700k efr32 status         # {"efr32": "on", "start": "on", "port": "on"}
 host/bin/w1700k efr32 identify       # ask it what firmware it runs
+host/bin/w1700k efr32 scan           # Bluetooth LE advertisers nearby; the radio only listens
 host/bin/w1700k efr32 pty --name ~/w1700k-efr32     # its port as a device, until stopped
 host/bin/w1700k efr32 off --keep     # held in reset again, now and at every start-up
 ```
@@ -105,6 +106,21 @@ host/bin/w1700k efr32 off --keep     # held in reset again, now and at every sta
   ```
 
   Other firmware (a Zigbee or Thread co-processor) does not answer it, and that is said.
+- **`scan`** has the factory firmware listen for Bluetooth LE advertisers for ten seconds
+  (`--seconds N`) and lists who was heard, strongest first:
+
+  ```
+  {"seconds": 10.0, "phy": "1m", "reports": 1431, "transmitted": 0,
+   "advertisers": [{"address": "c0:ff:ee:00:00:01", "address_type": "public", "rssi": -41,
+                    "reports": 62, "name": "Lamp", "connectable": true, "scannable": true,
+                    "extended": false}, ...]}
+  ```
+
+  It is a passive scan: the radio listens and sends nothing. (An active scan would ask each
+  advertiser for more, which transmits; this never does.) `transmitted` is the radio's own
+  count of the packets it sent during the scan, and is 0. `--phy coded` listens for
+  long-range advertising instead, `--phy both` for the two together. A name is there only
+  where the advertisement itself carries one.
 - **`pty`** is the radio's port as a device, at 115200 baud unless `--baud 230400` or
   `--baud 460800` says otherwise. The factory firmware takes BGAPI commands there, so a
   BGAPI host library can scan, advertise and connect through it.
@@ -220,7 +236,15 @@ at no other.
   to `--name` as its user-defined port at 921600: it showed a 3D fix and every kind of
   sentence above. A program reading it through pyserial got every line as a sentence whose
   checksum holds.
-- No Bluetooth host stack has been run through the radio's port; only `identify`.
+- Of Bluetooth, only `identify` and the passive `scan` have been run through the radio's
+  port. Seen on a unit: 68 advertisers in 20 seconds, 51 of the 52 that a Nordic sniffer
+  dongle beside it heard in the same time, at a median 9 dB stronger; the radio's transmit
+  count stayed 0 and the sniffer saw nothing sent from the radio's address. Advertising,
+  active scanning and connecting have not been tried, and no Bluetooth host stack has been
+  run through the port.
+- The factory firmware has no Wi-Fi coexistence (it answers "not supported"), so it does
+  nothing to keep clear of the unit's own 2.4 GHz use; with our receive-only firmware
+  there is nothing of ours to keep clear of.
 - 230400 and 460800 on the radio's port were measured by timing, not against a device that
   talks at them: the factory firmware talks only 115200.
 - All of this was measured on one unit (hardware 2.1).
