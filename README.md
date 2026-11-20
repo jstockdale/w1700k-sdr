@@ -162,6 +162,7 @@ between them, in 1.22 kHz bins.*
 | [`host/stream/`](host/stream/README.md) | `w1700k-stream`, the host's one receiver of the export: the IQ stream in shared memory for every consumer, and the roll-off correction |
 | [`host/spectrum/`](host/spectrum/README.md) | The spectrum/waterfall web server |
 | [`host/recv/`](host/recv/README.md) | `sdr-recv`, the stream recorder |
+| [`host/wifi/`](host/wifi/README.md) | `wifi-beacons`, which reads Wi-Fi beacons out of the samples: the networks on a channel by name; `tools/wifi_scan.py` runs it across a band |
 | [`host/soapy/`](host/soapy/README.md) | The SoapySDR module (`driver=w1700k`): the receiver in GNU Radio and other SoapySDR programs |
 | [`init/`](init/README.md) | Installation from stock, updates, recovery, return to stock |
 | [`include/hw/`](include/hw/README.md) | Register reference: every known MT7996, A-die and AN7581 register, as C headers |
