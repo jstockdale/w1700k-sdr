@@ -253,10 +253,12 @@ static void dsss_run(const cf *x, size_t n)
 		fprintf(stderr, "dsss: the sample rate must be a whole number of Msps\n");
 		return;
 	}
+	if (n < block * 8)			/* too little to hold a frame */
+		return;
 	dsss_correlate(&d, x, n);
 	{	/* the noise level of the despread signal: a low percentile of block means */
 		size_t nb = n / block, k = 0;
-		float *means = malloc(nb * sizeof(float));
+		float *means = calloc(nb + 1, sizeof(float));
 
 		for (size_t b = 0; b < nb; b++) {
 			double s = 0;
@@ -270,7 +272,7 @@ static void dsss_run(const cf *x, size_t n)
 			while (j && means[j - 1] > v) { means[j] = means[j - 1]; j--; }
 			means[j] = v;
 		}
-		floor = means[k / 10];
+		floor = k ? means[k / 10] : 0;
 		free(means);
 	}
 	for (size_t at = 0; at + block * 4 < n;) {
@@ -442,7 +444,7 @@ static void ofdm_symbol(const struct ofdm_rx *r, size_t at, int polarity, unsign
 		unsigned bin = (unsigned)(data_carrier[d] + 64) & 63;
 		cf z = v[bin] * conjf(r->h[bin]) * rot;		/* weighted by the carrier's strength */
 		float g = crealf(r->h[bin] * conjf(r->h[bin])), re = crealf(z), im = cimagf(z);
-		float bit[4];
+		float bit[4] = { 0 };
 
 		if (nbpsc == 1) {
 			bit[0] = re;
@@ -481,8 +483,8 @@ static size_t ofdm_frame(struct ofdm_rx *r, size_t start, cf coarse, double nois
 	double bestv = 0, power = 0;
 	float s48[48];
 	uint8_t sb[24];
-	unsigned rate, length, parity = 0, nbpsc, ncbps, ndbps;
-	double mbps;
+	unsigned rate, length, parity = 0, nbpsc = 1, ncbps, ndbps;
+	double mbps = 6;
 	cf fine = 0, v1[64], v2[64];
 
 	if (start + 2000 >= r->n)
@@ -585,7 +587,7 @@ static void ofdm_run(const cf *x, size_t n)
 			sum += h[k];
 		}
 		for (int k = 0; k < TAPS; k++) h[k] /= sum;
-		m = (n - TAPS) / 2;
+		m = n > TAPS ? (n - TAPS) / 2 : 0;
 		y = malloc(m * sizeof(cf));
 		for (size_t i = 0; i < m; i++) {
 			cf acc = 0;
@@ -600,9 +602,13 @@ static void ofdm_run(const cf *x, size_t n)
 		return;
 	}
 	r.x = y; r.n = m;
+	if (m < 4000) {				/* too little to hold a frame */
+		free(y);
+		return;
+	}
 	{	/* the noise level: a low percentile of block powers */
 		size_t nb = m / 400, k = 0;
-		float *means = malloc(nb * sizeof(float));
+		float *means = calloc(nb + 1, sizeof(float));
 
 		for (size_t b = 0; b < nb; b++) {
 			double s = 0;
@@ -611,7 +617,7 @@ static void ofdm_run(const cf *x, size_t n)
 			means[k++] = (float)(s / 400);
 		}
 		for (size_t i = 1; i < k; i++) { float v = means[i]; size_t j = i; while (j && means[j - 1] > v) { means[j] = means[j - 1]; j--; } means[j] = v; }
-		noise = means[k / 10];
+		noise = k ? means[k / 10] : 0;
 		free(means);
 	}
 	{	/* the short training repeats every 16 samples: correlate the signal with itself 16 later */

@@ -250,6 +250,10 @@ class Beacons(unittest.TestCase):
         lines, summary = self.decode(on_air([], 40e6, noise=0.3)[:4 * 200000], 40)
         self.assertEqual(lines, [])
         self.assertIn('0 frames whose check held', summary)
+        for size in (0, 4, 4000):                                 # a file too short to hold anything
+            lines, summary = self.decode(bytes(size), 40)
+            self.assertEqual(lines, [])
+            self.assertIn('0 frames whose check held', summary)
         result = subprocess.run([str(PROGRAM)], capture_output=True, text=True)
         self.assertEqual(result.returncode, 2)
         self.assertIn('usage: wifi-beacons FILE --rate 40|20', result.stderr)
