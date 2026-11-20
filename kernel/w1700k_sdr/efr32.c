@@ -21,8 +21,8 @@
  * not drive it high: it makes the line an input again, as the board had it, and the chip's own
  * pull-up ends the reset. `status` reads the line as it is, without driving it.
  *
- * That is the W1700K. The same loader and root run on the XR1710G, which has no such chip, and
- * what its line 24 does is not known. The loader holds the line only on a unit it has named a
+ * That is the W1700K. The same loader and root run on the XR1710G, which has no such chip:
+ * its line 24 is a hardware-revision strap (docs/boards/xr1710g.md). The loader holds the line only on a unit it has named a
  * W1700K (`/chosen/w1700k,board` in the device tree), and so does this: on a board named
  * anything else, one the loader could not name included, it does nothing and says so,
  * whatever it was asked. (The chip does nothing unasked, so a W1700K that cannot be named loses

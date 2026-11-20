@@ -25,7 +25,8 @@
  * How it differs from the W1700K, all of it:
  *   - no GPS receiver, and GPIO 43, its power line there, is a port LED here;
  *   - the two 1 GbE ports' LEDs are on GPIO 33, 34, 43 and 44, not 9, 10, 27, 28;
- *   - GPIO 44 being an LED, there is no minor hardware-revision strap;
+ *   - the hardware-revision straps are GPIO 30/28 and 27/25/24, not 30/18 and 45/44,
+ *     and two of them are the W1700K's low-power radio's lines (24, 25);
  *   - RTL8261BE PHYs, which answer as the RTL8261N of the W1700K (HW 1.x) does;
  *   - other DRAM parts of the same size; an older build of the same stock U-Boot.
  */
@@ -144,12 +145,23 @@
 #define XR1710G_GPIO_PHY_10G_B_RESET    46u     /* MDIO 5 */
 
 /*
- * Hardware-revision straps. Read as stock leaves the pads, without forcing them
- * to GPIO as the W1700K's procedure does: GPIO 30 = 0 and GPIO 18 = 1, which by
- * the W1700K's formula (2 * GPIO30 + GPIO18) is major revision 1, the label's
- * "HW 1.0"; GPIO 45 = 1 [measured]. GPIO 44, the W1700K's minor LSB, is an LED
- * here, so no minor revision can be read. Nothing in this tree reads the straps.
+ * Hardware-revision straps [static: /etc/init.d/hardware_test in stock's root]:
+ * major = 2 * GPIO30 + GPIO28, minor = 4 * GPIO27 + 2 * GPIO25 + GPIO24, each
+ * line made an input and read, with no pad forced to GPIO as the W1700K's
+ * procedure does. Read on a unit: 0, 1 and 0, 0, 0, which is 1.0, the label's
+ * "HW 1.0" [measured].
+ *
+ * Not the W1700K's lines (30/18 and 45/44). GPIO 18 and GPIO 45 read 1 here
+ * [measured], so the W1700K's formula for the major gives 1 too, by chance;
+ * GPIO 44 is an LED. GPIO 24 and 25 are the reset and bootloader lines of the
+ * W1700K's low-power radio (w1700k_board.h): on this board they must stay
+ * inputs. Nothing in this tree reads the straps.
  */
+#define XR1710G_GPIO_HWREV_MAJOR_MSB    30u
+#define XR1710G_GPIO_HWREV_MAJOR_LSB    28u
+#define XR1710G_GPIO_HWREV_MINOR_MSB    27u
+#define XR1710G_GPIO_HWREV_MINOR_MID    25u
+#define XR1710G_GPIO_HWREV_MINOR_LSB    24u
 
 /* ======================================================================== */
 /* NAND and what stock keeps in it                                          */

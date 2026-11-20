@@ -376,8 +376,10 @@ Nothing of ours uses it either, and it is held in reset.
   the board and before a second loader is started or any root runs
   (`efr32_off`, after `board_id` in `bootcmd`): line 24 an output, then low, in
   that order, as for the GPS receiver.
-- **Only on a W1700K.** The XR1710G has no such chip, and what its line 24 does
-  is not known; a unit the loader cannot name may be one. On any board not
+- **Only on a W1700K.** The XR1710G has no such chip, and its line 24 is a
+  hardware-revision strap
+  ([`docs/boards/xr1710g.md`](../docs/boards/xr1710g.md)); a unit the loader
+  cannot name may be one. On any board not
   named `w1700k` the loader leaves the line alone and says nothing of a radio,
   and `w1700k-efr32` does nothing and says so. (The chip does nothing unasked,
   so a W1700K that cannot be named loses little by it; the GPS receiver, which

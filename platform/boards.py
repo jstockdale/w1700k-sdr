@@ -51,7 +51,8 @@ class Board:
 W1700K = Board('w1700k', 'W1700K', 'W1700K', gps_line=43, efr32_reset_line=24)
 # GPIO 43 is the green LED of a 1 GbE port here, lit when low [measured on a unit:
 # stock's device tree and its kernel's GPIO table].
-# No such chip on the board [photo], and what GPIO 24 does there is not known.
+# No such chip on the board [photo]. GPIO 24 there is a hardware-revision strap, the low bit of
+# the minor [static: stock's hardware test script; it read 0 on a unit], and is left an input.
 XR1710G = Board('xr1710g', 'XR1710G', 'XR1710G', gps_line=None, efr32_reset_line=None)
 ALL = (W1700K, XR1710G)
 UNKNOWN = 'unknown'
