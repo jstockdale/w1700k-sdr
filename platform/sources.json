@@ -19,7 +19,15 @@
       "target/linux/generic/files",
       "target/linux/airoha/patches-6.18",
       "target/linux/airoha/dts",
+      "target/linux/mediatek/patches-6.18",
+      "target/linux/mediatek/files",
+      "target/linux/mediatek/files-6.18",
+      "target/linux/mediatek/dts",
       "package/firmware/rtl826x-firmware"
+    ],
+    "files": [
+      "target/linux/generic/config-6.18",
+      "target/linux/mediatek/filogic/config-6.18"
     ]
   },
   "u-boot": {

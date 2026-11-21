@@ -60,6 +60,28 @@ class KeptCheckout(unittest.TestCase):
         with self.assertRaisesRegex(buildlib.BuildError, 'Makefile'):
             self.checkout()
 
+    def test_one_made_for_fewer_paths_is_widened_and_not_fetched_again(self):
+        """The pins gain directories and single files (a second target of the same OpenWrt): a
+        checkout from before takes them, at the same commit."""
+        def limited(paths, files=()):
+            with mock.patch('builtins.print'):
+                return fetch.git_checkout(self.kept, str(self.origin), self.commit, paths, files=files)
+        (self.origin / 'target').mkdir()
+        (self.origin / 'target/config-1').write_text('CONFIG = 1\n')
+        (self.origin / 'target/other').write_text('not asked for\n')
+        self.git('add', '.')
+        self.git('-c', 'user.name=t', '-c', 'user.email=t@example.invalid', 'commit', '-q', '-m', 'more')
+        self.commit = self.git('rev-parse', 'HEAD').strip()
+        limited(['package'])
+        self.assertTrue((self.kept / 'package/one.mk').exists())
+        self.assertFalse((self.kept / 'Makefile').exists(), 'only the paths asked for')
+        (self.kept / 'marker').write_text('a file of the build\n')
+        limited(['package'], ['target/config-1'])
+        self.assertEqual((self.kept / 'target/config-1').read_text(), 'CONFIG = 1\n')
+        self.assertFalse((self.kept / 'target/other').exists(), 'a single file, not its directory')
+        self.assertTrue((self.kept / 'marker').exists(), 'widened, not fetched again')
+        limited(['package'], ['target/config-1'])
+
     def test_one_at_another_commit_is_fetched_again(self):
         self.checkout()
         (self.origin / 'Makefile').write_text('all:\n\tfalse\n')

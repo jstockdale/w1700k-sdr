@@ -81,16 +81,22 @@ def extract(archive, dest):
     return dest
 
 
-def git_checkout(dest, url, commit, paths=(), tag=None):
-    """A shallow checkout of exactly `commit`, limited to `paths` when given.
+def git_checkout(dest, url, commit, paths=(), tag=None, files=()):
+    """A shallow checkout of exactly `commit`, limited to the directories `paths` and the single
+    `files` when given. A checkout already at the commit is widened to them if it was made for
+    fewer.
 
     With `tag`, the tag is fetched too: Buildroot names its version (which ends
     up in the compiler's version string) from `git describe`.
     """
     dest = Path(dest)
+    wanted = [f'/{path}/' for path in paths] + [f'/{path}' for path in files]
     if dest.is_dir():
         head = output(['git', '-C', dest, 'rev-parse', 'HEAD']).strip()
         if head == commit:
+            if wanted and output(['git', '-C', dest, 'sparse-checkout', 'list']).split() != wanted:
+                print(f'fetch: {dest.name}: taking the paths it was not checked out with')
+                run(['git', '-C', dest, 'sparse-checkout', 'set', '--no-cone', *wanted])
             # At the pinned commit, and as that commit has it: a file changed in the checkout is
             # built from as readily as the pinned one, and its commit would not show it.
             changed = output(['git', '-C', dest, 'status', '--porcelain', '--untracked-files=no']).splitlines()
@@ -107,9 +113,8 @@ def git_checkout(dest, url, commit, paths=(), tag=None):
     print(f'fetch: {url} at {commit[:12]}')
     run(['git', 'init', '-q', partial])
     run(['git', '-C', partial, 'remote', 'add', 'origin', url])
-    if paths:
-        run(['git', '-C', partial, 'sparse-checkout', 'set', '--no-cone',
-             *[f'/{path}/' for path in paths]])
+    if wanted:
+        run(['git', '-C', partial, 'sparse-checkout', 'set', '--no-cone', *wanted])
     if tag:
         run(['git', '-C', partial, 'fetch', '-q', '--depth', '1', '--filter=blob:none',
              'origin', f'refs/tags/{tag}:refs/tags/{tag}'])
@@ -132,7 +137,7 @@ def buildroot():
 def openwrt():
     pin = sources()['openwrt']
     url = os.environ.get('W1700K_OPENWRT_GIT') or pin['git']
-    return git_checkout(SRC / 'openwrt', url, pin['commit'], pin['paths'])
+    return git_checkout(SRC / 'openwrt', url, pin['commit'], pin['paths'], files=pin.get('files', ()))
 
 
 def linux_archive():

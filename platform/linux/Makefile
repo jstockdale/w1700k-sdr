@@ -12,6 +12,9 @@ kernel:
 # tree (default: this directory's build output).
 KDIR ?= $(OUT)
 SDR := $(ROOT)/kernel/w1700k_sdr
+# Where the module and the clients are built: those for another kernel (KDIR) go to a
+# directory of their own.
+SDR_OUT ?= $(SDR)/build
 # Built the same way, but not clients of the driver: the reset button's service, the GPS
 # receiver's power line, the low-power radio's reset line, and the link that hands either's
 # serial port to a host.
@@ -19,12 +22,12 @@ UNIT_PROGRAMS := keyd:w1700k-key gps:w1700k-gps-line efr32:w1700k-efr32-line por
 SDR_CLIENTS := probe:mt7996-probe download:mt7996-download stream:mt7996-stream \
 	ctl:mt7996-ctl ledd:w1700k-led
 module:
-	mkdir -p $(SDR)/build
-	$(MAKE) -C $(KDIR) ARCH=arm64 CROSS_COMPILE=$(CROSS_COMPILE) M=$(SDR) MO=$(SDR)/build modules
+	mkdir -p $(SDR_OUT)
+	$(MAKE) -C $(KDIR) ARCH=arm64 CROSS_COMPILE=$(CROSS_COMPILE) M=$(SDR) MO=$(SDR_OUT) modules
 reader:
-	mkdir -p $(SDR)/build
+	mkdir -p $(SDR_OUT)
 	set -e; for pair in $(SDR_CLIENTS) $(UNIT_PROGRAMS); do \
 		$(CROSS_COMPILE)gcc -std=c11 -O2 -Wall -Wextra -Werror -static \
 			-I$(ROOT)/include/uapi -I$(ROOT)/include $(SDR)/$${pair%%:*}.c -lpthread -lm \
-			-o $(SDR)/build/$${pair##*:}; \
+			-o $(SDR_OUT)/$${pair##*:}; \
 	done
