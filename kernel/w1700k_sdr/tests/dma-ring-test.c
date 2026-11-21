@@ -158,6 +158,30 @@ static void allocation(void)
 	sdr_dma_wm_rx_count = SDR_DMA_WM_RX_COUNT;
 	sdr_dma_wm_rx_bytes = SDR_DMA_WM_RX_BYTES;
 	sdr_dma_stream_bytes = SDR_DMA_STREAM_BYTES;
+	/* The ring is sized to the unit's memory: whole where it is at most five
+	 * eighths of it, else halved until it is, and never under what the slots
+	 * and the export's margin need.
+	 */
+	{
+		const u64 whole = SDR_DMA_STREAM_BYTES;
+		const u64 least = (u64)(8 + 64 + 1) * 4096;
+		u64 floor = whole;
+
+		sdr_dma_wm_rx_count = 8;
+		sdr_dma_wm_rx_bytes = 4096;
+		while (floor / 2 >= least)
+			floor /= 2;
+		CHECK(sdr_dma_stream_fit(whole * 2) == whole);
+		CHECK(sdr_dma_stream_fit(whole / 5 * 8 + 8) == whole);
+		CHECK(sdr_dma_stream_fit(whole / 5 * 8 - 8) == whole / 2);
+		CHECK(sdr_dma_stream_fit(whole) == whole / 2);
+		CHECK(sdr_dma_stream_fit(whole / 2) == whole / 4);
+		CHECK(sdr_dma_stream_fit(0) == floor && floor >= least && floor / 2 < least);
+		CHECK(sdr_dma_stream_bytes == floor);
+		CHECK(sdr_dma_stream_fit(whole * 2) == whole && sdr_dma_stream_bytes == whole);
+		sdr_dma_wm_rx_count = SDR_DMA_WM_RX_COUNT;
+		sdr_dma_wm_rx_bytes = SDR_DMA_WM_RX_BYTES;
+	}
 	{
 		const dma_addr_t bad[] = { 0x100001, 0x100000000ULL, 0xfffffff0ULL };
 

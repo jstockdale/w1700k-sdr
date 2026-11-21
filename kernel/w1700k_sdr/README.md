@@ -6,7 +6,9 @@ Linux driver and unit-side tools that run the W1700K's MediaTek MT7996
 - loads the MCU firmware (ROM patch, then the WM, WA and optionally DSP RAM
   containers) over the WFDMA download rings;
 - turns the WM event ring into a stream ring: 1536 RX descriptors cycling
-  through a 1 GiB DRAM buffer of 8 KiB slices, mapped read-only by userspace;
+  through a 1 GiB DRAM buffer of 8 KiB slices, mapped read-only by userspace
+  (halved until it is at most five eighths of the unit's memory: 512 MiB on a
+  unit with 1 GiB; readers take the size from the ring's header);
 - optionally sends every slice to the network as one UDP datagram, zero copy;
 - relays small word writes/reads to the firmware's mailbox page, also while a
   stream runs.

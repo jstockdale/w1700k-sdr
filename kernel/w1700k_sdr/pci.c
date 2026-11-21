@@ -1097,6 +1097,8 @@ static int __init sdr_init(void)
 	int ret;
 
 	sdr_led_init(&sdr_led);		/* without it the receiver works all the same */
+	pr_info("w1700k_sdr: stream ring of %llu MiB\n",
+		sdr_dma_stream_fit((u64)totalram_pages() << PAGE_SHIFT) >> 20);
 	ret = pci_register_driver(&sdr_driver);
 	if (ret)
 		sdr_led_exit(&sdr_led);

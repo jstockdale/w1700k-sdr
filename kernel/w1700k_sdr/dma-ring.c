@@ -49,6 +49,24 @@ static u32 sdr_dma_wm_rx_count = SDR_DMA_WM_RX_COUNT;
 static u32 sdr_dma_wm_rx_bytes = SDR_DMA_WM_RX_BYTES;
 static u64 sdr_dma_stream_bytes = SDR_DMA_STREAM_BYTES;
 
+/*
+ * The stream ring for a unit with `ram_bytes` of memory: SDR_DMA_STREAM_BYTES
+ * where that is at most five eighths of it (the W1700K's 2 GiB), else halved
+ * until it is (512 MiB of 1 GiB, which is 0.42 s at 1.28 GB/s), and never
+ * under what the slots and the export's margin need. Readers take the size
+ * from the ring's header.
+ */
+u64 sdr_dma_stream_fit(u64 ram_bytes)
+{
+	const u64 least = (u64)(sdr_dma_wm_rx_count + 64 + 1) * sdr_dma_wm_rx_bytes;
+	u64 bytes = SDR_DMA_STREAM_BYTES;
+
+	while (bytes / 2 >= least && bytes > ram_bytes / 8 * 5)
+		bytes /= 2;
+	sdr_dma_stream_bytes = bytes;
+	return bytes;
+}
+
 struct sdr_dma_desc {
 	__le32 buf0, ctrl, buf1, info;
 };

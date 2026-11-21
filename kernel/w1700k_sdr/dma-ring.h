@@ -21,6 +21,10 @@ enum sdr_dma_queue {
 
 int sdr_dma_ring_alloc(struct device *dev, enum sdr_dma_queue queue,
 		       struct sdr_dma_ring **out);
+/* Sizes the stream ring to the unit's memory, before any ring is allocated;
+ * returns the size taken.
+ */
+u64 sdr_dma_stream_fit(u64 ram_bytes);
 
 /*
  * Program BASE/CNT/CPU_IDX/DMA_IDX on a stopped engine, read all four back,
