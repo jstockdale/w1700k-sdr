@@ -5,12 +5,14 @@ board around another SoC, a MediaTek MT7988A. This is the intake record of one
 unit: what was read from its board and labels, what public sources say about
 the model, and what has to be found out before anything of ours runs on it.
 
-**A kernel of ours starts on it from RAM; the receiver does not run on it
-yet.** The project's images are the AN7581's and none of them runs here. What
-has been measured is the stock bootloader and the flash, from the unit's first
-power-on with us (2026-11-20), stopped at U-Boot before stock Linux started;
-one whole stock boot, logged with nothing sent to the unit; and a Linux built
-for the board, started from RAM by stock U-Boot with no driver for the flash.
+**A kernel of ours starts on it from RAM, and its radio runs the project's
+firmware; the radio has not been brought up and no stream has run.** The
+project's images are the AN7581's and none of them runs here. What has been
+measured is the stock bootloader and the flash, from the unit's first power-on
+with us (2026-11-20), stopped at U-Boot before stock Linux started; one whole
+stock boot, logged with nothing sent to the unit; and a Linux built for the
+board, started from RAM by stock U-Boot with no driver for the flash, in which
+the project's driver loaded the project's firmware onto the radio.
 
 Every line carries where it comes from:
 
@@ -95,9 +97,10 @@ Ten, each a small board on a cable to a connector on the main board [photo]:
 | `2.4/5.8G-1` … `2.4/5.8G-5` | grey | numbered 6 … 10, marked `2.4/5.8G-n (GY)` | 2.4 and 5 GHz share an antenna |
 | `6G-1` … `6G-5` | black | numbered 1 … 5, marked `6G-n (BK)` | |
 
-That is five connectors a group for a radio sold as four streams a band. What
-the fifth of each group is connected to has not been found out. A receive path of the radio beyond
-its four chains would fit, and is a guess.
+That is five connectors a group for a radio sold as four streams a band. The
+calibration gives the 6 GHz band five receive paths [measured], which would
+be its fifth connector; what the fifth `2.4/5.8G` connector is for has not
+been found out.
 
 Because 2.4 and 5 GHz share antennas here, a cable into one `2.4/5.8G`
 connector reaches two of the radio's bands at once.
@@ -247,6 +250,13 @@ On our unit as received [measured]:
   partition) nothing.
 - **`Factory`** begins `90 79`, as the W1700K's calibration does, and holds
   data up to `0xf0fff`, well past the `0x1e00` bytes of the calibration.
+- **The calibration** is those first `0x1e00` bytes, and the 16 KiB they
+  begin are otherwise blank: cut out, they are a calibration file as the host
+  takes one, and its check passes. Against a W1700K's, the bands (2.4, 5 and
+  6 GHz), the paths (four to transmit on each; four, four and five to
+  receive) and the three front-end bytes at `0x196` are the same; byte
+  `0x002` is 4 where the W1700K's is 5, and bytes `0x1a3`, `0x1a7` and
+  `0x1a9` differ. What those four mean to our bring-up is not known.
 - **Spare areas**: all 128 bytes `0xff` on each of five pages sampled across
   the chip.
 
@@ -273,6 +283,30 @@ interfaces, the four switch ports and both 10 GbE ports, and one complaint
 at 2 Mbaud in 36 s.
 
 None of this is in the tree yet: the build was an experiment beside it.
+
+## The receiver on it
+
+With the project's driver, its unit-side tools and the firmware set in that
+system's initramfs [measured]:
+
+- **The radio's ROM is the W1700K's.** Its first 64 KiB hash to the value the
+  firmware set names (`firmware.json`, taken from a W1700K of hardware 2.1),
+  so the set's patch and WM, which call the ROM by address, are for this
+  radio too. It was read and compared before anything was downloaded, as the
+  host does it.
+- **The driver** takes the radio (`14c3:7990`) unchanged but for the stream
+  ring, which it now sizes to the unit's memory: 512 MiB here, where the
+  W1700K keeps its 1 GiB. It finds no status LED, since it looks for the
+  AN7581's pin controller, and says so.
+- **The firmware set downloads**: the ROM patch, the WM, the DSP image and the
+  WA, each complete, the same files as on the W1700K.
+- **Our WM runs**: its status block reads `OWWM`, version 7, state running,
+  no trap counted, and its main loop passes 29 million times a second.
+- The system had 431 MiB free with the ring allocated, and the SoC read 34 °C.
+
+Nothing has asked the radio to receive yet: its bring-up takes this unit's
+calibration, and a stream needs the 10 GbE ports, neither of which has been
+tried.
 
 ## Reading a unit out
 
@@ -315,15 +349,17 @@ What follows from it, before any measurement:
   driver, the flash handling ([`platform/bmt`](../../platform/bmt) is Airoha's
   table), the loader, the dumper and the restorer are the AN7581's, and
   [`include/hw/an7581`](../../include/hw/an7581) describes that chip.
-- **The radio side should carry over, and that is not shown.** The radio
+- **The radio side carries over as far as it has been tried** (the firmware
+  loads and the WM runs; see "The receiver on it"). The radio
   firmware ([`firmware/`](../../firmware)) runs on the MT7996's own
   processors, and the driver ([`kernel/w1700k_sdr`](../../kernel/w1700k_sdr))
   is a PCI driver that polls. Two of its files know the AN7581: `led.c` (the
   LED's lines and generators) and `export.c` (a setting of Airoha's Ethernet).
   The unit-side tools for the GPS receiver, the low-power radio, the status
   LED and the reset-button key are the W1700K board's.
-- **The stream ring does not fit.** The driver keeps received samples in a
-  1 GiB ring, which is all the memory this unit has.
+- **The stream ring is half the W1700K's.** The driver's 1 GiB ring is all
+  the memory this unit has, so it takes 512 MiB here: 0.42 s of an unpacked
+  320 Msps stream where the W1700K holds 0.84 s.
 - **The reduced formats lean on the SoC.** Where the W1700K's packs part of a
   320 Msps stream on its own cores, this board has faster cores, half the
   memory and no NPU; what it can carry to a host has to be measured.
@@ -332,12 +368,12 @@ What follows from it, before any measurement:
 
 In the order bring-up needs them:
 
-1. Whether the project's driver and radio firmware run the radio here as
-   they do on the W1700K.
+1. Whether the radio comes up with this unit's calibration and a stream
+   runs, as on the W1700K.
 2. The radio's crystal.
-3. The `Factory` partition's layout against the W1700K's calibration, which
-   begins `90 79`.
-4. What the fifth antenna connector of each group is connected to.
+3. What the calibration bytes that differ from the W1700K's (`0x002`,
+   `0x1a3`, `0x1a7`, `0x1a9`) mean to the bring-up.
+4. What the fifth `2.4/5.8G` antenna connector is connected to.
 5. Where the flash chip is on the board, and its full ID.
 6. How fast the SoC can pass samples to a 10 GbE port, and how hot the board
    runs doing it without a fan.
