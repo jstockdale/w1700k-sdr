@@ -5,15 +5,20 @@ board around another SoC, a MediaTek MT7988A. This is the intake record of one
 unit: what was read from its board and labels, what public sources say about
 the model, and what has to be found out before anything of ours runs on it.
 
-**Nothing here has been measured on a unit yet.** No image of this project has
-been built for the board, and none of the existing ones runs on it: they are
-the AN7581's.
+**Nothing of ours has run on it yet.** No image of this project has been built
+for the board, and none of the existing ones runs on it: they are the
+AN7581's. What has been measured is the stock bootloader and the flash, from
+the unit's first power-on with us (2026-11-20), stopped at U-Boot before stock
+Linux started, and then one whole stock boot, logged with nothing sent to the
+unit.
 
 Every line carries where it comes from:
 
-- **[photo]** a marking or a part read from the board of one unit in hand
-  (its label says made by Tozed Kangwei; opened 2026-11-20, never powered by
-  us).
+- **[measured]** on one unit: from its serial console at its first power-on
+  with us, stopped at stock U-Boot's prompt; from an image of its whole flash
+  read out there; and from the console log of the stock boot that followed.
+- **[photo]** a marking or a part read from the board of that unit (its label
+  says made by Tozed Kangwei; opened 2026-11-20).
 - **[static]** from a document or another source tree, which is named. Two
   carry most of it: OpenWrt's commit `25f6620614ac` ("mediatek: add support
   for LTC Velo7 Max", 2026-07-31) with its device tree
@@ -21,7 +26,6 @@ Every line carries where it comes from:
 - **[forum]** from the OpenWrt forum thread on the model ("LTC Velo7 Max
   router", topic 250792): owners' posts, not checked by anyone here. Good for
   knowing what to look for, not for relying on.
-- **[measured]** on a unit, by us. None so far.
 
 Nothing here is a unit's own: no serial number, MAC address, network name,
 calibration or credential.
@@ -47,12 +51,13 @@ names a board by how its serial begins.
 | Part | What it is | |
 | --- | --- | --- |
 | SoC | MediaTek MT7988AV, date code 2441: four Cortex-A73 at 1.8 GHz | [photo]; [static: OpenWrt commit] |
-| DRAM | two Nanya NT5AD256M16E4-JR, DDR4, 4 Gbit each: 1 GiB | [photo] |
-| Flash | Winbond W25N02KV, 256 MiB SPI-NAND, bad blocks managed by MediaTek's NMBM | [static: OpenWrt commit]; not found in our photos |
+| DRAM | two Nanya NT5AD256M16E4-JR, DDR4, 4 Gbit each: 1 GiB; the first stage finds 1024 MB with "DDR unknown settings" | [photo]; [measured] |
+| Flash | Winbond SPI-NAND (ID begins `ef`), 256 MiB, 2048 + 128 byte pages, 128 KiB blocks, bad blocks managed by MediaTek's NMBM; a W25N02KV by OpenWrt's account | [measured]; [static: OpenWrt commit]; not found in our photos |
 | eMMC | a footprint beside the SoC, not populated | [photo] |
-| Radio | MediaTek MT7996, on both of the SoC's two-lane PCIe interfaces; its reset on GPIO 7 | [static: OpenWrt commit, device tree] |
+| Radio | MediaTek MT7996: PCI `14c3:7990` behind the bridge at `pcie@11300000` and its second interface `14c3:7991` behind `pcie@11310000`, the W1700K's IDs; its reset on GPIO 7 | [measured]; [static: device tree] |
+| RF front ends | an MT7976 and two MT7977, as on the W1700K: stock's driver names the set `ADIE_76_77_77` | [measured] |
 | Radio, on the board | one chip under a thermal pad in its own shield frame between the SoC and the RF section, and three closed shield cans; none opened, no marking read | [photo] |
-| 10 GbE PHYs | two Realtek RTL8261BE, at MDIO 6 and 7, USXGMII; resets on GPIO 77 and GPIO 10 | [static: device tree] |
+| 10 GbE PHYs | two Realtek RTL8261BE, at MDIO 6 and 7, USXGMII; resets on GPIO 77 and GPIO 10. Stock's driver, which calls itself RTL8261N/RTL826XB, takes both | [static: device tree]; [measured] |
 | 10 GbE magnetics | two JXD TG2484S | [photo] |
 | 1 GbE | four ports from the SoC's built-in switch | [static: OpenWrt commit] |
 | Regulator | Richtek RT5190A at I2C0 `0x64`; buck 3 is the cores' supply | [static: device tree] |
@@ -117,17 +122,43 @@ Three plated holes in a row at the board's edge, at the corner of the RF
 section farthest from the Ethernet sockets, marked `RX` and `TX` at the ends;
 the middle one has no mark and is ground [photo]; [static: OpenWrt commit]. No header is fitted.
 115200 8N1, 3.3 V, and no supply pin: only the three are connected [static];
-[forum]. It is the SoC's UART at `0x11000000` [static: device tree].
+[forum]; it worked so on our unit [measured]. It is the SoC's UART at
+`0x11000000`, clocked at 40 MHz (its divisor reads 22) [measured].
+
+Stock U-Boot refuses every console speed above 115200 (`setenv baudrate`
+answers "not supported" from 230400 up) [measured]. The UART itself runs
+faster when its registers are set as U-Boot's own driver would set them for a
+high speed: at 2 Mbaud (high-speed mode 3, divisor 1, sample count 19, sample
+point 8) the console worked in both directions for an hour, and of 1881
+blocks printed one came damaged and was printed again [measured]. That is in RAM only; a reset puts 115200
+back.
 
 ## Stock boot chain
 
-All of this is from others' units, and none of it has been seen on ours.
-
-- **Bootloader.** MediaTek's: a first stage (`BL2`), then a `FIP` holding
-  U-Boot [static: flash layout]. Its prompt is `MT7988>`, it waits five
-  seconds (`bootdelay=5`), and its menu has a web recovery (`httpd`) and an
-  image loader (`mtkload`). Its own address is 192.168.1.1 and it looks for a
-  server at 192.168.1.10 [forum].
+- **First stages.** After the boot ROM's own lines, `BL2: v2.10.0(release):b860d5f7`,
+  built 2025-11-21, which finds the DRAM and the flash and attaches NMBM
+  read-only; then `BL31` of the same build [measured].
+- **Stock U-Boot** is `U-Boot 2024.04 (Nov 21 2025 - 19:57:50 +0800)`, 1.1 s
+  after the first byte on the console. It calls the board `mt7988-rfb`
+  (`mediatek,mt7988-spim-nand-rfb`), MediaTek's reference board, and runs the
+  maker's `tozed_w19b6vm_gpio_init` [measured].
+- **It attaches the UBI area on every start**, before anything can be typed,
+  to read its environment from the volume `u-boot-env` [measured]. An attach
+  may write to the flash, so no power-on leaves the UBI area provably
+  untouched.
+- **The boot menu** comes 2.9 s after the first byte: "Startup system
+  (Default)", which runs `mtkboardboot`; upgrades of the firmware, of BL2, of
+  the FIP and of single images (`mtkupgrade`); "Load image" (`mtkload`); and
+  "Start Web failsafe" (`httpd`). It waits five seconds. **Ctrl+C leaves it
+  for the prompt, `MT7988>`, without choosing an entry** [measured].
+- **At the prompt** there are `bootm`, `booti`, `go`, `tftpboot`, `loadb`,
+  `loadx`, `loady`, `mtd`, `nand`, `nmbm`, `ubi`, `fip`, `bl2`, `md`, `mw`
+  and `crc32`, among others. There is no `tftpput`: nothing sends data out
+  over the network [measured].
+- **The environment as received** has `dual_boot.current_slot=1`, and its
+  `bootcmd` is a BOOTP and NFS line that the menu's default entry does not
+  use [measured]. Owners give U-Boot's own address as 192.168.1.1 and its
+  server as 192.168.1.10 [forum]; neither was set in ours.
 - **Two slots.** MediaTek's dual-boot scheme: UBI volumes `kernel`/`rootfs`
   and `kernel2`/`rootfs2`, chosen by the variable `dual_boot.current_slot`.
   The environment is itself a UBI volume, `u-boot-env`, not the raw partition
@@ -137,19 +168,40 @@ All of this is from others' units, and none of it has been seen on ours.
   FIT; if either fails it tries the other slot [static: OpenWrt commit]. An
   image whose hash does not fit is refused with "rootfs verification failed"
   [forum]. Whether the first stages are signed, and whether U-Boot will start
-  an image given to it in RAM, is in none of the sources.
-- **Stock Linux** is OpenWrt 21.02 from MediaTek's SDK, built for the
-  reference board `mediatek_mt7988a-dsa-10g-spim-nand`; firmware versions
-  3.2.6, 3.2.7 and 3.3.3 are spoken of. Its `sysupgrade` takes an OpenWrt
-  image as it is, writes the slot that is not running, and restarts only with
-  `-R` [static: OpenWrt commit]; [forum].
+  an image given to it in RAM, is in none of the sources and has not been
+  tried.
+- **What it checked on our unit.** It read `kernel2` and `rootfs2` (slot 1),
+  checked the CRC32 and SHA-1 of the FIT's kernel and device tree and of the
+  root file system, and said "Firmware integrity verification passed". Those
+  are hashes, not signatures: nothing in the log verifies a key [measured].
+- **Stock Linux** is 5.4.281, an OpenWrt from MediaTek's SDK built for the
+  reference board `mediatek_mt7988a-dsa-10g-spim-nand` ("MediaTek MT7988A DSA
+  10G SPIM-NAND RFB") [measured]; firmware versions 3.2.6, 3.2.7 and 3.3.3
+  are spoken of [forum]. Its `sysupgrade` takes an OpenWrt image as it is,
+  writes the slot that is not running, and restarts only with `-R` [static:
+  OpenWrt commit]; [forum].
+- **The radio under stock** is driven by MediaTek's own driver (`mt_wifi`,
+  `mtk_hwifi`, `mt7990`), not mt76, with its settings in
+  `/etc/wireless/mediatek/mt7990.b0.dat` to `.b2.dat` [measured].
+- **The console under stock** offers failsafe mode ("Press the [f] key and
+  hit [enter]") and then "Please press Enter to activate this console"
+  [measured]; neither was answered.
+- **Timeline of a stock boot**, from power-on: U-Boot's banner at 1.1 s, the
+  menu at 5.9 s, the kernel started at 10.7 s, the failsafe offer at 30.4 s,
+  the console offered at 37.7 s, the last kernel module loaded at 40.7 s
+  [measured].
+- **A stock boot writes to the flash.** It mounts `rootfs_data`, `config`,
+  `config_bak` and `data` for writing, and each needed recovery when mounted
+  ("recovery needed"), as after a power cut [measured]. A unit that has
+  booted stock once is no longer as it arrived; ours was imaged first.
 - **OpenWrt** supports the board since that commit: target
   `mediatek/filogic`, device `ltc_vl7m19k`, board name `ltc,vl7m19k`.
 
 ## Flash
 
-256 MiB, of which 240 MiB are laid out and the rest is NMBM's [static: device
-tree]:
+256 MiB, of which 240 MiB are laid out and the rest is NMBM's. The offsets are
+the device tree's [static], and stock U-Boot lists the same eight partitions
+on its `nmbm0` [measured]:
 
 | Partition | Offset | Size | |
 | --- | --- | --- | --- |
@@ -168,8 +220,43 @@ not stored but taken from the first of those, less 2 for the LAN and less 1
 for the WAN [static: OpenWrt commit]. It is the one thing on the flash that
 cannot be had again from anywhere else.
 
-On a stock unit the `ubi` partition held six volumes: `u-boot-env`, `kernel`
-(3.5 MiB), `rootfs`, `rootfs_data`, `kernel2` and `rootfs2` [forum].
+On our unit as received [measured]:
+
+- **NMBM**: 2048 blocks, 1920 of them for data; its tables from block 1920
+  (info tables at 1920 and 1923, write count 0), its signature in block 2047.
+  No block was bad and none remapped, so the physical chip and `nmbm0` are the
+  same over the first 240 MiB.
+- **The `ubi` partition**: 1540 blocks, erase counters at most 8 and 5 on
+  average, six volumes: `u-boot-env` (9 blocks reserved), `kernel` (29),
+  `rootfs` (422), `rootfs_data` (579), `kernel2` (29) and `rootfs2` (366).
+  `rootfs` and `rootfs2` each held 366 blocks of data, and `rootfs_data`
+  already 11: the unit had run its own Linux before it reached us, at the
+  factory by every sign.
+- **`BL2`** holds 261 KiB, the **`FIP`** 784 KiB, and `u-boot-env` (the raw
+  partition) nothing.
+- **`Factory`** begins `90 79`, as the W1700K's calibration does, and holds
+  data up to `0xf0fff`, well past the `0x1e00` bytes of the calibration.
+- **Spare areas**: all 128 bytes `0xff` on each of five pages sampled across
+  the chip.
+
+## Reading a unit out
+
+A unit can be backed up whole from stock U-Boot's prompt, with nothing written
+to it and nothing of ours started on it. That is how the image of our unit was
+made, before stock Linux first ran [measured]:
+
+1. Stop U-Boot with Ctrl+C from its banner on.
+2. Raise the console to 2 Mbaud in the UART's registers (above).
+3. For each megabyte of `spi-nand0`, the physical chip: `mtd read` it into
+   RAM, have `crc32` give the checksum of each 128 KiB block there, and print
+   with `md.l` every block that is not all `0xff` (only its first 4 KiB where
+   the rest is `0xff`, as in an empty UBI block).
+4. Hold every printed block to U-Boot's checksum, and print it again if it
+   differs.
+5. Read the whole chip a second time and compare the checksums with the image.
+
+The 256 MiB took 49 minutes, with 857 blocks printed whole and 1024 in part,
+and the second pass three minutes more; it found all 2048 blocks equal.
 
 ## What differs from the W1700K
 
@@ -179,7 +266,7 @@ On a stock unit the `ubi` partition held six volumes: `u-boot-env`, `kernel`
 | DRAM | 2 GiB | 1 GiB on this unit | [photo] |
 | Flash | 512 MiB, Airoha's bad-block table | 256 MiB, MediaTek's NMBM | [static] |
 | Stock bootloader | U-Boot 2014.04, `ECNT>`, `tclinux` images | MediaTek U-Boot, `MT7988>`, FIT in UBI, two slots | [forum] |
-| Radio | MT7996 on PCIe | MT7996 on PCIe | [static] |
+| Radio | MT7996, `14c3:7990` and `14c3:7991`, MT7976 + 2 x MT7977 | the same | [measured] |
 | 10 GbE | two RTL8261, Airoha's Ethernet | two RTL8261BE, MediaTek's Ethernet | [static] |
 | Second processor | the AN7581's NPU | none of ours to use | |
 | GPS, low-power radio | AG3352, EFR32MG21 | neither seen | [photo] |
@@ -209,17 +296,14 @@ What follows from it, before any measurement:
 
 In the order bring-up needs them:
 
-1. The stock boot log, from the first byte, with nothing sent to the unit.
-2. Whether stock U-Boot starts an image staged in RAM, and what it checks of
-   one.
-3. Whether the first stages are signed and the SoC's secure boot is on.
-4. The radio's PCI IDs and link (the W1700K's are `14c3:7990` and `14c3:7991`,
-   Gen3 x2), and whether its two interfaces are wired as the W1700K's are.
-5. The front ends in the three cans (the W1700K has an MT7976 and two
-   MT7977), and the radio's crystal.
-6. The `Factory` partition's layout against the W1700K's calibration, which
+1. Whether stock U-Boot starts an image staged in RAM. What it checks of the
+   images on the flash is hashes only, which is a good sign and not the answer.
+2. Whether the first stages are signed and the SoC's secure boot is on.
+3. The radio's PCIe link speed and width on each interface (the W1700K's
+   first is Gen3 x2), and the radio's crystal.
+4. The `Factory` partition's layout against the W1700K's calibration, which
    begins `90 79`.
-7. What the fifth antenna connector of each group is connected to.
-8. Where the flash chip is, and its ID.
-9. How fast the SoC can pass samples to a 10 GbE port, and how hot the board
+5. What the fifth antenna connector of each group is connected to.
+6. Where the flash chip is on the board, and its full ID.
+7. How fast the SoC can pass samples to a 10 GbE port, and how hot the board
    runs doing it without a fan.
