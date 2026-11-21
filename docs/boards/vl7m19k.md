@@ -5,9 +5,11 @@ board around another SoC, a MediaTek MT7988A. This is the intake record of one
 unit: what was read from its board and labels, what public sources say about
 the model, and what has to be found out before anything of ours runs on it.
 
-**A kernel of ours starts on it from RAM, and in it the host's `w1700k load`
-brings the radio up and every capture mode streams into the unit's memory, up
-to 320 Msps on each band; no stream has left the unit yet.** The project's images are the AN7581's and none
+**A kernel of ours starts on it from RAM, and in it the receiver works as on
+the W1700K: the host's `w1700k load` brings the radio up, and every stream
+mode the project's sweep knows reaches the host through a 10 GbE port, up to
+320 Msps on each band, on a 5 Gbit/s link with nothing lost. It is not
+installed: everything runs from RAM beside the tree.** The project's images are the AN7581's and none
 of them runs here. What has been
 measured is the stock bootloader and the flash, from the unit's first power-on
 with us (2026-11-20), stopped at U-Boot before stock Linux started; one whole
@@ -285,6 +287,31 @@ at 2 Mbaud in 36 s.
 
 None of this is in the tree yet: the build was an experiment beside it.
 
+### The 10 GbE ports under it
+
+Three things the ports needed before a cable was ever in them [measured]:
+
+- **The PHYs' patch.** The kernel's driver for the RTL8261BE asks for
+  `rtl8261n.bin` and, while the file cannot be had, puts its probe off without
+  a word. The ports then open on the generic PHY driver. With the file built
+  into the kernel, as the W1700K's kernel has it and from the same pinned
+  source, both PHYs are taken by "RTL8261BE 10Gbps PHY".
+- **The PHYs' reset lines.** OpenWrt's device tree gives each PHY a reset
+  (GPIO 77 and GPIO 10). While the driver's probe was put off, the kernel left
+  both asserted, and the PHYs sat in reset. The vendor's device tree, read
+  from this unit's stock image, has no reset on the PHY nodes and holds both
+  lines high from start (and marks the PHYs `mdi-reversal`, which this
+  kernel's driver does not read); the RAM start's device tree now does the
+  same. Whether OpenWrt's resets would also work on this unit once the patch
+  is there was not tried.
+- **Jumbo frames.** The Ethernet driver takes an MTU of 2030 at the most,
+  because it receives into 2 KiB buffers. The project's export sends a whole
+  8 KiB slice as one datagram. As an experiment the limit was raised to 9194
+  for what the stack may send, with receiving left as it is. The MAC does put
+  such frames on the wire: pings of 1,900 to 9,000 bytes all reached the
+  host whole and valid (20 of 20 at each size); the unit itself still takes
+  nothing above 2 KiB, so it never hears the answers to the large ones.
+
 ## The receiver on it
 
 With the project's driver, its unit-side tools and the firmware set in that
@@ -346,8 +373,28 @@ What it took beside the tree: an ssh server and this unit's own identity key
 in the RAM system, an address on one switch port, and a host configuration
 naming the tools' place there and the calibration file.
 
-Not tried: a stream out of a 10 GbE port, and with it the reduced formats and
-the split schedule, which the SoC's senders make.
+### Out of a 10 GbE port
+
+With the host's stream adapter on the unit's second 10 GbE port (`eth2`, the
+PHY at MDIO 7), linked at 5 Gbit/s, which is that adapter's limit [measured]:
+
+- **[`tools/unit_sweep.py`](../../tools/unit_sweep.py) passes, 30 modes of
+  30**, less its check of the status LED, which this board does not have:
+  every band at 40, 80, 160 and 320 Msps under the packing the controller
+  picks for the link (raw, raw, `full`, `split`), every other packing that
+  fits on the 2.4 GHz band (`half`, `full`, 16, 14, 8 and 7 bits), and the
+  6 GHz band captured at 640 Msps. Each arrived at its rate with no slice
+  lost, of the kind its packing makes, at a plausible level, in lock.
+- **A minute of 320 Msps** at 5250 MHz, `split`: 9,377,311 slices at the
+  host, none lost, 4.50 Gbit/s on the wire. On the unit the pump's CPU was
+  busy as it is meant to be, the other three about half, 397 MiB of memory
+  free, and the SoC went from 44 to 47 °C.
+- The driver's zero-copy export and the SoC's own senders both work here, the
+  first because the MAC sends jumbo frames (above).
+
+Not tried: a link faster than 5 Gbit/s, and so 320 Msps without the SoC
+reducing part of it; both 10 GbE ports at once; a stream of more than a
+minute.
 
 ## Reading a unit out
 
@@ -409,7 +456,7 @@ What follows from it, before any measurement:
 
 In the order bring-up needs them:
 
-1. Whether a stream leaves through the 10 GbE ports, and at what rates.
+1. What the board carries on a 10 Gbit/s link, and on both ports at once.
 2. The radio's crystal.
 3. What the calibration bytes that differ from the W1700K's (`0x002`,
    `0x1a3`, `0x1a7`, `0x1a9`) mean to the bring-up.
