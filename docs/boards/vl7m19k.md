@@ -5,9 +5,10 @@ board around another SoC, a MediaTek MT7988A. This is the intake record of one
 unit: what was read from its board and labels, what public sources say about
 the model, and what has to be found out before anything of ours runs on it.
 
-**A kernel of ours starts on it from RAM, and its radio runs the project's
-firmware; the radio has not been brought up and no stream has run.** The
-project's images are the AN7581's and none of them runs here. What has been
+**A kernel of ours starts on it from RAM, and in it the host's `w1700k load`
+brings the radio up and a stream of samples runs into the unit's memory; no
+stream has left the unit yet.** The project's images are the AN7581's and none
+of them runs here. What has been
 measured is the stock bootloader and the flash, from the unit's first power-on
 with us (2026-11-20), stopped at U-Boot before stock Linux started; one whole
 stock boot, logged with nothing sent to the unit; and a Linux built for the
@@ -304,9 +305,25 @@ system's initramfs [measured]:
   no trap counted, and its main loop passes 29 million times a second.
 - The system had 431 MiB free with the ring allocated, and the SoC read 34 °C.
 
-Nothing has asked the radio to receive yet: its bring-up takes this unit's
-calibration, and a stream needs the 10 GbE ports, neither of which has been
-tried.
+- **The host's `w1700k load` works on it as it is**, over ssh to the RAM
+  system through a 1 GbE port: driver, ROM check, download, the unit's
+  calibration given as a file, the radio's bring-up and every band's set-up.
+  All three bands came ready and all three synthesizers locked.
+- **A stream runs**: the 2.4 GHz band at 2437 MHz and 40 Msps for three
+  seconds, raw, into the driver's ring with readers on the unit and no
+  export. The radio sent 58,594 chunks and the ring received 58,594, none
+  malformed and none lost to the readers; that is 40 Msps to the chunk.
+- **The samples are radio**: in 52 ms of them, no spare bit set in two
+  million words, I and Q alike in level with a small offset, chunk power
+  ranging over 50 dB as the AGC and the band's traffic move it, and a
+  spectrum with the channel filter's shape.
+
+What it took beside the tree: an ssh server and this unit's own identity key
+in the RAM system, an address on one switch port, and a host configuration
+naming the tools' place there and the calibration file.
+
+Not tried: a stream out of a 10 GbE port, any rate above 40 Msps, the reduced
+formats, and the other two bands under a stream.
 
 ## Reading a unit out
 
@@ -368,8 +385,7 @@ What follows from it, before any measurement:
 
 In the order bring-up needs them:
 
-1. Whether the radio comes up with this unit's calibration and a stream
-   runs, as on the W1700K.
+1. Whether a stream leaves through the 10 GbE ports, and at what rates.
 2. The radio's crystal.
 3. What the calibration bytes that differ from the W1700K's (`0x002`,
    `0x1a3`, `0x1a7`, `0x1a9`) mean to the bring-up.
