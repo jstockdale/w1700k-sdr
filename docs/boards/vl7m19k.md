@@ -367,6 +367,18 @@ system's initramfs [measured]:
   raw samples without a spare bit and at a plausible level, the band's
   synthesizer in lock. An unpacked 320 Msps stream is 1.28 GB/s through the
   radio's first PCIe interface into memory.
+- **The 2.4 GHz band's 320 MHz filter oscillated on this unit, and no longer
+  does.** That filter is the MT7976's 160 MHz one widened by lowering its
+  trim 9 codes under the calibrated one, a setting found on a W1700K whose
+  die calibrates to 17. This unit's calibrates to 13, which gave 4, and at 0,
+  2 and 4 the widened filter oscillates: a narrow line wandering near
+  ±145 MHz from the LO at about -20 dBFS, at the same offset wherever the LO
+  is, at the same level whatever the LNA gain, absent at the 160 MHz filter
+  and on the other two bands. It looks like two strong signals at the band's
+  edges, and the AGC, which sees it, sits at its lowest baseband gain. From 5
+  up the filter is clean here. The firmware now keeps that trim at 8 or over
+  (`include/hw/adie/mt7976.h`), and with it the band is clean at 320 Msps and
+  the AGC follows the band, at about 13 dB more gain.
 - **One thing to watch**: in some runs the pump took its first completions
   about 10 to 14 ms late, in proportion to the rate (up to 2,246 at once at
   320 Msps, more than its 1,536 slots). The producer was then at most 26
