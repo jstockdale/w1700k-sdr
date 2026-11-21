@@ -5,18 +5,19 @@ board around another SoC, a MediaTek MT7988A. This is the intake record of one
 unit: what was read from its board and labels, what public sources say about
 the model, and what has to be found out before anything of ours runs on it.
 
-**Nothing of ours has run on it yet.** No image of this project has been built
-for the board, and none of the existing ones runs on it: they are the
-AN7581's. What has been measured is the stock bootloader and the flash, from
-the unit's first power-on with us (2026-11-20), stopped at U-Boot before stock
-Linux started, and then one whole stock boot, logged with nothing sent to the
-unit.
+**A kernel of ours starts on it from RAM; the receiver does not run on it
+yet.** The project's images are the AN7581's and none of them runs here. What
+has been measured is the stock bootloader and the flash, from the unit's first
+power-on with us (2026-11-20), stopped at U-Boot before stock Linux started;
+one whole stock boot, logged with nothing sent to the unit; and a Linux built
+for the board, started from RAM by stock U-Boot with no driver for the flash.
 
 Every line carries where it comes from:
 
 - **[measured]** on one unit: from its serial console at its first power-on
   with us, stopped at stock U-Boot's prompt; from an image of its whole flash
-  read out there; and from the console log of the stock boot that followed.
+  read out there; from the console log of the stock boot that followed; and
+  from a shell in a Linux of ours started from RAM.
 - **[photo]** a marking or a part read from the board of that unit (its label
   says made by Tozed Kangwei; opened 2026-11-20).
 - **[static]** from a document or another source tree, which is named. Two
@@ -50,14 +51,15 @@ names a board by how its serial begins.
 
 | Part | What it is | |
 | --- | --- | --- |
-| SoC | MediaTek MT7988AV, date code 2441: four Cortex-A73 at 1.8 GHz | [photo]; [static: OpenWrt commit] |
+| SoC | MediaTek MT7988AV, date code 2441: four Cortex-A73 (part `0xd09`), run at 800, 1100, 1500 or 1800 MHz | [photo]; [measured] |
 | DRAM | two Nanya NT5AD256M16E4-JR, DDR4, 4 Gbit each: 1 GiB; the first stage finds 1024 MB with "DDR unknown settings" | [photo]; [measured] |
 | Flash | Winbond SPI-NAND (ID begins `ef`), 256 MiB, 2048 + 128 byte pages, 128 KiB blocks, bad blocks managed by MediaTek's NMBM; a W25N02KV by OpenWrt's account | [measured]; [static: OpenWrt commit]; not found in our photos |
 | eMMC | a footprint beside the SoC, not populated | [photo] |
 | Radio | MediaTek MT7996: PCI `14c3:7990` behind the bridge at `pcie@11300000` and its second interface `14c3:7991` behind `pcie@11310000`, the W1700K's IDs; its reset on GPIO 7 | [measured]; [static: device tree] |
+| Radio's PCIe links | both interfaces at 8.0 GT/s, two lanes (Gen3 x2), which is all either end can do; on each, BAR0 is 2 MiB and BAR2 32 KiB | [measured] |
 | RF front ends | an MT7976 and two MT7977, as on the W1700K: stock's driver names the set `ADIE_76_77_77` | [measured] |
 | Radio, on the board | one chip under a thermal pad in its own shield frame between the SoC and the RF section, and three closed shield cans; none opened, no marking read | [photo] |
-| 10 GbE PHYs | two Realtek RTL8261BE, at MDIO 6 and 7, USXGMII; resets on GPIO 77 and GPIO 10. Stock's driver, which calls itself RTL8261N/RTL826XB, takes both | [static: device tree]; [measured] |
+| 10 GbE PHYs | two Realtek RTL8261BE, at MDIO 6 and 7, USXGMII; resets on GPIO 77 and GPIO 10. Stock's driver, which calls itself RTL8261N/RTL826XB, takes both, and so does the "RTL8261BE 10Gbps PHY" driver of OpenWrt's kernel, with the device tree's reset lines as they are | [static: device tree]; [measured] |
 | 10 GbE magnetics | two JXD TG2484S | [photo] |
 | 1 GbE | four ports from the SoC's built-in switch | [static: OpenWrt commit] |
 | Regulator | Richtek RT5190A at I2C0 `0x64`; buck 3 is the cores' supply | [static: device tree] |
@@ -74,6 +76,9 @@ The RTL8261BE is the PHY of the [XR1710G](xr1710g.md), so the Realtek patch
 this project's kernel carries applies to the part. Owners report that on some
 units the PHYs answer with ID 0 until the device tree leaves their reset lines
 alone and sets `mdi-reversal` (OpenWrt pull request 25791) [forum].
+
+The SoC's own sensor read 41 °C with the board idle at a shell and its case
+open [measured].
 
 No GPS receiver and no Bluetooth or Zigbee chip was seen outside the shield
 cans [photo]. Not populated on this board: the eMMC, two telephone line
@@ -167,9 +172,15 @@ back.
   over the squashfs, which it takes from a top-level `rootfs` node of that
   FIT; if either fails it tries the other slot [static: OpenWrt commit]. An
   image whose hash does not fit is refused with "rootfs verification failed"
-  [forum]. Whether the first stages are signed, and whether U-Boot will start
-  an image given to it in RAM, is in none of the sources and has not been
-  tried.
+  [forum].
+- **It starts an image of ours from RAM.** Its own device tree has no
+  `/signature` node, so it asks for no key. A FIT of our kernel, device tree
+  and initramfs, each with a CRC32 and a SHA-1 as stock's have, sent to
+  `0x50000000` with `loadx` and passed by `iminfo`, was started by `bootm`
+  [measured]. U-Boot adds stock's `boot_param.*` words (the slots and their
+  volume names) to the kernel's command line.
+- Whether the first stages are signed is not known, and does not matter while
+  they are left as they are.
 - **What it checked on our unit.** It read `kernel2` and `rootfs2` (slot 1),
   checked the CRC32 and SHA-1 of the FIT's kernel and device tree and of the
   root file system, and said "Firmware integrity verification passed". Those
@@ -239,6 +250,30 @@ On our unit as received [measured]:
 - **Spare areas**: all 128 bytes `0xff` on each of five pages sampled across
   the chip.
 
+## A Linux for it
+
+The kernel that ran is the project's own Linux with another target of the same
+OpenWrt [measured]:
+
+- **Source**: Linux 6.18.52 and OpenWrt at the commit `platform/sources.json`
+  pins, as for the W1700K, with OpenWrt's `target/linux/mediatek` in place of
+  its `target/linux/airoha`: the generic patches and the 137 of
+  `mediatek/patches-6.18` all apply.
+- **Configuration**: OpenWrt's generic and `mediatek/filogic` configurations,
+  and what a kernel with its root in an initramfs needs on top.
+- **Device tree**: OpenWrt's `mt7988a-ltc-vl7m19k.dts` for the board, which
+  that commit already has.
+- **For a first start** the SPI-NAND was given no node, so no driver could
+  find the flash (`/proc/mtd` was empty), the Ethernet addresses were random,
+  and the radio was enumerated and left to no driver.
+
+It reached its shell in 2.8 s with 946 MiB of its 980 MiB free, both of the radio's
+interfaces, the four switch ports and both 10 GbE ports, and one complaint
+(a reference clock of the USB 3 PHY). Its 5.3 MiB image went over the console
+at 2 Mbaud in 36 s.
+
+None of this is in the tree yet: the build was an experiment beside it.
+
 ## Reading a unit out
 
 A unit can be backed up whole from stock U-Boot's prompt, with nothing written
@@ -267,6 +302,7 @@ and the second pass three minutes more; it found all 2048 blocks equal.
 | Flash | 512 MiB, Airoha's bad-block table | 256 MiB, MediaTek's NMBM | [static] |
 | Stock bootloader | U-Boot 2014.04, `ECNT>`, `tclinux` images | MediaTek U-Boot, `MT7988>`, FIT in UBI, two slots | [forum] |
 | Radio | MT7996, `14c3:7990` and `14c3:7991`, MT7976 + 2 x MT7977 | the same | [measured] |
+| Radio's second PCIe interface | Gen2, one lane | Gen3, two lanes | [measured] |
 | 10 GbE | two RTL8261, Airoha's Ethernet | two RTL8261BE, MediaTek's Ethernet | [static] |
 | Second processor | the AN7581's NPU | none of ours to use | |
 | GPS, low-power radio | AG3352, EFR32MG21 | neither seen | [photo] |
@@ -296,14 +332,12 @@ What follows from it, before any measurement:
 
 In the order bring-up needs them:
 
-1. Whether stock U-Boot starts an image staged in RAM. What it checks of the
-   images on the flash is hashes only, which is a good sign and not the answer.
-2. Whether the first stages are signed and the SoC's secure boot is on.
-3. The radio's PCIe link speed and width on each interface (the W1700K's
-   first is Gen3 x2), and the radio's crystal.
-4. The `Factory` partition's layout against the W1700K's calibration, which
+1. Whether the project's driver and radio firmware run the radio here as
+   they do on the W1700K.
+2. The radio's crystal.
+3. The `Factory` partition's layout against the W1700K's calibration, which
    begins `90 79`.
-5. What the fifth antenna connector of each group is connected to.
-6. Where the flash chip is on the board, and its full ID.
-7. How fast the SoC can pass samples to a 10 GbE port, and how hot the board
+4. What the fifth antenna connector of each group is connected to.
+5. Where the flash chip is on the board, and its full ID.
+6. How fast the SoC can pass samples to a 10 GbE port, and how hot the board
    runs doing it without a fan.
