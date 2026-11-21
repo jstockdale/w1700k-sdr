@@ -1,0 +1,75 @@
+// SPDX-License-Identifier: (GPL-2.0 OR MIT)
+/*
+ * LTC Velo7 Max as the receiver runs on it: started from RAM by its stock U-Boot, its root in
+ * an initramfs. OpenWrt's device tree for the board with three things changed
+ * (docs/boards/vl7m19k.md has what was measured):
+ *
+ *  - The flash is not reached. The SPI-NAND has no node here, so no driver finds it, and what
+ *    took an address or the radio's calibration from it does without: the Ethernet addresses
+ *    are random, and the host gives the calibration as a file.
+ *  - The radio is enumerated and left to the project's driver: OpenWrt's node for mt76 is gone.
+ *  - The two 10 GbE PHYs have no reset lines. The vendor's device tree (read from a unit's own
+ *    stock image) gives the PHY nodes none and holds both lines, GPIO 77 and GPIO 10, high from
+ *    the start; so does this. With OpenWrt's reset lines a probe of the PHY driver that does
+ *    not finish leaves both PHYs in reset.
+ */
+#include "mt7988a-ltc-vl7m19k.dts"
+
+/ {
+	model = "LTC Velo7 Max (w1700k-sdr, started from RAM)";
+
+	chosen {
+		bootargs = "console=ttyS0,115200n1 earlycon=uart8250,mmio32,0x11000000 pci=pcie_bus_perf rdinit=/init";
+	};
+};
+
+&spi0 {
+	status = "disabled";
+};
+
+&gmac0 {
+	/delete-property/ nvmem-cells;
+	/delete-property/ nvmem-cell-names;
+};
+
+&gmac1 {
+	/delete-property/ nvmem-cells;
+	/delete-property/ nvmem-cell-names;
+};
+
+&gmac2 {
+	/delete-property/ nvmem-cells;
+	/delete-property/ nvmem-cell-names;
+};
+
+&pcie0 {
+	/delete-node/ pcie@0,0;
+};
+
+&phy6 {
+	/delete-property/ reset-gpios;
+	/delete-property/ reset-assert-us;
+	/delete-property/ reset-deassert-us;
+};
+
+&phy7 {
+	/delete-property/ reset-gpios;
+	/delete-property/ reset-assert-us;
+	/delete-property/ reset-deassert-us;
+};
+
+&pio {
+	phy6-out-of-reset-hog {
+		gpio-hog;
+		gpios = <77 GPIO_ACTIVE_HIGH>;
+		output-high;
+		line-name = "10G PHY 6 out of reset";
+	};
+
+	phy7-out-of-reset-hog {
+		gpio-hog;
+		gpios = <10 GPIO_ACTIVE_HIGH>;
+		output-high;
+		line-name = "10G PHY 7 out of reset";
+	};
+};

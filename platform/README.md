@@ -27,6 +27,7 @@ starts Dropbear for key-only root logins. Nothing at startup writes NAND.
 | images | `images.py` | `images/w1700k-system.itb`, `w1700k-recovery.itb`, `rootfs.squashfs`, `durable-w25n04kv.ubifs`, `durable-w25n04lv.ubifs` |
 | dumper | `dumper/build.py` | `images/w1700k-dumper.itb` |
 | restorer | `restorer/build.py` | `images/w1700k-restorer.itb` |
+| velo7max | `velo7max/build.py`, `velo7max/image.py` | another board's kernel and RAM image, `images/velo7max-ram.itb`; `make velo7max`, not part of `make` |
 
 A first build downloads about 500 MB of sources and builds a GCC toolchain;
 on a 20-core host the whole `make` takes about ten minutes plus the downloads.
@@ -55,7 +56,11 @@ PHY firmware's own generator files and output by SHA-256, and the RTL8261CE's
 firmware file (the W1700K2's PHY) from linux-firmware by commit and SHA-256.
 [`fetch.py`](fetch.py) downloads and checks them; `W1700K_OPENWRT_GIT` points it
 at another OpenWrt repository (for example a local mirror) while still
-requiring the pinned commit.
+requiring the pinned commit. The OpenWrt pin names the directories taken from
+it, and single files under `files`: its Airoha target for the W1700K, its
+MediaTek target and two kernel configurations for the Velo7 Max
+([`velo7max/`](velo7max/README.md)). A checkout made before a path was added
+is widened to it at the same commit, not fetched again.
 
 An archive can name `mirrors`, tried in order after its `url`: the file is the
 same wherever it comes from, since it is held to its SHA-256, so a mirror is
@@ -78,6 +83,7 @@ another name. If no address gives an archive, a copy from anywhere put into
 | `patches/` | U-Boot patches the loader, the dumper and the restorer all carry (among them the W25N04LV and the part named at probe) |
 | `bmt/` | the vendor bad-block translation and replacement engine, shared by our U-Boots and Linux, and its C test harnesses |
 | `bootstrap/` | the initramfs `init` that mounts the root |
+| `velo7max/` | another board, the LTC Velo7 Max (MT7988A): its kernel configuration, device tree and patch, and the image its stock U-Boot starts from RAM ([`velo7max/README.md`](velo7max/README.md)) |
 | `partitions.py` | the NAND parts and layout, generated into both device trees and the BMT policy header |
 
 ## NAND
@@ -295,6 +301,11 @@ on the XR1710G that line is a port LED.
 - **`gps_off` still comes first, on every board**, because a unit that cannot
   be named has to be taken for one with a receiver. On an XR1710G that lights
   the LED for a moment; `board_id` then drives the line high again.
+
+The LTC Velo7 Max is not one of these: it has the same radio around another
+SoC, so none of the images above runs on it and it is not in `boards.py`. Its
+kernel and the image its stock U-Boot starts from RAM are built in
+[`velo7max/`](velo7max/README.md); nothing is installed on it.
 
 ### The GPS receiver
 

@@ -1,0 +1,49 @@
+#!/bin/busybox sh
+# SPDX-License-Identifier: MIT
+# The Velo7 Max's root when its stock U-Boot starts the receiver from RAM: a busybox, the
+# driver and its clients, and (if the image was made with a login key) an ssh server.
+# Nothing here reaches the flash: the kernel has no node for it (platform/velo7max/dts).
+# /etc/velo7max.conf is written by platform/velo7max/image.py.
+bb=/bin/busybox
+$bb mount -t devtmpfs devtmpfs /dev
+$bb --install -s
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t tmpfs tmpfs /tmp
+mkdir -p /dev/pts && mount -t devpts devpts /dev/pts
+. /etc/velo7max.conf
+
+echo
+echo "=== Velo7 Max: w1700k-sdr, started from RAM ==="
+uname -srv
+ip link set lo up
+
+# The 10 GbE ports: both up for jumbo frames (a slice of samples is one datagram), and the
+# stream's address on the one named.
+for port in eth1 eth2; do
+	ip link set "$port" mtu "$STREAM_MTU"
+	ip link set "$port" up
+done
+if [ -n "$STREAM_PORT" ]; then
+	ip addr add "$STREAM_ADDRESS" dev "$STREAM_PORT"
+	echo "stream: $STREAM_PORT $STREAM_ADDRESS, MTU $STREAM_MTU"
+fi
+
+# Management: a switch port and ssh, only where the image carries a login key.
+if [ -f /root/.ssh/authorized_keys ]; then
+	ip link set eth0 up
+	ip link set "$MANAGEMENT_PORT" up
+	ip addr add "$MANAGEMENT_ADDRESS" dev "$MANAGEMENT_PORT"
+	dropbear -r /etc/dropbear/dropbear_ed25519_host_key -s -P /tmp/dropbear.pid
+	echo "management: $MANAGEMENT_PORT $MANAGEMENT_ADDRESS, ssh with the image's login key"
+else
+	echo "management: none (the image carries no login key); this console only"
+fi
+
+for device in /sys/bus/pci/devices/*; do
+	echo "pci $(basename "$device") $(cat "$device/vendor"):$(cat "$device/device")" \
+		"$(cat "$device/current_link_speed" 2>/dev/null) x$(cat "$device/current_link_width" 2>/dev/null)"
+done
+stty cols 500 rows 50 2>/dev/null
+echo "=== shell on the console ==="
+while :; do setsid cttyhack sh; done

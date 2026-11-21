@@ -13,7 +13,7 @@
 PYTHON ?= python3
 export PYTHONDONTWRITEBYTECODE := 1
 
-.PHONY: all toolchain linux sdr rootfs loader dumper restorer images firmware host check sweep bench \
+.PHONY: all toolchain linux sdr rootfs loader dumper restorer images velo7max firmware host check sweep bench \
 	clean distclean
 
 all: images dumper restorer firmware host
@@ -49,6 +49,13 @@ dumper: toolchain
 # The restorer, which writes a backup back to return a unit to stock firmware.
 restorer: toolchain
 	$(PYTHON) platform/restorer/build.py
+
+# The LTC Velo7 Max (docs/boards/vl7m19k.md): its kernel with the driver and clients built
+# against it, and the image its stock U-Boot starts from RAM. Not part of `all`: the W1700K's
+# images do not need it. platform/velo7max/image.py takes a login key for an image with ssh.
+velo7max: toolchain
+	$(PYTHON) platform/velo7max/build.py
+	$(PYTHON) platform/velo7max/image.py
 
 # MT7996 ROM patch, WM/WA firmware and the stream programs.
 firmware:

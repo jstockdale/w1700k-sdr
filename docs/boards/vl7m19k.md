@@ -9,8 +9,9 @@ the model, and what has to be found out before anything of ours runs on it.
 the W1700K: the host's `w1700k load` brings the radio up, and every stream
 mode the project's sweep knows reaches the host through a 10 GbE port, up to
 320 Msps on each band, on a 5 Gbit/s link with nothing lost. It is not
-installed: everything runs from RAM beside the tree.** The project's images are the AN7581's and none
-of them runs here. What has been
+installed: everything runs from RAM, from the image
+[`platform/velo7max`](../../platform/velo7max/README.md) builds.** The
+W1700K's images are the AN7581's and none of them runs here. What has been
 measured is the stock bootloader and the flash, from the unit's first power-on
 with us (2026-11-20), stopped at U-Boot before stock Linux started; one whole
 stock boot, logged with nothing sent to the unit; and a Linux built for the
@@ -285,7 +286,10 @@ interfaces, the four switch ports and both 10 GbE ports, and one complaint
 (a reference clock of the USB 3 PHY). Its 5.3 MiB image went over the console
 at 2 Mbaud in 36 s.
 
-None of this is in the tree yet: the build was an experiment beside it.
+That first kernel was built beside the tree. The build is now
+[`platform/velo7max`](../../platform/velo7max/README.md), with the device tree,
+the configuration and the one patch of ours it needs, and the image made by it
+was started on the unit and passed the same sweep (below).
 
 ### The 10 GbE ports under it
 
@@ -306,8 +310,8 @@ Three things the ports needed before a cable was ever in them [measured]:
   is there was not tried.
 - **Jumbo frames.** The Ethernet driver takes an MTU of 2030 at the most,
   because it receives into 2 KiB buffers. The project's export sends a whole
-  8 KiB slice as one datagram. As an experiment the limit was raised to 9194
-  for what the stack may send, with receiving left as it is. The MAC does put
+  8 KiB slice as one datagram. A patch of ours raises the limit to 9194 for
+  what the stack may send, with receiving left as it is. The MAC does put
   such frames on the wire: pings of 1,900 to 9,000 bytes all reached the
   host whole and valid (20 of 20 at each size); the unit itself still takes
   nothing above 2 KiB, so it never hears the answers to the large ones.
@@ -369,9 +373,10 @@ system's initramfs [measured]:
   chunks behind the capture, whose ring holds 128, and nothing was lost.
 - The SoC read 39 °C after fifteen minutes of this with the case open.
 
-What it took beside the tree: an ssh server and this unit's own identity key
-in the RAM system, an address on one switch port, and a host configuration
-naming the tools' place there and the calibration file.
+What it took besides the kernel: an ssh server and this unit's own identity
+key in the RAM system and an address on one switch port, which the image
+builder now gives it, and a host configuration naming the unit and its
+calibration file.
 
 ### Out of a 10 GbE port
 
@@ -391,6 +396,9 @@ PHY at MDIO 7), linked at 5 Gbit/s, which is that adapter's limit [measured]:
   free, and the SoC went from 44 to 47 °C.
 - The driver's zero-copy export and the SoC's own senders both work here, the
   first because the MAC sends jumbo frames (above).
+- The sweep passed twice, 30 of 30 each time: once on the kernel first built
+  beside the tree, and once on the image `platform/velo7max` builds, started
+  with nothing set by hand on the unit afterwards.
 
 Not tried: a link faster than 5 Gbit/s, and so 320 Msps without the SoC
 reducing part of it; both 10 GbE ports at once; a stream of more than a

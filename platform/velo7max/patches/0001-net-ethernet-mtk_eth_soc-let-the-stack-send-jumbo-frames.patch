@@ -1,0 +1,32 @@
+SPDX-License-Identifier: GPL-2.0-only
+Subject: [PATCH] net: ethernet: mtk_eth_soc: let the stack send jumbo frames
+
+The driver takes an MTU of 2030 at the most, because it receives into
+2 KiB buffers. The receiver's export sends each 8 KiB slice of samples as
+one UDP datagram, zero copy, which needs an MTU of 8236.
+
+Raise the limit to 9194 for what the stack may send. Nothing else
+changes: the receive buffers stay 2 KiB, so a frame larger than that is
+not taken whole, and a port of this kernel must not be given a peer that
+answers with jumbo frames it needs to hear.
+
+Measured on an MT7988A's USXGMII ports (LTC Velo7 Max, RTL8261BE at
+5 Gbit/s): frames of 1,900 to 9,000 bytes reach the peer whole and
+valid, and a minute of slices at 4.5 Gbit/s arrives with none lost.
+
+---
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+@@ -5470,7 +5470,11 @@
+ 	if (MTK_HAS_CAPS(eth->soc->caps, MTK_SOC_MT7628))
+ 		eth->netdev[id]->max_mtu = MTK_MAX_RX_LENGTH - MTK_RX_ETH_HLEN;
+ 	else
+-		eth->netdev[id]->max_mtu = MTK_MAX_RX_LENGTH_2K - MTK_RX_ETH_HLEN;
++		/* w1700k-sdr: the stack may send frames up to 9216 bytes (a slice of samples
++		 * is one datagram). Receiving is as it was: into 2 KiB buffers, so a larger
++		 * frame coming in is not taken whole.
++		 */
++		eth->netdev[id]->max_mtu = 9216 - MTK_RX_ETH_HLEN;
+ 
+ 	if (MTK_HAS_CAPS(eth->soc->caps, MTK_QDMA)) {
+ 		mac->device_notifier.notifier_call = mtk_device_event;
