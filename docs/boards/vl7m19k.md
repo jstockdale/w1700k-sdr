@@ -6,8 +6,8 @@ unit: what was read from its board and labels, what public sources say about
 the model, and what has to be found out before anything of ours runs on it.
 
 **A kernel of ours starts on it from RAM, and in it the host's `w1700k load`
-brings the radio up and a stream of samples runs into the unit's memory; no
-stream has left the unit yet.** The project's images are the AN7581's and none
+brings the radio up and every capture mode streams into the unit's memory, up
+to 320 Msps on each band; no stream has left the unit yet.** The project's images are the AN7581's and none
 of them runs here. What has been
 measured is the stock bootloader and the flash, from the unit's first power-on
 with us (2026-11-20), stopped at U-Boot before stock Linux started; one whole
@@ -318,12 +318,36 @@ system's initramfs [measured]:
   ranging over 50 dB as the AGC and the band's traffic move it, and a
   spectrum with the channel filter's shape.
 
+- **Every capture mode runs into the ring**: a sweep after
+  [`tools/unit_sweep.py`](../../tools/unit_sweep.py), three seconds a mode,
+  with the checks of it that do not need the stream to reach a host.
+
+  | Modes | | Result |
+  | --- | --- | --- |
+  | 2.4, 5 and 6 GHz at 40, 80, 160 and 320 Msps, raw | 12 | pass |
+  | 6 GHz at 640/2 (captured at 640 Msps, every other sample) | 1 | pass |
+  | 5 GHz at 40, 80, 160 and 320 Msps, half the chunks packed by the radio | 4 | pass |
+  | 5 GHz at 40, 80 and 160 Msps, every chunk packed by the radio | 3 | pass |
+
+  In each: the chunks the rate makes, to the chunk (468,757 in three seconds
+  at 320 Msps), as many received as sent, none malformed, the producer ended
+  cleanly, completions of the size the schedule makes (8192 bytes raw, 7168
+  packed), the radio's own count of packed chunks at the schedule's share,
+  raw samples without a spare bit and at a plausible level, the band's
+  synthesizer in lock. An unpacked 320 Msps stream is 1.28 GB/s through the
+  radio's first PCIe interface into memory.
+- **One thing to watch**: in some runs the pump took its first completions
+  about 10 to 14 ms late, in proportion to the rate (up to 2,246 at once at
+  320 Msps, more than its 1,536 slots). The producer was then at most 26
+  chunks behind the capture, whose ring holds 128, and nothing was lost.
+- The SoC read 39 °C after fifteen minutes of this with the case open.
+
 What it took beside the tree: an ssh server and this unit's own identity key
 in the RAM system, an address on one switch port, and a host configuration
 naming the tools' place there and the calibration file.
 
-Not tried: a stream out of a 10 GbE port, any rate above 40 Msps, the reduced
-formats, and the other two bands under a stream.
+Not tried: a stream out of a 10 GbE port, and with it the reduced formats and
+the split schedule, which the SoC's senders make.
 
 ## Reading a unit out
 
