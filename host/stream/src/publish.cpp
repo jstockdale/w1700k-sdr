@@ -118,6 +118,34 @@ struct Publisher::Worker {
     std::vector<Slot> kinds;
     std::vector<Span> spans;         // a correction job's input samples, in order
     std::vector<int16_t *> targets;  // ... and where each of its sample slots' output goes (nullptr: lost)
+    // The DC and I/Q correction's look at the spectrum (iqfix.h IqSums::signal): one transform of
+    // IqSums::kBins samples now and then, in place, on a plan of the worker's own.
+    fftwf_complex *spec = nullptr;
+    fftwf_plan spec_plan = nullptr;
+    float window[IqSums::kBins], power[IqSums::kBins];
+    Worker()
+    {
+        for (unsigned k = 0; k < IqSums::kBins; ++k)
+            window[k] = float(0.5 - 0.5 * std::cos(2 * M_PI * (k + 0.5) / IqSums::kBins));
+        spec = fftwf_alloc_complex(IqSums::kBins);
+        if (!spec) throw std::bad_alloc();
+        std::lock_guard<std::mutex> lock(fftw_planner());
+        spec_plan = fftwf_plan_dft_1d(int(IqSums::kBins), spec, spec, FFTW_FORWARD, FFTW_ESTIMATE);
+        if (!spec_plan) {
+            fftwf_free(spec);
+            throw std::runtime_error("FFTW could not plan the DC and I/Q correction's transform");
+        }
+    }
+    ~Worker()
+    {
+        {
+            std::lock_guard<std::mutex> lock(fftw_planner());
+            if (spec_plan) fftwf_destroy_plan(spec_plan);
+        }
+        fftwf_free(spec);
+    }
+    Worker(const Worker &) = delete;
+    Worker &operator=(const Worker &) = delete;
 };
 
 Publisher::Publisher(const SampleRing &raw, Ingest &ingest, w1700k_stream_header *out, unsigned workers)
@@ -191,6 +219,15 @@ void Publisher::report()
     store(&out_->received, s.newest);
     store(&out_->run_started_ns, uint64_t(s.run_started * 1e9));
     store(&out_->last_any_ns, uint64_t(s.last_any * 1e9));
+    store(&out_->iq_estimates, iq_[0].estimates());
+    store(&out_->iq_imbalance_estimates, iq_[0].imbalance_estimates());
+    for (unsigned c = 0; c < W1700K_STREAM_MAX_CHANNELS; ++c) {
+        const IqParams p = iq_[c].params();
+        store(&out_->iq_dc_i_milli[c], uint64_t(int64_t(std::lround(double(p.dc_i) * 1e3))));
+        store(&out_->iq_dc_q_milli[c], uint64_t(int64_t(std::lround(double(p.dc_q) * 1e3))));
+        store(&out_->iq_gain_ppb[c], uint64_t(int64_t(std::llround((double(p.gain) - 1) * 1e9))));
+        store(&out_->iq_cross_ppb[c], uint64_t(int64_t(std::llround(double(p.cross) * 1e9))));
+    }
     store(&out_->heartbeat_ns, w1700k_stream_now_ns());
 }
 
@@ -207,6 +244,7 @@ void Publisher::schedule()
     uint64_t seen_newest = 0, seen_at = 0, reported = 0, restarts = load(&out_->restart_requests);
     uint64_t late_since = 0, late_newest = 0;  // the wait for overdue slots: its start, and the newest then
     const Flatten *active = nullptr;
+    bool iq_active = false;
     // A run is of one channel or of two, as the control said when it began; a change of that word
     // makes the next completion a new run's first, so that no run is of both.
     auto wanted_channels = [&] { return load(&out_->radio_channels) == 2 ? 2u : 1u; };
@@ -239,6 +277,7 @@ void Publisher::schedule()
             lock.unlock();
             if (run) publish_position(run, published, channels);
             run = p.run;
+            for (IqEstimator &e : iq_) e.reset();  // a new stream starts from no correction
             channels = wanted;
             resolved = dispatched = published = 0;
             seen_newest = 0;
@@ -260,7 +299,7 @@ void Publisher::schedule()
         if (p.newest > resolved + 2 * reach) {
             std::unique_lock<std::mutex> lock(mutex_);
             if (resolved > dispatched) {  // what is in and settled goes out first
-                jobs_.push_back(Job{sequence++, run, dispatched, resolved, active, true, channels});
+                jobs_.push_back(Job{sequence++, run, dispatched, resolved, active, true, channels, iq_active});
                 dispatched = resolved;
                 work_ready_.notify_one();
             }
@@ -312,12 +351,17 @@ void Publisher::schedule()
             store(&out_->flatten_active, uint64_t(f != nullptr));
             store(&out_->flatten_rate, f ? uint64_t(f->rate()) : uint64_t(0));
         }
+        const bool iq = load(&out_->iq_correct) != 0;
+        if (iq != iq_active) {
+            iq_active = iq;
+            store(&out_->iq_active, uint64_t(iq));
+        }
         bool waiting = true;
         {
             std::unique_lock<std::mutex> lock(mutex_);
             if (stopping_) return;
             while (jobs_.size() + busy_ < 2 * worker_count_) {
-                Job job{sequence, run, dispatched, 0, f, false, channels};
+                Job job{sequence, run, dispatched, 0, f, false, channels, iq_active};
                 if (resolved >= dispatched + kChunk + (f ? 1 : 0)) {
                     job.last = dispatched + kChunk;
                 } else if (idle && resolved > dispatched) {
@@ -405,7 +449,7 @@ void Publisher::process(Worker &w, const Job &job)
     if (!job.flatten) {
         uint64_t lost = 0, overruns = 0;
         for (uint64_t s = job.first; s < job.last; ++s) {
-            const Slot kind = w.kinds[s - job.first];
+            Slot &kind = w.kinds[s - job.first];
             if (kind == Slot::Event) {
                 finish(s, W1700K_STREAM_TAG_EVENT);
                 continue;
@@ -418,13 +462,19 @@ void Publisher::process(Worker &w, const Job &job)
                 else
                     words_to_int16(raw_.slice(s), kSliceSamples, w1700k_stream_slice(out_, s));
                 if (raw_.tag(s) == SampleRing::tag_of(job.run, s)) {
-                    finish(s, 0);
+                    if (!job.iq) finish(s, 0);
                     continue;
                 }
+                kind = Slot::Lost;
             }
             finish(s, W1700K_STREAM_TAG_LOST);  // never arrived, or overwritten while being copied
             ++lost;
             if (overrun(job.run, s)) ++overruns;
+        }
+        if (job.iq) {  // the slots copied whole are corrected, then published
+            correct_iq(w, job, w.kinds);
+            for (uint64_t s = job.first; s < job.last; ++s)
+                if (w.kinds[s - job.first] == Slot::Data) finish(s, 0);
         }
         if (lost) lost_ += lost;
         if (overruns) overruns_ += overruns;
@@ -536,6 +586,7 @@ void Publisher::process(Worker &w, const Job &job)
         }
     }
 
+    if (job.iq) correct_iq(w, job, w.kinds);
     uint64_t lost = 0, overruns = 0, flat = 0;
     for (uint64_t s = job.first; s < job.last; ++s) {
         const Slot kind = w.kinds[s - job.first];
@@ -553,5 +604,34 @@ void Publisher::process(Worker &w, const Job &job)
     if (lost) lost_ += lost;
     if (overruns) overruns_ += overruns;
     if (flat) flattened_ += flat;
+    if (clipped) saturated_ += clipped;
+}
+
+void Publisher::correct_iq(Worker &w, const Job &job, const std::vector<Slot> &kinds)
+{
+    const unsigned C = job.channels == 2 ? 2 : 1, S = kSliceSamples / C;
+    IqParams p[W1700K_STREAM_MAX_CHANNELS];
+    IqSums sums[W1700K_STREAM_MAX_CHANNELS];
+    for (unsigned c = 0; c < C; ++c) p[c] = iq_[c].params();
+    uint64_t clipped = 0;
+    for (uint64_t s = job.first; s < job.last; ++s) {
+        if (kinds[s - job.first] != Slot::Data) continue;
+        for (unsigned c = 0; c < C; ++c) {
+            int16_t *x = C == 2 ? w1700k_stream_channel(out_, s, c, 2) : w1700k_stream_slice(out_, s);
+            if (s % 4 == 0) sums[c].add(x, S);  // as they came: the estimate is of the radio's own
+            if (s % 64 == 0) {                  // and the spectrum: does a signal stand out of the noise
+                for (unsigned k = 0; k < IqSums::kBins; ++k) {
+                    w.spec[k][0] = w.window[k] * x[2 * k];
+                    w.spec[k][1] = w.window[k] * x[2 * k + 1];
+                }
+                fftwf_execute(w.spec_plan);
+                for (unsigned k = 0; k < IqSums::kBins; ++k) w.power[k] = w.spec[k][0] * w.spec[k][0] + w.spec[k][1] * w.spec[k][1];
+                sums[c].add_spectrum(w.power);
+            }
+            clipped += iq_apply(p[c], x, S);
+        }
+    }
+    for (unsigned c = 0; c < C; ++c)
+        if (sums[c].n) iq_[c].add(sums[c]);
     if (clipped) saturated_ += clipped;
 }

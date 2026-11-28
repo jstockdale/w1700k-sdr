@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -42,6 +43,10 @@ private:
     std::vector<double> taps_;
     std::unique_ptr<fftwf_complex[], void (*)(void *)> transfer_{nullptr, fftwf_free};
 };
+
+// FFTW's planner is not thread-safe: whatever in this process makes or destroys a plan holds this
+// meanwhile (the plans here, and the DC and I/Q correction's look at the spectrum, publish.cpp).
+std::mutex &fftw_planner();
 
 // The plans of the correction's two transforms. FFTW finds the fastest by measuring ("measured":
 // 3.4 us a transform on an arm64 host where its estimate takes 5.4), in a few milliseconds where

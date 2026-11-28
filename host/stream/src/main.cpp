@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 // w1700k-stream: receives the W1700K's UDP export and serves it to every consumer on this host
-// through shared memory (include/w1700k_stream.h): in order, unpacked to complex int16, and on
-// request corrected for the radio's decimation roll-off (flatten.h).
+// through shared memory (include/w1700k_stream.h): in order, unpacked to complex int16, with the
+// receiver's DC offset and I/Q imbalance taken out (iqfix.h; --iq-correct off: as the radio gave
+// them), and on request corrected for the radio's decimation roll-off (flatten.h).
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -64,6 +65,9 @@ void usage()
                  "                    ask the kernel to keep the CPUs out of deep idle for as long as one does)\n"
                  "  --own-priority    run at the priority it was started with (default: nice -10, where the\n"
                  "                    user may, so that a busy host does not starve the receive threads)\n"
+                 "  --iq-correct on|off  take the receiver's DC offset and I/Q imbalance out of the samples, each\n"
+                 "                    channel by its own estimate from the stream (default on; consumers may\n"
+                 "                    change it, the header's iq_correct)\n"
                  "  --measure-plans   serve nothing: find FFTW's measured plans of the correction's transforms\n"
                  "                    and keep them for later runs, as a service that lacks them has done in\n"
                  "                    the background by itself\n");
@@ -89,7 +93,7 @@ int main(int argc, char **argv)
 {
     std::string bind = "10.77.0.10", name = W1700K_STREAM_NAME, unit;
     unsigned port = 7700, rx_threads = 8, workers = 6, ring_mib = 512, receive_mib = kReceiveMib, report = 0;
-    bool share_irq_cpu = false, deep_idle = false, own_priority = false, measure_plans = false;
+    bool share_irq_cpu = false, deep_idle = false, own_priority = false, measure_plans = false, iq_correct = true;
     try {
         for (int i = 1; i < argc; ++i) {
             const std::string arg = argv[i];
@@ -110,6 +114,11 @@ int main(int argc, char **argv)
             else if (arg == "--deep-idle") deep_idle = true;
             else if (arg == "--own-priority") own_priority = true;
             else if (arg == "--measure-plans") measure_plans = true;
+            else if (arg == "--iq-correct") {
+                const std::string v = value();
+                if (v != "on" && v != "off") throw std::runtime_error("--iq-correct needs on or off, not \"" + v + "\"");
+                iq_correct = v == "on";
+            }
             else if (arg == "-h" || arg == "--help") {
                 usage();
                 return 0;
@@ -174,6 +183,7 @@ int main(int argc, char **argv)
                              argv[0]);
         }
         SharedRing shared(name, ring_mib * 128);
+        __atomic_store_n(&shared.header()->iq_correct, uint64_t(iq_correct), __ATOMIC_RELEASE);  // before any consumer
         SampleRing received(receive_mib * 128);
         Ingest ingest(received, bind, port, rx_threads, unit);
         Publisher publisher(received, ingest, shared.header(), workers);
@@ -226,12 +236,16 @@ int main(int argc, char **argv)
                         ",\"overruns\":%" PRIu64 ",\"pieces\":%" PRIu64 ",\"late\":%" PRIu64
                         ",\"duplicates\":%" PRIu64 ",\"bad\":%" PRIu64 ",\"socket_drops\":%" PRIu64
                         ",\"spare_words\":%" PRIu64 ",\"stale_slices\":%" PRIu64 ",\"stale_lines\":%" PRIu64
-                        ",\"flatten_active\":%" PRIu64 ",\"flattened\":%" PRIu64 ",\"saturated\":%" PRIu64 "}\n",
+                        ",\"flatten_active\":%" PRIu64 ",\"flattened\":%" PRIu64 ",\"saturated\":%" PRIu64
+                        ",\"iq_active\":%" PRIu64 ",\"iq_estimates\":%" PRIu64 ",\"iq_imbalance_estimates\":%" PRIu64 ",\"iq_dc\":[%.3f,%.3f],\"iq_gain\":%.6f"
+                        ",\"iq_cross\":%.6f}\n",
                         run, newest, h->datagrams, h->slices, h->packed, h->reduced, h->suspect, h->events, h->lost, h->overruns,
                         h->pieces,
                         h->late, h->duplicates,
                         h->bad, h->socket_drops, h->spare_words, h->stale_slices, h->stale_lines, h->flatten_active,
-                        h->flattened, h->saturated);
+                        h->flattened, h->saturated, h->iq_active, h->iq_estimates, h->iq_imbalance_estimates, int64_t(h->iq_dc_i_milli[0]) / 1e3,
+                        int64_t(h->iq_dc_q_milli[0]) / 1e3, 1 + int64_t(h->iq_gain_ppb[0]) / 1e9,
+                        int64_t(h->iq_cross_ppb[0]) / 1e9);
             std::fflush(stdout);
         }
     } catch (const std::exception &e) {

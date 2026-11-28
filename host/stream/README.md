@@ -3,9 +3,10 @@
 The host's one receiver of the W1700K's UDP export. It puts the stream in order, unpacks it and
 serves it, as complex int16 IQ, to every consumer on the host through shared memory:
 `w1700k-spectrum`, `sdr-recv`, the SoapySDR module ([`../soapy`](../soapy/README.md)), or any program that
-maps the ring. On request it also corrects
-the stream for the radio's decimation roll-off ("flatten"), in the samples themselves, so that
-every consumer gets the corrected stream.
+maps the ring. It takes the receiver's own DC offset and I/Q imbalance out of the samples
+([below](#the-receivers-dc-and-iq-imbalance-iq_correct)), and on request it also corrects the
+stream for the radio's decimation roll-off ("flatten"), in the samples themselves, so that every
+consumer gets the corrected stream.
 
 ## Build and run
 
@@ -31,6 +32,7 @@ build/w1700k-stream                    # until Ctrl-C; consumers attach any time
 | `--share-irq-cpu` | | run also on the CPU that takes the interface's packets (see below) |
 | `--deep-idle` | | let the host idle as deeply as it likes while a stream arrives (see below) |
 | `--own-priority` | | run at the priority it was started with (see below) |
+| `--iq-correct on\|off` | `on` | take the receiver's DC offset and I/Q imbalance out of the samples (below); consumers can change it at any time (`iq_correct`) |
 | `--measure-plans` | | serve nothing: measure the correction's FFT plans and keep them (see "The correction") |
 
 The object is the user's who runs the service, and its consumers run as that user: it is made
@@ -138,7 +140,8 @@ layout, the tag rules and helpers to map the object and read the position. In sh
   0, plus a kind: `TAG_EVENT` (no samples, no sample time: the slices either side are contiguous),
   `TAG_LOST` (no samples; the sample time is lost), `TAG_FLAT` (corrected samples).
 - Per slot one slice: 2048 complex samples, int16 I then int16 Q, on the scale of the radio's
-  14-bit samples (full scale 8192). Uncorrected samples are the radio's, bit for bit; the int16
+  14-bit samples (full scale 8192). With neither correction (`iq_correct` 0, no flatten) the samples are
+  the radio's, bit for bit; the DC and I/Q correction leaves them on the same scale; the int16
   range above them is the correction's headroom (a sample beyond it saturates, counted).
 
 A reader reads a slot's tag (acquire), its samples, then the tag again: a changed tag means the
@@ -159,7 +162,8 @@ version 2 for it:
 - Whoever starts a stream says how many channels it has before it starts, in the control word
   `radio_channels` (the controller does: `export.service`). A change of that word makes the next
   completion a new run's first, so no run is of both. `radio_sample_rate` is a channel's rate.
-- The correction is applied to each channel as a stream of its own.
+- The correction is applied to each channel as a stream of its own, and the DC and I/Q correction
+  by each channel's own estimate.
 
 A reader of the old layout refuses the object (`EPROTO`): read as one channel, a two-channel slot
 would be two signals end to end.
@@ -195,7 +199,82 @@ Nyquist): without the correction -1.7 / -6.4 / -14.2 / -19.8 / -22.8 dB at 62.5 
 97 % of Nyquist; with it +0.9 / +0.5 / +0.1 / -0.4 / -1.1 dB. The service used 0.8 CPU cores
 without it and 1.8 with it, with no loss.
 
+## The receiver's DC and I/Q imbalance (`iq_correct`)
+
+The radio's I and Q branches differ a little in gain and are not quite 90 degrees apart, which
+puts a mirror image of every signal at minus its frequency, and each branch carries an offset.
+Measured on one W1700K (2026-11-27, a tone swept over +-68 MHz at 160 Msps): the image -36 to -47
+dBc on its three radios, and offsets of up to about -230 counts (-31 dBFS) on I and -100 on Q,
+which change with the gain. The radio's own RX IQ compensation filters sit after the capture tap
+([`docs/architecture.md`](../../docs/architecture.md)), so the stream carries both as the
+receiver made them.
+
+The service takes them out ([`src/iqfix.h`](src/iqfix.h)), each channel by its own estimate, in
+every format it decodes (raw, packed, reduced, split; one channel or two), with the roll-off
+correction or without it (it is applied after it, to the int16 samples). The estimate is blind:
+it goes by the stream's own statistics, in which whatever a receiver takes in (noise, a tone, a
+modulated signal off the LO) has I and Q of equal power, uncorrelated and without a mean. Over
+2^20 samples (a quarter of the slots measured) it takes the means, the two powers and the
+covariance of I and Q, and makes Q orthogonal to I and of I's power (a Gram-Schmidt step). The
+offsets are taken from every estimate; the gain and the cross term only from one in which a
+signal stands out of the noise (the strongest bin of a 512-point spectrum, taken now and then,
+at least 10 dB over the median bin): the receiver's own noise, at the lowest gains made mostly in
+the two baseband chains apart, does not carry the RF path's imbalance. Each estimate counts a
+quarter towards the parameters in use, so they settle in about 0.1 s at 160 Msps (0.4 s at 40)
+and follow a change of gain or LO as quickly. A new run starts from no correction. The header
+reports what applies (`iq_active`) and the parameters per channel (`iq_dc_i_milli`,
+`iq_dc_q_milli`, `iq_gain_ppb`, `iq_cross_ppb`, `iq_estimates`, `iq_imbalance_estimates`).
+`iq_correct` 0 (or `--iq-correct off`) gives the samples as the radio made them.
+
+What it does and does not do, measured on that unit (a tone at a dozen offsets over +-68 MHz from
+the LO at 160 Msps, the correction worked out from the unit's own samples by the service's
+arithmetic; image in dBc, median / worst over the offsets):
+
+| radio, gain | as captured | estimate from the tone itself | an estimate from noise alone (not used, below) | best single correction |
+|---|---|---|---|---|
+| 5 GHz, LNA 2 / filter 9 | -42.2 / -39.0 | -95 to -127 | -53.9 / -45.4 | -51.9 / -46.6 |
+| 5 GHz, LNA 0 / filter 0 | -41.5 / -39.0 | -78 to -115 | -46.7 / -44.2 | -56.2 / -50.2 |
+| 6 GHz, LNA 2 / filter 9 | -40.6 / -39.9 | -84 to -129 | -49.3 / -48.1 | -61.5 / -55.4 |
+| 6 GHz, LNA 0 / filter 0 | -41.5 / -39.0 | -58 to -94 | -37.6 / -36.7 | -54.2 / -47.0 |
+| 2.4 GHz, LNA 0 / filter 9 (3 offsets) | -39.0 / -36.4 | -41 to -56 | -40.9 / -38.0 | -52.6 / -50.1 |
+
+(The tone's own estimate is what the service settles on while that tone dominates the band; a
+tone at 0 dBFS that clips reads -75 dBc. The 2.4 GHz figures are few and noisy: outside Wi-Fi
+got into the shielded box during the measurements and only quiet captures were kept.) DC: up to
+about -230 counts on I and -100 on Q, which change with the gain (5 GHz radio: -233 / +47 at
+LNA 2 / filter 9, -64 / -11 at LNA 0 / filter 0).
+
+On the live stream through the service (a W1700K's 5 GHz radio at 160 Msps, a tone at -12 and at
+-21 dBFS, the image read as the tone's coherent mirror in 13-ms captures): the image -41.7 dBc
+without the correction and -80 to -90 dBc with it; the offsets 214 to 219 counts on I without it
+and within 3 counts with it (they wander by about that much from one estimate to the next).
+
+- **It follows the strongest signal.** One correction holds for the whole band, so it is exact
+  only at the frequencies that dominate the statistics. With a strong signal in the band it
+  converges on that signal's imbalance: the image of a tone near full scale fell from -40..-47
+  dBc to below -75 dBc. The imbalance itself varies over the band (mostly a phase that grows
+  linearly with frequency, as a delay of about 15 ps between the two branches would make, and a
+  gain step near the filter's edge), so a signal far from the one the estimate followed keeps
+  an image of -46 to -62 dBc. With nothing but noise in the band only the offsets are followed:
+  an estimate of the imbalance from noise alone is the noise's, at the lowest gain the baseband's
+  own, and was measured to leave a weak signal's image worse than none (6 GHz radio, LNA 0 /
+  filter 0: -37.6 against -41.5 dBc; at LNA 2 / filter 9 -32.9 against -38.3), so it is not used.
+- **It removes a signal exactly at the LO**, as any DC correction does (within about a hertz).
+- **Cost**: about a quarter of a core at 160 Msps on an Intel N350, 1.5 to 1.7 ns a sample: on
+  the live stream the service took 1.14 of a core with the correction against 0.87 without (five
+  10-s periods each, by turns), and on a stream over loopback at the same rate 0.93 to 0.97
+  against 0.68 to 0.74. No slice was lost in any of them, nor in a 30-s stream with it on. The
+  forms measured are SSE2's (every x86-64); other hosts run plain ones, not measured.
+
 ## Tests
 
 `python3 -m unittest discover -s tests -p test_stream.py` from the repository root (`make check`
-runs it) builds the service and runs it against a fake export over loopback.
+runs it) builds the service and runs it against a fake export over loopback. It includes the DC
+and I/Q correction end to end (`IqCorrection`: a known imbalance and offset taken out to below
+-60 dBc and half a count, in every format and after the roll-off correction, each channel of two
+by its own estimate; noise alone moving only the offsets; and with it off, from the start or
+within a run, the samples bit for bit).
+
+`make -C host/stream check` checks the DC and I/Q correction's sums, its arithmetic and its
+estimate of a known imbalance against the rule written out plainly (`tests/iqfix_check.cpp`); the
+test suite runs it too.

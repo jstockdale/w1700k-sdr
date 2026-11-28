@@ -106,12 +106,24 @@ struct w1700k_stream_header {
 	uint64_t radio_channels;	/* 2: the stream is of two channels (0, 1: of one). Whoever starts a
 					 * stream writes it first; a change makes the next completion start
 					 * a new run, so no run is of both. radio_sample_rate is a channel's */
-	uint64_t reserved3[10];
+	uint64_t iq_correct;		/* 1: take the receiver's DC offset and I/Q imbalance out of the samples
+					 * (host/stream/src/iqfix.h), each channel by its own estimate; 0: the
+					 * samples as the radio gave them. The service starts it at 1 unless
+					 * started with --iq-correct off */
+	uint64_t reserved3[9];
 
 	/* the service's view of the control */
 	uint64_t flatten_active;	/* the correction applies to the slices being published */
 	uint64_t flatten_rate;		/* the sample rate whose correction applies; 0: none */
-	uint64_t reserved4[14];
+	uint64_t iq_active;		/* the I/Q and DC correction applies to the slices being published */
+	uint64_t iq_estimates;		/* estimates folded in this run (channel 0); 0: none yet, no correction */
+	/* the parameters in use, per channel (int64 in uint64 words): I' = I - dc_i,
+	 * Q' = gain ((Q - dc_q) + cross (I - dc_i)) */
+	uint64_t iq_dc_i_milli[2], iq_dc_q_milli[2];	/* counts x 1000 */
+	uint64_t iq_gain_ppb[2], iq_cross_ppb[2];	/* (gain - 1) x 1e9, cross x 1e9 */
+	uint64_t iq_imbalance_estimates;	/* of iq_estimates (channel 0), those that also moved the gain and
+					 * cross term: a signal stood out of the noise in them */
+	uint64_t reserved4[3];
 };
 
 #define w1700k_stream_load(p)		__atomic_load_n((p), __ATOMIC_ACQUIRE)

@@ -11,7 +11,7 @@ LDLIBS += -pthread -lfftw3f -lrt
 SOURCES := $(wildcard src/*.cpp)
 OBJECTS := $(patsubst src/%.cpp,build/%.o,$(SOURCES))
 
-.PHONY: all clean install
+.PHONY: all clean install check
 all: build/w1700k-stream
 
 build/w1700k-stream: $(OBJECTS)
@@ -19,6 +19,13 @@ build/w1700k-stream: $(OBJECTS)
 
 build/%.o: src/%.cpp $(wildcard src/*.h) include/w1700k_stream.h ../../include/hw/mt7996/iq_reduce.h | build
 	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+# The DC and I/Q correction's forms against the rule (tests/iqfix_check.cpp).
+build/iqfix_check: tests/iqfix_check.cpp build/iqfix.o | build
+	$(CXX) $(CXXFLAGS) $< build/iqfix.o -o $@
+
+check: build/iqfix_check
+	build/iqfix_check
 
 build:
 	mkdir -p $@

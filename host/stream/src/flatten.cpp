@@ -83,6 +83,8 @@ double bessel_i0(double x)
 
 }  // namespace
 
+std::mutex &fftw_planner() { return planner; }
+
 const Flatten *Flatten::for_rate(double sample_rate)
 {
     static std::mutex m;

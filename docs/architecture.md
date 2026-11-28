@@ -20,7 +20,7 @@ receiver controls. The MT7996 runs only our firmware.
 | MT7996 WM MCU | our WM | brings the radio up from cold; sets each band's LO, sample rate, filter and capture path on command; runs the stream producer |
 | MT7996 WA MCU | our WA | packs its share of chunks to 28 bits per sample pair |
 | Host (x86 Linux) | `w1700k` | load, configure, stream, RF control: commands to our firmware |
-| Host | `w1700k-stream` | receives the export; serves the IQ stream to every consumer through shared memory, unpacked, gap-tagged, optionally corrected for the decimation's roll-off; checks the export's integrity |
+| Host | `w1700k-stream` | receives the export; serves the IQ stream to every consumer through shared memory, unpacked, gap-tagged, with the receiver's DC offset and I/Q imbalance taken out (estimated from the stream itself; can be switched off), optionally corrected for the decimation's roll-off; checks the export's integrity |
 | Host | `w1700k-spectrum` | FFT and web UI over the served stream; drives the unit through `w1700k serve` |
 | Host | `sdr-recv` | records the served stream |
 | Host | `libw1700kSupport.so` | the SoapySDR module (`host/soapy`): the served stream and the controller as a SoapySDR device |
@@ -69,7 +69,7 @@ transmit path stays disabled.
  kernel export: one UDP datagram per slice, pages attached (zero copy),
    │            sent on the 10 GbE port at line rate
  host: w1700k-stream (8 receive threads → reorder ring → workers: unpack,
-   │    optional correction) → shared ring of complex int16
+   │    optional roll-off correction, DC and I/Q correction) → shared ring of complex int16
    └──→ consumers: w1700k-spectrum (FFT workers → browser), sdr-recv, SoapySDR programs (host/soapy), …
 ```
 

@@ -18,7 +18,9 @@ FIELDS = {
     "bad": 312, "late": 320, "before_start": 328, "duplicates": 336, "socket_drops": 344, "spare_words": 352,
     "stale_slices": 360, "stale_lines": 368, "flattened": 376, "saturated": 384, "overruns": 392, "reduced": 400, "suspect": 408,
     "restart_requests": 496, "flatten": 504, "radio_sample_rate": 512, "radio_capture_rate": 520,
-    "radio_filter_hz": 528, "radio_channels": 536, "flatten_active": 624, "flatten_rate": 632,
+    "radio_filter_hz": 528, "radio_channels": 536, "iq_correct": 544, "flatten_active": 624, "flatten_rate": 632,
+    "iq_active": 640, "iq_estimates": 648, "iq_dc_i_milli": 656, "iq_dc_q_milli": 672, "iq_gain_ppb": 688,
+    "iq_cross_ppb": 704, "iq_imbalance_estimates": 720,
 }
 
 
@@ -47,8 +49,9 @@ class Shm:
     def close(self):
         self.map.close()
 
-    def get(self, field):
-        return struct.unpack_from("<Q", self.map, FIELDS[field])[0]
+    def get(self, field, index=0):
+        """A header word; `index`: of a field that is an array (one word per channel)."""
+        return struct.unpack_from("<Q", self.map, FIELDS[field] + 8 * index)[0]
 
     def set(self, field, value):
         struct.pack_into("<Q", self.map, FIELDS[field], value)

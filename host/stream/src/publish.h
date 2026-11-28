@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 // w1700k-stream's output: the shared ring every consumer reads (include/w1700k_stream.h), and the
-// publisher that fills it from the receive ring, in order, unpacked to complex int16 and, where it
-// applies, corrected by the decimation roll-off's inverse (flatten.h).
+// publisher that fills it from the receive ring, in order, unpacked to complex int16, with the
+// receiver's DC offset and I/Q imbalance taken out (iqfix.h) and, where it applies, corrected by
+// the decimation roll-off's inverse (flatten.h).
 #pragma once
 
 #include <atomic>
@@ -17,6 +18,7 @@
 
 #include "flatten.h"
 #include "ingest.h"
+#include "iqfix.h"
 #include "w1700k_stream.h"
 
 // The POSIX shared-memory object, created by the service and unlinked when it stops.
@@ -55,6 +57,7 @@ private:
         const Flatten *flatten = nullptr;
         bool flush = false;
         unsigned channels = 1;  // the run's: 2 lays each slot out by channel
+        bool iq = false;        // the DC and I/Q correction (iqfix.h) applies
     };
     struct Worker;
 
@@ -67,6 +70,9 @@ private:
     void publish_position(uint64_t run, uint64_t newest, unsigned channels);
     const Flatten *correction() const;  // from the control words, nullptr: none applies
     void report();                      // heartbeat and counters into the header
+    // The DC and I/Q correction of the job's published slots, each channel by its own estimate,
+    // which a quarter of the slots then add to.
+    void correct_iq(Worker &w, const Job &job, const std::vector<Slot> &kinds);
 
     const SampleRing &raw_;
     Ingest &ingest_;
@@ -81,6 +87,7 @@ private:
     bool stopping_ = false;
 
     std::atomic<uint64_t> lost_{0}, overruns_{0}, flattened_{0}, saturated_{0};
+    IqEstimator iq_[W1700K_STREAM_MAX_CHANNELS];  // reset at every run
     std::vector<std::unique_ptr<Worker>> workers_;
     std::thread scheduler_;
 };

@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 """w1700k-stream against a fake export over loopback, read through its shared memory: samples
 unpacked bit-exact, events and losses tagged, the roll-off correction's gain where it applies and
-nowhere else, runs restarted on request, and the export's integrity counted."""
+nowhere else, the receiver's DC and I/Q imbalance taken out, runs restarted on request, and the
+export's integrity counted."""
 import cmath
 import fcntl
 import math
@@ -21,6 +22,11 @@ import unittest
 import iq_reduce_ref
 import stream_shm
 from stream_shm import TAG_EVENT, TAG_FLAT, TAG_LOST, Shm, tag
+
+try:
+    import numpy as np
+except ImportError:                                      # the service needs none; the I/Q tests make their signal with it
+    np = None
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STREAM = os.path.join(ROOT, "host", "stream")
@@ -95,7 +101,9 @@ def tone_amplitude(samples, cycles):
 
 @unittest.skipIf(build_problem(), build_problem())
 class Service(unittest.TestCase):
-    """A w1700k-stream of the test's own, on a free port and under a name of its own."""
+    """A w1700k-stream of the test's own, on a free port and under a name of its own. It takes the
+    receiver's DC and I/Q imbalance out, as by default (IqCorrection), which changes no sample before
+    its first estimate, 2048 slots into a run: the tests that compare samples bit for bit send fewer."""
     counter = 0
 
     @classmethod
@@ -589,6 +597,243 @@ class OnlyTheUnit(Service):
         self.assertEqual((self.shm.get("bad"), self.shm.get("slices")), (40, 40))
 
 
+def imbalanced(samples, gain, phase_deg, dc_i, dc_q):
+    """A receiver's I/Q imbalance and DC on complex samples: Q's branch `gain` times I's and `phase_deg`
+    off quadrature, then the offsets; as 14-bit sample words."""
+    phi = math.radians(phase_deg)
+    i = samples.real + dc_i
+    q = gain * (samples.imag * math.cos(phi) - samples.real * math.sin(phi)) + dc_q
+    i, q = np.clip(np.round(i), -8192, 8191).astype(np.int64), np.clip(np.round(q), -8192, 8191).astype(np.int64)
+    return ((i & 0x3FFF) << 16 | (q & 0x3FFF)).astype("<u4")
+
+
+def s64(v):
+    """An int64 the header keeps in a u64 word."""
+    return v - (1 << 64) if v >> 63 else v
+
+
+@unittest.skipIf(build_problem() or np is None, build_problem() or "numpy is not installed")
+class IqCorrection(Service):
+    """The receiver's DC and I/Q imbalance taken out (host/stream/src/iqfix.h): estimated blind from
+    the stream itself, each channel by its own, in every format the service decodes and with the
+    roll-off correction too; off, the samples are the radio's bit for bit."""
+    SLOTS = 8192                                         # four estimates of 2048 slots
+
+    def stream(self, words_of, slots, first=0):
+        for s in range(first, first + slots):
+            self.send(s, words_of(s).tobytes())
+            if s % 32 == 31:
+                time.sleep(0.002)
+        return self.wait_newest(first + slots, timeout=60)
+
+    def published(self, first, last, channel=None, channels=1):
+        """Slots [first, last) as one complex array (one channel's of a two-channel run)."""
+        parts = []
+        for s in range(first, last):
+            pairs = self.shm.samples(s) if channel is None else self.shm.channel(s, channel, channels)
+            a = np.array(pairs, dtype=np.float64)
+            parts.append(a[:, 0] + 1j * a[:, 1])
+        return np.concatenate(parts)
+
+    @staticmethod
+    def tone_and_image(x, cycles, per):
+        """Amplitudes of the tone and of its mirror over whole slots of `per` samples."""
+        n = np.arange(len(x))
+        return (abs(np.mean(x * np.exp(-2j * np.pi * cycles * n / per))),
+                abs(np.mean(x * np.exp(2j * np.pi * cycles * n / per))))
+
+    def image_dbc(self, first, last, cycles, per=SLICE, channel=None, channels=1):
+        tone, image = self.tone_and_image(self.published(first, last, channel, channels), cycles, per)
+        return 20 * math.log10(image / tone)
+
+    @staticmethod
+    def tone_with_noise(rng, n, cycles=300, amplitude=3000.0, noise=40.0):
+        t = np.arange(n)
+        return amplitude * np.exp(2j * np.pi * cycles * t / SLICE) + noise * (rng.standard_normal(n) + 1j * rng.standard_normal(n))
+
+    def test_dc_and_imbalance_are_taken_out(self):
+        rng = np.random.default_rng(1)
+        cycles, amplitude, n = 300, 3000.0, SLICE * self.SLOTS
+        words = imbalanced(self.tone_with_noise(rng, n, cycles, amplitude), 1.05, 3.0, 150.0, -80.0)
+        self.assertEqual(self.shm.get("iq_correct"), 1, "on unless the service was started with it off")
+        run = self.stream(lambda s: words[s * SLICE:(s + 1) * SLICE], self.SLOTS)
+        self.assertEqual(self.shm.tag(self.SLOTS - 1), tag(run, self.SLOTS - 1), "corrected, not flattened")
+        before = words[-256 * SLICE:]
+        raw = (((before >> 16).astype(np.int64) ^ 0x2000) & 0x3FFF) - 0x2000 + 1j * (((before.astype(np.int64) ^ 0x2000) & 0x3FFF) - 0x2000)
+        tone0, image0 = self.tone_and_image(raw, cycles, SLICE)
+        x = self.published(self.SLOTS - 256, self.SLOTS)
+        tone, image = self.tone_and_image(x, cycles, SLICE)
+        self.assertGreater(20 * math.log10(image0 / tone0), -32, "the imbalance made an image (about -30 dBc)")
+        self.assertLess(20 * math.log10(image / tone), -60, "and the correction took it out")
+        self.assertAlmostEqual(tone / amplitude, 1, delta=0.005, msg="I's scale kept (Q is made I's)")
+        self.assertLess(abs(x.real.mean()), 0.5)
+        self.assertLess(abs(x.imag.mean()), 0.5)
+        self.assertEqual(self.shm.get("iq_active"), 1)
+        self.assertGreaterEqual(self.shm.get("iq_estimates"), 3)
+        self.assertEqual(self.shm.get("iq_imbalance_estimates"), self.shm.get("iq_estimates"), "a tone stands out in every one")
+        phi = math.radians(3.0)
+        self.assertAlmostEqual(s64(self.shm.get("iq_dc_i_milli")) / 1e3, 150.0, delta=0.5)
+        self.assertAlmostEqual(s64(self.shm.get("iq_dc_q_milli")) / 1e3, -80.0, delta=0.5)
+        self.assertAlmostEqual(1 + s64(self.shm.get("iq_gain_ppb")) / 1e9, 1 / (1.05 * math.cos(phi)), delta=1e-3)
+        self.assertAlmostEqual(s64(self.shm.get("iq_cross_ppb")) / 1e9, 1.05 * math.sin(phi), delta=1e-3)
+        self.assertEqual(self.shm.get("saturated"), 0)
+
+    def test_noise_alone_moves_the_offsets_and_not_the_imbalance(self):
+        """With nothing but noise in the band the statistics are the receiver's own noise, which need not
+        carry the RF path's imbalance: only the offsets are taken from them (iqfix.h IqSums::signal)."""
+        rng = np.random.default_rng(4)
+        n = SLICE * 6144
+        clean = 300 * (rng.standard_normal(n) + 1j * rng.standard_normal(n))
+        words = imbalanced(clean, 1.05, 3.0, 150.0, -80.0)
+        self.stream(lambda s: words[s * SLICE:(s + 1) * SLICE], 6144)
+        self.assertGreaterEqual(self.shm.get("iq_estimates"), 2)
+        self.assertEqual(self.shm.get("iq_imbalance_estimates"), 0)
+        self.assertEqual((s64(self.shm.get("iq_gain_ppb")), s64(self.shm.get("iq_cross_ppb"))), (0, 0))
+        self.assertAlmostEqual(s64(self.shm.get("iq_dc_i_milli")) / 1e3, 150.0, delta=1.0)
+        self.assertAlmostEqual(s64(self.shm.get("iq_dc_q_milli")) / 1e3, -80.0, delta=1.0)
+        x = self.published(6144 - 64, 6144)
+        self.assertLess(abs(x.mean()), 4.0, "the offsets taken out (noise of 300 counts: its mean over 64 slots wanders ~1)")
+
+    def test_off_the_samples_are_the_radios(self):
+        self.shm.set("iq_correct", 0)
+        rng = np.random.default_rng(2)
+        n = SLICE * 3000
+        clean = 900 * (rng.standard_normal(n) + 1j * rng.standard_normal(n))
+        words = imbalanced(clean, 0.97, -2.0, -200.0, 60.0)
+        run = self.stream(lambda s: words[s * SLICE:(s + 1) * SLICE], 3000)
+        for s in (2500, 2999):
+            self.assertEqual(self.shm.tag(s), tag(run, s))
+            self.assertEqual(self.shm.samples(s), unpacked(words[s * SLICE:(s + 1) * SLICE].tolist()))
+        self.assertEqual((self.shm.get("iq_active"), self.shm.get("iq_estimates")), (0, 0))
+
+    def wait_for_active(self, value):
+        deadline = time.monotonic() + 5
+        while self.shm.get("iq_active") != value:
+            self.assertLess(time.monotonic(), deadline, "iq_active never became %d" % value)
+            time.sleep(0.01)
+
+    def test_switched_off_and_on_within_a_run(self):
+        """Off, the slots published from then on are the radio's; on again, the estimate the run had
+        applies at once."""
+        rng = np.random.default_rng(5)
+        n = SLICE * 6144
+        words = imbalanced(self.tone_with_noise(rng, n), 1.05, 3.0, 150.0, -80.0)
+        of = lambda s: words[s * SLICE:(s + 1) * SLICE]   # noqa: E731
+        run = self.stream(of, 4096)
+        self.shm.set("iq_correct", 0)
+        self.wait_for_active(0)
+        self.assertEqual(self.stream(of, 1024, 4096), run, "the same run")
+        for s in (4096, 4600, 5119):
+            self.assertEqual(self.shm.samples(s), unpacked(of(s).tolist()), "slot %d" % s)
+        estimates = self.shm.get("iq_estimates")
+        self.shm.set("iq_correct", 1)
+        self.wait_for_active(1)
+        self.assertEqual(self.stream(of, 1024, 5120), run)
+        self.assertEqual(self.shm.get("iq_estimates"), estimates, "none since: 1024 slots are a half of one")
+        self.assertLess(self.image_dbc(5120, 5376, 300), -60, "corrected again from its first slot")
+
+    def test_every_format_the_service_decodes(self):
+        """The correction applies to the samples as published, whatever form they came in: raw, packed,
+        reduced by the unit (SDR2) and by the radio (a split stream's chunks), here by turns."""
+        rng = np.random.default_rng(6)
+        period, slots = 100, 4096                         # distinct slices, sent over and over
+        words = imbalanced(self.tone_with_noise(rng, SLICE * period), 1.05, 3.0, 150.0, -80.0)
+
+        def send(s):
+            w = words[s % period * SLICE:(s % period + 1) * SLICE]
+            form = s // 4 % 4                             # each form in turn among the slots measured
+            if form == 0:
+                self.send(s, w.tobytes())
+            elif form == 1:
+                self.send(s, struct.pack("<%dI" % (SLICE // 8 * 7), *pack(w.tolist())))
+            elif form == 2:
+                self.send_reduced(s, w.tolist(), 16)
+            else:
+                self.send(s, iq_reduce_ref.radio14_encode(w.tolist(), 6))
+            if s % 32 == 31:
+                time.sleep(0.002)
+        for s in range(slots):
+            send(s)
+        run = self.wait_newest(slots, timeout=60)
+        self.assertEqual((self.shm.get("lost"), self.shm.get("bad"), self.shm.get("reduced")), (0, 0, 2048))
+        self.assertEqual(self.shm.tag(slots - 1), tag(run, slots - 1))
+        self.assertGreaterEqual(self.shm.get("iq_imbalance_estimates"), 1)
+        for form in range(4):                             # the last 64 slots of each form
+            chosen = [s for s in range(slots - 256, slots) if s // 4 % 4 == form]
+            x = np.concatenate([self.published(s, s + 1) for s in chosen])
+            tone, image = self.tone_and_image(x, 300, SLICE)
+            self.assertLess(20 * math.log10(image / tone), -60, "form %d" % form)
+            self.assertLess(abs(x.mean()), 2.0, "form %d" % form)
+
+    def test_with_the_rolloff_correction(self):
+        """The roll-off's correction first, then this one, on its output."""
+        for field, value in (("radio_sample_rate", 160000000), ("radio_capture_rate", 160000000),
+                             ("radio_filter_hz", 160000000), ("flatten", 1)):
+            self.shm.set(field, value)
+        deadline = time.monotonic() + 5
+        while self.shm.get("flatten_active") != 1:
+            self.assertLess(time.monotonic(), deadline, "the roll-off correction never applied")
+            time.sleep(0.01)
+        rng = np.random.default_rng(7)
+        words = imbalanced(self.tone_with_noise(rng, SLICE * self.SLOTS), 1.05, 3.0, 150.0, -80.0)
+        run = self.stream(lambda s: words[s * SLICE:(s + 1) * SLICE], self.SLOTS)
+        self.assertEqual(self.shm.tag(self.SLOTS - 2), tag(run, self.SLOTS - 2) | TAG_FLAT)
+        self.assertLess(self.image_dbc(self.SLOTS - 256, self.SLOTS - 1, 300), -60)
+        x = self.published(self.SLOTS - 256, self.SLOTS - 1)
+        self.assertLess(abs(x.mean()), 0.5)
+        self.assertEqual((self.shm.get("iq_active"), self.shm.get("saturated")), (1, 0))
+
+    def test_each_channel_by_its_own_estimate(self):
+        self.shm.set("radio_channels", 2)
+        time.sleep(0.3)
+        rng = np.random.default_rng(3)
+        per, n = SLICE // 2, SLICE // 2 * self.SLOTS
+        t = np.arange(n)
+        ch = []
+        for cycles, gain, phase, dci, dcq in ((100, 1.04, 2.0, 120.0, -30.0), (-230, 0.96, -4.0, -60.0, 90.0)):
+            clean = 2500 * np.exp(2j * np.pi * cycles * t / per) + 30 * (rng.standard_normal(n) + 1j * rng.standard_normal(n))
+            ch.append(imbalanced(clean, gain, phase, dci, dcq))
+        beat = np.empty(2 * n, dtype="<u4")              # two sample times of channel 0, then of channel 1 (iq_format.h)
+        beat.reshape(-1, 4)[:, 0:2] = ch[0].reshape(-1, 2)
+        beat.reshape(-1, 4)[:, 2:4] = ch[1].reshape(-1, 2)
+        run = self.stream(lambda s: beat[s * SLICE:(s + 1) * SLICE], self.SLOTS)
+        self.assertEqual(self.shm.layout(), (run, self.SLOTS, 2))
+        for channel, cycles in ((0, 100), (1, -230)):
+            x = self.published(self.SLOTS - 128, self.SLOTS, channel, 2)
+            tone, image = self.tone_and_image(x, cycles, per)
+            self.assertLess(20 * math.log10(image / tone), -60, "channel %d" % channel)
+            self.assertLess(abs(x.mean()), 0.7, "channel %d" % channel)
+        for c, (gain, phase, dci, dcq) in enumerate(((1.04, 2.0, 120.0, -30.0), (0.96, -4.0, -60.0, 90.0))):
+            phi = math.radians(phase)          # each channel's parameters in its own word of the header
+            self.assertAlmostEqual(s64(self.shm.get("iq_dc_i_milli", c)) / 1e3, dci, delta=0.5, msg="channel %d" % c)
+            self.assertAlmostEqual(s64(self.shm.get("iq_dc_q_milli", c)) / 1e3, dcq, delta=0.5, msg="channel %d" % c)
+            self.assertAlmostEqual(1 + s64(self.shm.get("iq_gain_ppb", c)) / 1e9, 1 / (gain * math.cos(phi)), delta=1e-3,
+                                   msg="channel %d" % c)
+            self.assertAlmostEqual(s64(self.shm.get("iq_cross_ppb", c)) / 1e9, gain * math.sin(phi), delta=1e-3,
+                                   msg="channel %d" % c)
+
+
+@unittest.skipIf(build_problem() or np is None, build_problem() or "numpy is not installed")
+class IqCorrectionStartedOff(Service):
+    """--iq-correct off: the header's word starts at 0, and the samples are the radio's."""
+    OPTIONS = ["--iq-correct", "off"]
+
+    def test_started_off_the_samples_are_the_radios(self):
+        self.assertEqual((self.shm.get("iq_correct"), self.shm.get("iq_active")), (0, 0))
+        rng = np.random.default_rng(8)
+        n = SLICE * 3000
+        words = imbalanced(500 * (rng.standard_normal(n) + 1j * rng.standard_normal(n)), 1.03, 2.0, 100.0, -50.0)
+        for s in range(3000):
+            self.send(s, words[s * SLICE:(s + 1) * SLICE].tobytes())
+            if s % 32 == 31:
+                time.sleep(0.002)
+        run = self.wait_newest(3000)
+        for s in (1000, 2047, 2999):                     # the shared ring holds the last 2048
+            self.assertEqual(self.shm.tag(s), tag(run, s))
+            self.assertEqual(self.shm.samples(s), unpacked(words[s * SLICE:(s + 1) * SLICE].tolist()), "slot %d" % s)
+        self.assertEqual(self.shm.get("iq_estimates"), 0)
+
+
 @unittest.skipIf(build_problem(), build_problem())
 class TransformPlans(unittest.TestCase):
     """The service is ready at once, on FFTW's estimated plans of the correction's transforms,
@@ -745,6 +990,12 @@ class Options(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("not an IPv4 address: the-unit", result.stderr)
 
+    def test_iq_correct_is_on_or_off(self):
+        result = subprocess.run([BINARY, "--iq-correct", "maybe", "--name", "/w1700k-test-%d-iq" % os.getpid()],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('--iq-correct needs on or off, not "maybe"', result.stderr)
+
 
 @unittest.skipIf(build_problem() or not shutil.which("cc"), build_problem() or "no C compiler")
 class NewRunWhileReceiving(Service):
@@ -790,6 +1041,20 @@ class NewRunWhileReceiving(Service):
         # held as late too: tens of slices, where the fault files tens of thousands.
         self.assertLess(self.shm.get("late"), 1000,
                         "slices of the new run were dropped as late: a slice of the run before moved its position")
+
+
+
+@unittest.skipIf(build_problem(), build_problem())
+class IqArithmetic(unittest.TestCase):
+    def test_the_sums_the_correction_and_the_estimate_against_the_rule(self):
+        """host/stream/src/iqfix.cpp (SSE2 where the build has it) against the rule written out plainly:
+        the sums of a slice exactly, the correction to within a count of double arithmetic, the
+        saturation count, the estimate of a known imbalance and the test for a signal
+        (host/stream/tests/iqfix_check.cpp)."""
+        result = subprocess.run(["make", "-C", STREAM, "check"], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("iqfix: ", result.stdout)
+        self.assertIn(" 0 differ", result.stdout)
 
 
 if __name__ == "__main__":
