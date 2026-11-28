@@ -20,6 +20,7 @@
 #include "patch_init.h"
 #include "radio.h"
 #include "radio_cmd.h"
+#include "rfctl.h"
 #include "rfinit.h"
 
 struct radio_id radio_id;
@@ -141,6 +142,32 @@ static void mac_rx_enable(uint32_t band)
 		MT7996_LMAC_ARB_SCR_TX_DIS);
 }
 
+/* The gain hold as the gain word says (phy.h MT7996_PHY_GAIN_HOLD_*): its bits cleared while the
+ * gain is forced, which keeps runs of zeros out of the samples, else as the bring-up and the channel
+ * set leave them. The host's GAIN command does the same (rfctl.c); a channel set (SETUP, RATE)
+ * writes the words again, and the force outlives it, so the hold is put back here. */
+static void gain_hold(uint32_t band)
+{
+	struct radio_band *rb = &radio_band[band];
+
+	if (rb->held) {		/* off first: the hold keeps a gain from reaching the receiver */
+		hal_rmw(MT7996_PHY_BN_8200(band), MT7996_PHY_GAIN_HOLD_8200, rb->hold_8200);
+		hal_set(MT7996_PHY_BN_8550(band), MT7996_PHY_GAIN_HOLD_8550);
+		hal_set(MT7996_PHY_BN_8D60(band), MT7996_PHY_GAIN_HOLD_8D60);
+		rb->held = 0;
+	}
+	if (hal_rd(MT7996_PHY_RXGAIN(band, 0)) & MT7996_PHY_RXGAIN_FORCED) {
+		/* the receive path restarted so that it takes the forced gain (rfctl.c GAIN) */
+		hal_set(MT7996_LMAC_ARB_SCR(band), MT7996_LMAC_ARB_SCR_RX_DIS);
+		hal_clr(MT7996_LMAC_ARB_SCR(band), MT7996_LMAC_ARB_SCR_RX_DIS);
+		hal_udelay(RFCTL_GAIN_HOLD_US);
+		hal_clr(MT7996_PHY_BN_8200(band), MT7996_PHY_GAIN_HOLD_8200);
+		hal_clr(MT7996_PHY_BN_8550(band), MT7996_PHY_GAIN_HOLD_8550);
+		hal_clr(MT7996_PHY_BN_8D60(band), MT7996_PHY_GAIN_HOLD_8D60);
+		rb->held = 1;
+	}
+}
+
 /* RATE band bw: the sample rate alone; the band's capture path must be set up again. */
 static uint32_t rate(const uint32_t *arg, uint32_t *state)
 {
@@ -167,6 +194,7 @@ static uint32_t capture(const uint32_t *arg, uint32_t *state)
 	if ((res = capture_setup(arg[0], arg[1])) != RADIO_OK)
 		return res;
 	mac_rx_enable(arg[0]);
+	gain_hold(arg[0]);
 	if (radio_failed())
 		return RADIO_ERR_HW;
 	*state |= RADIO_STATE_CAPTURE(arg[0]);

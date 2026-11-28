@@ -12,6 +12,7 @@
 #include "hw/adie/sxchan.h"
 #include "hw/mt7996/icap.h"
 #include "hw/mt7996/phy.h"
+#include "hw/mt7996/phy_cal.h"
 #include "hw/mt7996/phy_chan.h"
 
 #include "radio.h"
@@ -491,6 +492,15 @@ uint32_t rfctl_rephase(uint32_t band, uint32_t chain, struct rfctl_op *ops, uint
  * GAIN, FILTER, TRIM, STATUS, LOCKS, BAND
  * --------------------------------------------------------------------------------------------- */
 
+/* The gain hold's three words: their bits cleared (on), or as the bring-up and the band's last channel
+ * set left them (off). */
+static void hold(struct prog *p, uint32_t band, int on)
+{
+	rmw32(p, MT7996_PHY_BN_8200(band), MT7996_PHY_GAIN_HOLD_8200, on ? 0 : radio_band[band].hold_8200);
+	rmw32(p, MT7996_PHY_BN_8550(band), MT7996_PHY_GAIN_HOLD_8550, on ? 0 : MT7996_PHY_GAIN_HOLD_8550);
+	rmw32(p, MT7996_PHY_BN_8D60(band), MT7996_PHY_GAIN_HOLD_8D60, on ? 0 : MT7996_PHY_GAIN_HOLD_8D60);
+}
+
 uint32_t rfctl_gain(uint32_t band, uint32_t lna, uint32_t lpf, struct rfctl_op *ops, uint32_t max)
 {
 	struct prog p = { ops, 0, max };
@@ -504,8 +514,24 @@ uint32_t rfctl_gain(uint32_t band, uint32_t lna, uint32_t lpf, struct rfctl_op *
 		word = MT7996_PHY_RXGAIN_FORCE_AB(lna, lpf);
 	else
 		return 0;
+	/* The gain hold (phy.h MT7996_PHY_GAIN_HOLD_*): its bits cleared while the gain is forced, which
+	 * keeps runs of zeros out of the samples; under the AGC as the bring-up and the band's last
+	 * channel set left them (radio_band; radio.c does the same after a channel set). A gain written
+	 * while the hold is on does not reach the receiver (phy.h): the hold is given back first, the
+	 * gain written, and the hold taken again once the receiver has it. */
+	if (radio_band[band].held)
+		hold(&p, band, 0);
 	for (c = 0; c < chains[band]; c++)
 		w32(&p, MT7996_PHY_RXGAIN(band, c), word);
+	if (word) {
+		/* the receive path restarted, as the vendor's recipe does (ARB_SCR RX_DIS pulsed, TX_DIS left
+		 * set): that is what takes the new gain while the AGC's events are held off */
+		rmw32(&p, MT7996_LMAC_ARB_SCR(band), MT7996_LMAC_ARB_SCR_RX_DIS, MT7996_LMAC_ARB_SCR_RX_DIS);
+		rmw32(&p, MT7996_LMAC_ARB_SCR(band), MT7996_LMAC_ARB_SCR_RX_DIS, 0);
+		put(&p, MT7996_PROBE_CTL_OP_DELAY | HW_PREP(MT7996_PROBE_CTL_OP_ARG, RFCTL_GAIN_HOLD_US), 0, 0, 0);
+		hold(&p, band, 1);
+	}
+	radio_band[band].held = word != 0;
 	for (c = 0; c < chains[band]; c++)
 		r32(&p, MT7996_PHY_RXGAIN(band, c));
 	return done(&p);
@@ -661,7 +687,7 @@ uint32_t rfctl_build(uint32_t a, uint32_t b, uint32_t c, struct rfctl_prog *p)
 		break;
 	case MT7996_PROBE_CTL_RF_GAIN:
 		n = rfctl_gain(band, b, c, rfctl_buf, RFCTL_MAX_OPS);
-		out = n / 2u;			/* the read-backs */
+		out = n ? n - chains[band] : 0;	/* the read-backs */
 		break;
 	case MT7996_PROBE_CTL_RF_FILTER:
 		n = rfctl_filter(band, b, rfctl_buf, RFCTL_MAX_OPS);

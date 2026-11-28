@@ -356,7 +356,11 @@
  *           bands 1 and 2 4.65..7.41 GHz
  *   GAIN    b = LNA index 0..4, c = LPF index 0..9, forced on every chain
  *           (phy.h MT7996_PHY_RXGAIN_FORCE_AB); b = RF_GAIN_AGC hands the
- *           gain back to the AGC
+ *           gain back to the AGC. Also the band's gain hold (phy.h
+ *           MT7996_PHY_GAIN_HOLD_*: BN +0x8200 [21] [29], +0x8550 [1], +0x8d60
+ *           [29]): cleared while forced, given back under the AGC; a forced
+ *           gain is written with the hold off and taken by pulsing the band's
+ *           MAC receive disable (LMAC ARB_SCR RX_DIS; TX_DIS stays as it is)
  *   FILTER  b = analog RX bandwidth in MHz: 20, 40, 80, 160 or 320; on band 0
  *           (MT7976) 320 is code 3 widened (firmware/radio/rfctl.h), which
  *           also sets the RC trim; refused there before the bring-up

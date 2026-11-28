@@ -235,6 +235,30 @@ class RadioCode(unittest.TestCase):
         self.assertEqual(len(written), 3)
         self.assertEqual({value & 0x300 for value in written}, {0x100}, 'TX_DIS set and RX_DIS clear, on each band')
 
+    def test_capture_keeps_the_gain_hold_while_the_gain_is_forced(self):
+        """The gain hold (phy.h MT7996_PHY_GAIN_HOLD_*: BN +0x8200 [21] [29], +0x8550 [1], +0x8d60
+        [29]): a channel set writes +0x8200 and +0x8d60 again, and with the gain forced the samples
+        then carry runs of zeros. Every capture set-up (after SETUP and RATE) clears the hold's bits
+        when the band's gain word is forced, and nothing else of the words; under the AGC it leaves
+        them as the channel set wrote them."""
+        bn = lambda band, off: 0x83080000 + (band << 20) + off          # noqa: E731
+        masks = {0x8200: 0x20200000, 0x8550: 0x2, 0x8D60: 1 << 29}
+
+        def last_write(lines, addr):
+            written = [int(f[2], 16) for f in (line.split() for line in lines if line.startswith('W '))
+                       if int(f[1], 16) == addr]
+            return written[-1] if written else None
+
+        forced = self.load('commands', RADIO_SMOKE_RXGAIN=f'{0x929203:#x}')
+        for band in range(3):
+            self.assertTrue(last_write(self.segment('setup', band, forced), bn(band, 0x8D60)) & 1 << 29, 'table B sets it')
+            for off, mask in masks.items():
+                self.assertIsNone(last_write(self.segment('capture', band, self.commands), bn(band, off)),
+                                  'the AGC: the words as the channel set left them')
+                value = last_write(self.segment('capture', band, forced), bn(band, off))
+                self.assertIsNotNone(value, f'band {band} +{off:#x}: forced, the hold is cleared')
+                self.assertFalse(value & mask, f'band {band} +{off:#x}')
+
     def test_select_is_the_band_switch(self):
         """SELECT leaves ICAPCR8 of the three ICAPs as the RF band switch writes it mid-stream."""
         band_switch = self.rfctl((rf.RF_BAND | 1 << 8, 0, 0))[0]
@@ -375,10 +399,30 @@ class RadioCode(unittest.TestCase):
             (rf.RF_GAIN | 1 << 8, 2, 9), (rf.RF_GAIN | 1 << 8, rf.RF_GAIN_AGC, 0), (rf.RF_FILTER | 2 << 8, 80, 0),
             (rf.RF_TRIM, 7, 0), (rf.RF_STATUS | 2 << 8, 0, 0), (rf.RF_LOCKS, 0, 0), (rf.RF_BAND | 2 << 8, 0, 0))
         ops = lambda p: [tuple(o) for o in p['ops']]    # noqa: E731
-        self.assertEqual(ops(gain), [rf.w32(csd(1, c), 0x929203) for c in range(4)] +
-                         [rf.r32(csd(1, c)) for c in range(4)])
-        self.assertEqual(gain['out'], 4)
-        self.assertEqual(ops(agc)[:4], [rf.w32(csd(1, c), 0) for c in range(4)])
+        bn = lambda band, off: 0x83080000 + (band << 20) + off          # noqa: E731 (phy.h MT7996_PHY_BN)
+        hold = lambda band, h8200, on: [rf.rmw32(bn(band, 0x8200), 0x20200000, h8200),    # noqa: E731
+                                        rf.rmw32(bn(band, 0x8550), 0x2, 0x2 if on else 0),
+                                        rf.rmw32(bn(band, 0x8D60), 1 << 29, 1 << 29 if on else 0)]
+        # forced: the gain written, the receive path restarted so that it takes it (MAC RX_DIS pulsed, under a
+        # mask that leaves TX_DIS as it is), a moment, then the hold taken; the AGC after it: the hold given
+        # back first (a gain written under the hold does not reach the receiver, phy.h)
+        arb = 0x820F3000                                   # phy_cal.h MT7996_LMAC_ARB_SCR(1)
+        pulse = [rf.rmw32(arb, 1 << 9, 1 << 9), rf.rmw32(arb, 1 << 9, 0)]
+        self.assertEqual(ops(gain), [rf.w32(csd(1, c), 0x929203) for c in range(4)] + pulse + [rf.delay(20)] +
+                         hold(1, 0, False) + [rf.r32(csd(1, c)) for c in range(4)])
+        self.assertEqual(gain['count'] - gain['out'], 4, 'every chain read back')
+        self.assertEqual(ops(agc)[:7], hold(1, 0, True) + [rf.w32(csd(1, c), 0) for c in range(4)],
+                         'under the AGC the hold given back (+0x8200 as the channel set left it: none here)')
+        self.assertNotIn(pulse[0], ops(agc), 'the AGC takes its own gain: no restart')
+        self.assertEqual(agc['count'] - agc['out'], 4)
+        again, again2 = self.rfctl((rf.RF_GAIN | 1 << 8, 0, 0), (rf.RF_GAIN | 1 << 8, 2, 9))
+        self.assertEqual(ops(again2)[:3], hold(1, 0, True), 'a new forced gain: the hold off before it is written')
+        self.assertEqual(ops(again2)[3:10], [rf.w32(csd(1, c), 0x929203) for c in range(4)] + pulse + [rf.delay(20)])
+        for p in (gain, agc, again, again2):
+            for op in map(tuple, p['ops']):
+                if op[0] in (rf.W32, rf.RMW32) and op[1] in (0x820E3000, 0x820F3000, 0x830E3000):
+                    self.assertEqual(op[0], rf.RMW32, 'the MAC word only read-modified')
+                    self.assertEqual(op[2], 1 << 9, 'RX_DIS alone: TX_DIS is never touched')
         self.assertEqual(ops(filt), [rf.aw(rf.reg(2, k, 0x100), 2) for k in range(5)] +
                          [rf.aw(rf.reg(2, k, 0x933), 2) for k in range(5)] +
                          [rf.ar(rf.reg(2, k, 0x1E8)) for k in range(5)])

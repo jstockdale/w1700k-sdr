@@ -1523,6 +1523,9 @@ static uint32_t chanset_flow(const struct chanset_ctx *c, int sx)
 	table_b(c);
 	rx_frontend(c);
 	rx_setup(c);
+	/* ours: the gain hold's +0x8200 bits as table B and the RX setup left them, which the AGC gets
+	 * back (radio.h; phy.h MT7996_PHY_GAIN_HOLD_*; radio.c clears them again for a forced gain) */
+	radio_band[c->band].hold_8200 = hal_rd(MT7996_PHY_BN_8200(c->band)) & MT7996_PHY_GAIN_HOLD_8200;
 	if (sx)
 		r = chanset_tune(c);
 	else

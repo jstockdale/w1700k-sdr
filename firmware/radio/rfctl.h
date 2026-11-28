@@ -44,7 +44,11 @@
  *     its two phases against the other chains (probe_page.h REPHASE).
  * rfctl_gain(band, lna, lpf)  Every chain's RXGAIN forced to (lna 0..4, lpf 0..9) in sets A
  *     and B (phy.h MT7996_PHY_RXGAIN_FORCE_AB), or handed to the AGC with lna = RFCTL_GAIN_AGC;
- *     then every chain's word read back.
+ *     the band's gain hold cleared while forced and given back under the AGC (phy.h
+ *     MT7996_PHY_GAIN_HOLD_*: forced gain without it leaves runs of zeros in the samples; radio.h
+ *     radio_band, which the build updates): a forced gain is written with the hold off and taken by
+ *     the receiver at a pulse of the band's ARB_SCR RX_DIS (TX_DIS under the mask's protection),
+ *     RFCTL_GAIN_HOLD_US before the hold goes on again; then every chain's word read back.
  * rfctl_filter(band, mhz)  Every chain's analog filter to mhz (20, 40, 80, 160, 320) at whatever
  *     bandwidth the channel has: rfctl_filter_regs' ADIE_RX_BW and ADIE_CHSET_933, on the MT7976
  *     also MT7976_RXF_125 [22:20] and the RC trim; then every chain's ADIE_RX_BW_RB read (on band
@@ -75,6 +79,9 @@ struct rfctl_op {
 #define RFCTL_MAX_OPS		112u
 #define RFCTL_GAIN_AGC		MT7996_PROBE_CTL_RF_GAIN_AGC
 #define RFCTL_UNLOCKED		MT7996_PROBE_CTL_RF_UNLOCKED
+/* How long a forced gain is given, the gain hold off, to reach the receiver before the hold is taken
+ * again (phy.h MT7996_PHY_GAIN_HOLD_*). */
+#define RFCTL_GAIN_HOLD_US	20u
 /* Units of the arguments. */
 #define RFCTL_HZ_PER_KHZ	1000u
 #define RFCTL_HZ_PER_MHZ	1000000u

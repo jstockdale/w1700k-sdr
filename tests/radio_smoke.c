@@ -81,6 +81,13 @@ static void presets(void)
 
 	for (uint32_t band = 0; band < RADIO_BANDS; band++)
 		mock_preset(MT7996_LMAC_ARB_SCR(band), start ? (uint32_t)strtoul(start, NULL, 0) : MT7996_LMAC_ARB_SCR_CAL);
+	/* RADIO_SMOKE_RXGAIN: every band's chain-0 gain word as a host's GAIN left it (0, the AGC,
+	 * otherwise), for the test that a capture set-up follows it. */
+	const char *gain = getenv("RADIO_SMOKE_RXGAIN");
+
+	if (gain)
+		for (uint32_t band = 0; band < RADIO_BANDS; band++)
+			mock_preset(MT7996_PHY_RXGAIN(band, 0), (uint32_t)strtoul(gain, NULL, 0));
 }
 
 static void command(const char *name, uint32_t op, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3)

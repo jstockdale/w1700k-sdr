@@ -1334,8 +1334,47 @@
 #define   MT7996_PHY_BN_8554_KEEP         HW_GENMASK(31, 24)
 #define MT7996_PHY_BN_SWLNA_STROBE(band)  MT7996_PHY_BN(band, 0x8560u)
 #define   MT7996_PHY_BN_SWLNA_STROBE_B27  HW_BIT(27)
+/* +0x8d60: PHY table B writes it whole at every channel set (phy_chan.h; [29] set in every
+ * column: 0x200c1c65 on all three bands here). [static][measured]
+ * [29], with the gain forced (RXGAIN set A / B): set, the receive path writes runs of exact zeros
+ * (I = Q = 0) into the capture in place of the samples, about 0.6-0.75 us each (96 or 104 samples
+ * at 160 Msps, 29..31 at 40, 51..55 at 80, 189..221 at 320), 150 to 9,800 runs a second at random
+ * intervals, with or without a signal and more at higher gain, on bands 0 and 1 (none seen on band
+ * 2, 160 Msps, LO 5980 MHz). 0.13 % of the samples zeroed spreads -29 dBc of every signal over
+ * about +-1 MHz round it (the "skirt" of a tone). Cleared, there are none in a quiet band (bands 0
+ * and 1, 2 M samples each, alternately set and cleared in one session); DC, image and noise floor
+ * do not change. Under the AGC its own gain changes bring such runs whatever [29] holds. What the
+ * bit gates is not known. [measured 2026-11-27, one unit]
+ * With [29] clear and outside signals in the band (Wi-Fi-like bursts up to -19 dBFS, 3-34 % of the
+ * time, band 0 at LNA 0 / filter 9), runs of 105 samples came back during the bursts: 36 in 12 M
+ * samples. +0x8550 [1] cleared as well: 6; +0x8200 [21] and [29] as well: none, in 12 M samples
+ * with bursts 3-36 % of the time, and none in 24 M more. These are the three words the vendor's
+ * manual-gain recipe saves, clears and restores (above): MT7996_PHY_GAIN_HOLD_* below.
+ * [measured 2026-11-27, one unit] */
 #define MT7996_PHY_BN_8D60(band)          MT7996_PHY_BN(band, 0x8d60u)
 #define   MT7996_PHY_BN_8D60_B29          HW_BIT(29)
+/* Sets A or B of RXGAIN enabled: the gain is forced (rather than the AGC's). */
+#define MT7996_PHY_RXGAIN_FORCED          (MT7996_PHY_RXGAIN_A_EN | MT7996_PHY_RXGAIN_B_EN)
+/* The gain hold: the bits the vendor's manual-gain capture recipe clears, which while the gain is
+ * forced keep the runs of zeros above out of the samples. Cleared while the gain is forced
+ * (firmware/radio/rfctl.c GAIN, radio.c after a channel set), given back under the AGC: +0x8550
+ * [1] and +0x8d60 [29] set, as the per-band PHY init (0x0698000a) and every column of table B
+ * write them; +0x8200 [21] and [29] as the channel set left them (table B and the RX setup's
+ * [21] by band). [static][measured]
+ * While the hold is on, a new forced gain does not reach the receiver: band 1, tone at LO + 13.7 MHz,
+ * the force set to (2, 9), (0, 0), (2, 9), (0, 9), (0, 0) in turn read -4.5, -33.2, -33.3, -33.3,
+ * -33.3 dBFS; band 2 (2, 9), (0, 0) -4.9, -4.9 dBFS (the baseline firmware, no hold: -5.1, -38.8,
+ * and (4, 9) clipping, every time). Taking the hold off for 20 us around the write did not help;
+ * the receiver takes a forced gain at its own AGC events, which the hold stops, or when its receive
+ * path restarts, which is the vendor recipe's other step: LMAC ARB_SCR RX_DIS pulsed (phy_cal.h).
+ * So GAIN takes the hold off, writes the gain, pulses RX_DIS (TX_DIS left as it is), waits
+ * RFCTL_GAIN_HOLD_US and takes the hold again (firmware/radio/rfctl.c; radio.c after a channel
+ * set): band 1 (2, 9) (0, 0) (2, 9) (0, 9) (0, 0) (4, 5) then read -4.9, -33.6, -4.9, -14.7,
+ * -33.6, -3.0 dBFS, band 2 -5.4, -39.2, -5.5, -20.3, -39.0, -2.8, with no runs of zeros.
+ * [measured 2026-11-28, one unit] */
+#define MT7996_PHY_GAIN_HOLD_8200         (MT7996_PHY_BN_8200_B21 | MT7996_PHY_BN_8200_B29)
+#define MT7996_PHY_GAIN_HOLD_8550         MT7996_PHY_BN_8550_B1
+#define MT7996_PHY_GAIN_HOLD_8D60         MT7996_PHY_BN_8D60_B29
 #define MT7996_PHY_BN_8234(band)          MT7996_PHY_BN(band, 0x8234u)
 #define   MT7996_PHY_BN_8234_B0           HW_BIT(0)
 #define MT7996_PHY_BN_8240(band)          MT7996_PHY_BN(band, 0x8240u)

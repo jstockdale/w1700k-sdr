@@ -63,6 +63,9 @@ struct radio_band {
 	uint64_t lock_hz;	/* the LO its synthesizer last locked at (a TUNE's); 0: never. A HOLD moves
 				 * lo_hz away from it and leaves it */
 	uint32_t bw, set;
+	/* The gain hold (phy.h MT7996_PHY_GAIN_HOLD_*): +0x8200's hold bits as the band's last channel
+	 * set left them, which the AGC gets back; `held` while the hold bits are cleared. */
+	uint32_t hold_8200, held;
 };
 extern struct radio_band radio_band[RADIO_BANDS];
 
