@@ -40,6 +40,17 @@ Then plug the adapter in again.
 Repeat after a kernel update (`make KVER=...` builds for another installed kernel), until the
 kernel's own `r8152` knows the adapter; `sudo make uninstall` removes it.
 
+Or have DKMS repeat it: a kernel update otherwise puts the adapter back on `cdc_ncm` without a
+word, and the first sign is a stream that does not arrive [seen: 7.0.0-43 to 7.0.0-44 here, where
+`init/host/link keep` then said "mtu greater than device maximum"].
+
+```sh
+sudo apt install dkms
+sudo make dkms-install     # for the running kernel now, and for each one installed later
+```
+
+`sudo make dkms-uninstall` removes it. `dkms status` names the kernels it is built for.
+
 `r8152.c` is `drivers/net/usb/r8152.c` of Linux v7.3 (SHA-256
 `9d766f203c7fdabe6449e8dd2b9e5dd4fccfa20a62aa5dbf00d64c0c475c5a9f`), under the kernel's
 GPL-2.0-only licence like the Makefile beside it; the rest of this repository is MIT.
