@@ -90,6 +90,30 @@
  *     shared by the A53s and the NPU
  *   NPU cluster read: 1.55-1.69 GB/s idle, 1.09 GB/s under a 1.28 GB/s
  *     PCIe write stream (each NPU core has one blocking miss in flight)
+ *
+ * What sets those numbers [measured: 2026-11-25, a W1700K, with threads at
+ * chosen physical pages and the controller's own counters; dramc.h]:
+ *   - Address bits 13 and 22 choose among FOUR groups of banks, and a row is
+ *     4 KiB (every other bit from 12 to 30, differing alone, is a row bit).
+ *     An 8 KiB stream chunk lies in one group, the next chunk in the pair's
+ *     other; bit 22 changes every 4 MiB.
+ *   - Writers: one A53 writes 6.3 GB/s; four, each in a group of its own,
+ *     6.3 in all; two in ONE group 1.4 in all (46 ns a 64-byte line, a whole
+ *     row cycle for every line) and four in one group 1.1. Two unplaced
+ *     writers got 3.4, four 2.4: more writers, less written.
+ *   - Readers: 2.4 GB/s for one, 2.4-2.8 for two or four wherever they lie:
+ *     about 26 ns a 64-byte line, one after another, while the controller
+ *     counts itself busy 98 % of the time. Reads do not overlap; the banks
+ *     are not what holds them.
+ *   - A reader and a writer: 0.72 + 2.94 GB/s in one group, 0.99 + 4.18 in
+ *     two.
+ *   - A 320 Msps capture alone (the radio writing 1.28 GB/s, nothing
+ *     reading) leaves the controller 25 % of its time: what the A53s can
+ *     then read is about 0.8 GB/s, whatever the number of threads.
+ *   - Refresh was a tenth of the controller's time as the loader sets it;
+ *     at the interval the parts need it is a twentieth (dramc.h
+ *     AN7581_DRAMC_REFRESH): read 2.43 -> 2.55 GB/s, write 6.33 -> 6.68,
+ *     four copies 1.02 -> 1.10.
  */
 #define AN7581_DRAM_BASE                0x80000000u
 #define AN7581_DRAM_SIZE_W1700K         0x80000000u

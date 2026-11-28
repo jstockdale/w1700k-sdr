@@ -102,6 +102,24 @@ chunks itself (they still leave zero-copy) and the SoC the 6 between: 14 bits
 per sample pair, 4.6 Gbit/s, on a 5 Gbit/s link. The host puts both back as
 14-bit samples in one stream; see the top-level README's table.
 
+What holds the SoC's memory to that [measured on a W1700K, 2026-11-25;
+[`an7581/memmap.h`](../include/hw/an7581/memmap.h) has the numbers and
+[`an7581/dramc.h`](../include/hw/an7581/dramc.h) the controller's words]. The
+memory itself is DDR4-2666, 10.7 GB/s on its pins, but the controller serves
+reads one after another, about 26 ns for each 64 bytes, so every reader
+together gets 2.4 to 2.8 GB/s; a write that does not follow straight on the
+one before costs as much, and two streams in the same group of banks cost a
+whole row cycle (46 ns) for each 64 bytes. A 320 Msps capture arriving over
+PCIe is such writes and takes three quarters of the controller's time by
+itself, which leaves the cores about 0.8 GB/s of reads: 59 % of a 320 Msps
+stream reduced to 16 bits by the unit alone and 69 % of one reduced to 8,
+with two sender threads or three. More threads do not help, and neither would
+other processors that read the same memory. The stock loader also refreshes
+the memory twice as often as its parts need; at the interval they need, plain
+reads, writes and copies gain 5 to 8 % and the 8-bit figure rises to 73 %.
+That is not yet built into the system (the loader sets its own value at
+every start).
+
 ## Control path
 
 The host talks to our WM through words in its mailbox page in patch SRAM,

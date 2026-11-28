@@ -54,6 +54,7 @@ driver, the bare-metal RISC-V firmware and host tools can all include them.
 | **AN7581** | |
 | [`an7581/memmap.h`](an7581/memmap.h) | Peripheral bases, GIC, DRAM, PCIe windows, interrupts, measured bandwidths |
 | [`an7581/scu.h`](an7581/scu.h) | System control: PCIe clocks and resets, SerDes selects, straps, pin mux, GPIO, watchdog, UART |
+| [`an7581/dramc.h`](an7581/dramc.h) | Memory controller: the operating point, refresh interval and length, its own counters, what not to write |
 | [`an7581/pcie.h`](an7581/pcie.h) | PCIe MAC subset, decode registers, ASPM and MPS facts, topology |
 | [`an7581/eth.h`](an7581/eth.h) | Frame engine: GDM/CDM/PPE, QDMA and descriptors, PCS, 10G export facts |
 | [`an7581/npu.h`](an7581/npu.h) | NPU cores, on-chip RAMs, boot and mailbox, bridge, the SM4 coprocessor |
