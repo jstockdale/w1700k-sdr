@@ -18,8 +18,9 @@
 # driver still binds, and the link is reported to come up at 5 Gbit/s instead of 10.
 
 KVER ?= $(shell uname -r)
-KDIR ?= /lib/modules/$(KVER)/build
-DEST := /lib/modules/$(KVER)/updates/r8152.ko
+MODDIR := /lib/modules/$(KVER)
+KDIR ?= $(MODDIR)/build
+DEST := $(MODDIR)/updates/r8152.ko
 
 .PHONY: all install uninstall clean dkms-install dkms-uninstall
 
@@ -40,17 +41,23 @@ uninstall:
 	depmod -a $(KVER)
 
 # The driver kept current by DKMS: its own copy of the source, built for the running kernel now and for
-# each kernel the host installs afterwards. The copy `make install` put in updates/ goes: two would
-# leave it to depmod which one loads.
+# each kernel the host installs afterwards.
+#
+# The copy `make install` put in updates/ goes first, and only once DKMS has built its own: DKMS
+# declines to install beside a module that is the same as its own ("already installed (unversioned
+# module)") and still ends without a fault, which would leave the host with the kernel's own driver.
+# The kernel's own r8152 is set aside by DKMS itself, which puts it back at dkms-uninstall. The last
+# line is the check that the driver is where the next start will take it from.
 dkms-install:
 	@command -v dkms > /dev/null || { echo "dkms is not installed: sudo apt install dkms" >&2; exit 1; }
-	-dkms remove $(DKMS_NAME)/$(DKMS_VERSION) --all > /dev/null 2>&1
+	@if dkms status $(DKMS_NAME)/$(DKMS_VERSION) | grep -q .; then dkms remove $(DKMS_NAME)/$(DKMS_VERSION) --all; fi
 	install -d $(DKMS_SRC)
 	install -m 0644 r8152.c Kbuild dkms.conf $(DKMS_SRC)/
 	dkms add $(DKMS_NAME)/$(DKMS_VERSION)
-	dkms install $(DKMS_NAME)/$(DKMS_VERSION) -k $(KVER)
+	dkms build $(DKMS_NAME)/$(DKMS_VERSION) -k $(KVER)
 	rm -f $(DEST)
-	depmod -a $(KVER)
+	dkms install $(DKMS_NAME)/$(DKMS_VERSION) -k $(KVER)
+	@ls $(MODDIR)/updates/dkms/r8152.ko* > /dev/null 2>&1 || { echo "DKMS did not install the driver for $(KVER): dkms status" >&2; exit 1; }
 
 dkms-uninstall:
 	-dkms remove $(DKMS_NAME)/$(DKMS_VERSION) --all

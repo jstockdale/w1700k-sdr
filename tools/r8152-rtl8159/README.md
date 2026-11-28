@@ -49,7 +49,18 @@ sudo apt install dkms
 sudo make dkms-install     # for the running kernel now, and for each one installed later
 ```
 
-`sudo make dkms-uninstall` removes it. `dkms status` names the kernels it is built for.
+It takes the place of a copy `sudo make install` put in `updates/`. DKMS sets the kernel's own
+`r8152` aside for as long as ours is installed (`dkms status` then says "Original modules exist")
+and puts it back at `sudo make dkms-uninstall`. The driver already in memory stays until it is
+loaded again, by a restart or by hand, which takes every adapter it runs down for a moment:
+
+```sh
+sudo modprobe -r r8153_ecm r8152 && sudo modprobe r8152
+modinfo -F filename r8152      # .../updates/dkms/r8152.ko*: the one the next start loads
+```
+
+`dkms status` names the kernels it is built for [tested: Ubuntu, DKMS 3.2.2, over a copy from
+`make install`, over itself, and the rebuild for a second kernel].
 
 `r8152.c` is `drivers/net/usb/r8152.c` of Linux v7.3 (SHA-256
 `9d766f203c7fdabe6449e8dd2b9e5dd4fccfa20a62aa5dbf00d64c0c475c5a9f`), under the kernel's
