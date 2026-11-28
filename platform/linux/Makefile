@@ -12,6 +12,9 @@ kernel:
 # tree (default: this directory's build output).
 KDIR ?= $(OUT)
 SDR := $(ROOT)/kernel/w1700k_sdr
+# The W1700K's own module: the memory's refresh as its parts need it (kernel/w1700k_memtune).
+MEMTUNE := $(ROOT)/kernel/w1700k_memtune
+MEMTUNE_OUT ?= $(MEMTUNE)/build
 # Built the same way, but not clients of the driver: the reset button's service, the GPS
 # receiver's power line, the low-power radio's reset line, and the link that hands either's
 # serial port to a host.
@@ -21,6 +24,8 @@ SDR_CLIENTS := probe:mt7996-probe download:mt7996-download stream:mt7996-stream 
 module:
 	mkdir -p $(SDR)/build
 	$(MAKE) -C $(KDIR) ARCH=arm64 CROSS_COMPILE=$(CROSS_COMPILE) M=$(SDR) MO=$(SDR)/build modules
+	mkdir -p $(MEMTUNE_OUT)
+	$(MAKE) -C $(KDIR) ARCH=arm64 CROSS_COMPILE=$(CROSS_COMPILE) M=$(MEMTUNE) MO=$(MEMTUNE_OUT) modules
 reader:
 	mkdir -p $(SDR)/build
 	set -e; for pair in $(SDR_CLIENTS) $(UNIT_PROGRAMS); do \

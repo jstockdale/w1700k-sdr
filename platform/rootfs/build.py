@@ -31,6 +31,7 @@ import partitions
 OVERLAY = BUILD / 'rootfs-overlay'
 DEFCONFIG = BUILDROOT_OUT / 'w1700k_defconfig'
 MODULE = ROOT / 'kernel/w1700k_sdr/build/w1700k_sdr.ko'
+MEMTUNE = ROOT / 'kernel/w1700k_memtune/build/w1700k_memtune.ko'   # the memory's refresh, on a W1700K
 CLIENT_DIR = ROOT / 'kernel/w1700k_sdr/build'
 CLIENTS = ('mt7996-probe', 'mt7996-download', 'mt7996-stream', 'mt7996-ctl', 'w1700k-led',
            'w1700k-key', 'w1700k-gps-line', 'w1700k-efr32-line', 'w1700k-port-link')
@@ -106,11 +107,12 @@ def overlay_files(with_sdr):
                                                        path.stat().st_mode & 0o777)
     files['etc/fw_env.config'] = (fw_env_config().encode(), 0o644)
     if with_sdr:
-        missing = [path for path in [MODULE, *(CLIENT_DIR / name for name in CLIENTS)]
+        missing = [path for path in [MODULE, MEMTUNE, *(CLIENT_DIR / name for name in CLIENTS)]
                    if not path.is_file()]
         require(not missing, 'missing ' + ', '.join(str(p.relative_to(ROOT)) for p in missing)
                 + '; run make -C platform/linux module reader')
         files['lib/modules/w1700k_sdr.ko'] = (MODULE.read_bytes(), 0o644)
+        files['lib/modules/w1700k_memtune.ko'] = (MEMTUNE.read_bytes(), 0o644)
         for name in CLIENTS:
             files[f'usr/sbin/{name}'] = ((CLIENT_DIR / name).read_bytes(), 0o755)
         files['usr/share/licenses/w1700k_sdr/LICENSE.mt76'] = (LICENSE.read_bytes(), 0o644)

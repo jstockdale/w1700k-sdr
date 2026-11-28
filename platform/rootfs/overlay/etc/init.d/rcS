@@ -22,6 +22,19 @@ ip link set lo up
 status=W1700K_BOOT_READY
 /usr/sbin/verify-storage || status=W1700K_BOOT_DEGRADED
 /usr/sbin/w1700k-network || status=W1700K_BOOT_DEGRADED
+# The memory's refresh as the board's parts need it, before anything streams. The module loads
+# only where it finds this SoC's board and memory setup (kernel/w1700k_memtune); anywhere else
+# it declines, and that is no fault. By itself it keeps to DDR4's own 7.76 us.
+# long_x=4, on a W1700K alone (the loader names the board): while the SoC is cool a refresh only
+# every 31 us, four times DDR4's interval, given up a step at a time as it warms (70 C, 75 C,
+# 80 C). That is outside DDR4's specification and rests on a W1700K's own soak to 84 C
+# (include/hw/an7581/dramc.h). An XR1710G has the same SoC and the same memory setup but other
+# memory parts, which nobody has soaked: it gets the 7.76 us and no more.
+memtune_long=
+case " $(cat /proc/cmdline) " in
+*" w1700k.board=w1700k "*) memtune_long=long_x=4 ;;
+esac
+insmod /lib/modules/w1700k_memtune.ko $memtune_long 2>/dev/null || true
 insmod /lib/modules/w1700k_sdr.ko || {
 	echo 'w1700k: radio driver did not load' >&2
 	status=W1700K_BOOT_DEGRADED
